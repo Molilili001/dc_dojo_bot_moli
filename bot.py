@@ -72,6 +72,17 @@ def setup_database():
             PRIMARY KEY (user_id, guild_id, gym_id)
         )
     ''')
+    # Table for gym management audit logs
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS gym_audit_log (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            gym_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            action TEXT NOT NULL, -- 'create', 'update', 'delete'
+            timestamp TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -111,26 +122,32 @@ def get_single_gym(guild_id: str, gym_id: str) -> dict:
         "questions": json.loads(row[4])
     }
 
-def create_gym(guild_id: str, gym_data: dict):
-    """Creates a new gym. Raises sqlite3.IntegrityError if gym_id already exists."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            guild_id, gym_data['id'], gym_data['name'], gym_data['description'],
-            json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions'])
-        ))
+def create_gym(guild_id: str, gym_data: dict, cursor: sqlite3.Cursor = None):
+    """Creates a new gym. Uses provided cursor if available."""
+    conn = None
+    if cursor is None:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        guild_id, gym_data['id'], gym_data['name'], gym_data['description'],
+        json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions'])
+    ))
+
+    if conn:
         conn.commit()
-    finally:
         conn.close()
 
-def update_gym(guild_id: str, gym_id: str, gym_data: dict) -> bool:
-    """Updates an existing gym. Returns True if a row was updated, False otherwise."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def update_gym(guild_id: str, gym_id: str, gym_data: dict, cursor: sqlite3.Cursor = None) -> int:
+    """Updates an existing gym. Uses provided cursor if available. Returns rowcount."""
+    conn = None
+    if cursor is None:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
     cursor.execute('''
         UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?
         WHERE guild_id = ? AND gym_id = ?
@@ -139,9 +156,12 @@ def update_gym(guild_id: str, gym_id: str, gym_data: dict) -> bool:
         json.dumps(gym_data['questions']), guild_id, gym_id
     ))
     updated_rows = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return updated_rows > 0
+    
+    if conn:
+        conn.commit()
+        conn.close()
+    
+    return updated_rows
 
 def delete_gym(guild_id: str, gym_id: str, cursor: sqlite3.Cursor = None):
     """Deletes a gym for a guild. Uses provided cursor if available."""
@@ -154,6 +174,24 @@ def delete_gym(guild_id: str, gym_id: str, cursor: sqlite3.Cursor = None):
     cursor.execute("DELETE FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id))
 
     # If a new connection was created, commit and close it.
+    if conn:
+        conn.commit()
+        conn.close()
+
+# --- Gym Audit Log Functions ---
+def log_gym_action(guild_id: str, gym_id: str, user_id: str, action: str, cursor: sqlite3.Cursor = None):
+    """Logs a gym management action. Uses provided cursor if available."""
+    conn = None
+    if cursor is None:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cursor.execute('''
+        INSERT INTO gym_audit_log (guild_id, gym_id, user_id, action, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (guild_id, gym_id, user_id, action, timestamp))
+
     if conn:
         conn.commit()
         conn.close()
@@ -730,21 +768,33 @@ async def gym_create(interaction: discord.Interaction, json_data: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         data = json.loads(json_data)
-        
-        # Deep validation of the JSON data
-        validation_error = validate_gym_json(data)
-        if validation_error:
-            return await interaction.followup.send(f"❌ JSON数据验证失败：{validation_error}", ephemeral=True)
-        
-        create_gym(str(interaction.guild.id), data)
-        await interaction.followup.send(f"✅ 成功创建了道馆: **{data['name']}**", ephemeral=True)
     except json.JSONDecodeError:
-        await interaction.followup.send("❌ 无效的JSON格式。请检查您的输入。", ephemeral=True)
+        return await interaction.followup.send("❌ 无效的JSON格式。请检查您的输入。", ephemeral=True)
+
+    validation_error = validate_gym_json(data)
+    if validation_error:
+        return await interaction.followup.send(f"❌ JSON数据验证失败：{validation_error}", ephemeral=True)
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Perform actions within a transaction
+        create_gym(str(interaction.guild.id), data, cursor=cursor)
+        log_gym_action(str(interaction.guild.id), data['id'], str(interaction.user.id), 'create', cursor=cursor)
+        
+        conn.commit()
+        await interaction.followup.send(f"✅ 成功创建了道馆: **{data['name']}**", ephemeral=True)
     except sqlite3.IntegrityError:
+        if conn: conn.rollback()
         gym_id = data.get('id', '未知')
         await interaction.followup.send(f"❌ 操作失败：道馆ID `{gym_id}` 已存在。如需修改，请使用 `/道馆 更新` 指令。", ephemeral=True)
     except Exception as e:
+        if conn: conn.rollback()
         await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+    finally:
+        if conn: conn.close()
 
 @gym_management_group.command(name="更新", description="用新的JSON数据覆盖一个现有道馆 (馆主、管理员、开发者)。")
 @has_gym_management_permission("更新")
@@ -753,42 +803,63 @@ async def gym_update(interaction: discord.Interaction, gym_id: str, json_data: s
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         data = json.loads(json_data)
-        
-        # Ensure the ID in the JSON matches the provided gym_id
-        if 'id' not in data or data['id'] != gym_id:
-             return await interaction.followup.send(f"❌ JSON数据中的`id`必须是`{gym_id}`。", ephemeral=True)
+    except json.JSONDecodeError:
+        return await interaction.followup.send("❌ 无效的JSON格式。请检查您的输入。", ephemeral=True)
 
-        # Deep validation of the JSON data
-        validation_error = validate_gym_json(data)
-        if validation_error:
-            return await interaction.followup.send(f"❌ JSON数据验证失败：{validation_error}", ephemeral=True)
+    # Ensure the ID in the JSON matches the provided gym_id
+    if 'id' not in data or data['id'] != gym_id:
+            return await interaction.followup.send(f"❌ JSON数据中的`id`必须是`{gym_id}`。", ephemeral=True)
 
-        was_updated = update_gym(str(interaction.guild.id), gym_id, data)
+    # Deep validation of the JSON data
+    validation_error = validate_gym_json(data)
+    if validation_error:
+        return await interaction.followup.send(f"❌ JSON数据验证失败：{validation_error}", ephemeral=True)
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
         
-        if was_updated:
+        updated_rows = update_gym(str(interaction.guild.id), gym_id, data, cursor=cursor)
+        
+        if updated_rows > 0:
+            log_gym_action(str(interaction.guild.id), gym_id, str(interaction.user.id), 'update', cursor=cursor)
+            conn.commit()
             await interaction.followup.send(f"✅ 成功更新了道馆: **{data['name']}**", ephemeral=True)
         else:
+            conn.rollback()
             await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。如需创建，请使用 `/道馆 建造` 指令。", ephemeral=True)
-    except json.JSONDecodeError:
-        await interaction.followup.send("❌ 无效的JSON格式。请检查您的输入。", ephemeral=True)
     except Exception as e:
+        if conn: conn.rollback()
         await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+    finally:
+        if conn: conn.close()
 
 @gym_management_group.command(name="删除", description="删除一个道馆 (仅限管理员或开发者)。")
 @is_admin_or_owner()
 @app_commands.describe(gym_id="要删除的道馆ID。")
 async def gym_delete(interaction: discord.Interaction, gym_id: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    guild_id = str(interaction.guild.id)
+    # First, check if the gym exists.
+    if not get_single_gym(guild_id, gym_id):
+        return await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
+
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+        
+        # Perform all actions within a single transaction
+        log_gym_action(guild_id, gym_id, str(interaction.user.id), 'delete', cursor=cursor)
         # Delete progress entries for the gym
-        cursor.execute("DELETE FROM user_progress WHERE guild_id = ? AND gym_id = ?", (str(interaction.guild.id), gym_id))
+        cursor.execute("DELETE FROM user_progress WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id))
         # Delete the gym itself using the same transaction
-        delete_gym(str(interaction.guild.id), gym_id, cursor=cursor)
-        conn.commit() # Commit both deletions at once
-        await interaction.followup.send(f"✅ 如果道馆 `{gym_id}` 存在，它及其所有相关进度已被删除。", ephemeral=True)
+        delete_gym(guild_id, gym_id, cursor=cursor)
+        
+        conn.commit() # Commit all changes at once
+        await interaction.followup.send(f"✅ 道馆 `{gym_id}` 及其所有相关进度已被成功删除。", ephemeral=True)
     except Exception as e:
         if conn:
             conn.rollback() # Rollback changes on error
@@ -809,7 +880,8 @@ async def gym_get_json(interaction: discord.Interaction, gym_id: str):
     json_string = json.dumps(gym_data, indent=4, ensure_ascii=False)
     # Use a file for long JSON strings
     if len(json_string) > 1900:
-        filepath = 'gym_export.json'
+        # Create a unique filename to prevent race conditions
+        filepath = f'gym_export_{interaction.user.id}.json'
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(json_string)
