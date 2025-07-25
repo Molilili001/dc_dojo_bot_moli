@@ -6,6 +6,7 @@ import os
 import sqlite3
 import typing
 import datetime
+import aiohttp
 
 # --- Configuration Loading ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -420,11 +421,21 @@ class MainView(discord.ui.View):
         guild_id = str(interaction.guild.id)
         user_gym_progress = get_user_progress(user_id, guild_id)
         
-        await interaction.response.send_message(
-            "请从下面的列表中选择你要挑战的道馆。",
-            view=GymSelectView(guild_id, user_gym_progress),
-            ephemeral=True
-        )
+        try:
+            await interaction.response.send_message(
+                "请从下面的列表中选择你要挑战的道馆。",
+                view=GymSelectView(guild_id, user_gym_progress),
+                ephemeral=True
+            )
+        except aiohttp.ClientConnectorError:
+            # This error happens due to network instability.
+            # We can try to send an ephemeral message to the user to inform them.
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("🤖 抱歉，与 Discord 的连接出现网络波动，请稍后再试。", ephemeral=True)
+            except Exception:
+                # If sending the response also fails, just ignore it.
+                pass
 
 class StartChallengeButton(discord.ui.Button):
     def __init__(self, gym_id: str):
