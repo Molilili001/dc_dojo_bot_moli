@@ -36,9 +36,16 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS server_configs (
             guild_id TEXT PRIMARY KEY,
             challenge_channel_id TEXT,
-            master_role_id TEXT
+            master_role_id TEXT, -- Role to ADD on completion
+            role_to_remove_on_completion_id TEXT -- Role to REMOVE on completion
         )
     ''')
+    # Safely add the new column if it doesn't exist for existing databases
+    try:
+        cursor.execute("ALTER TABLE server_configs ADD COLUMN role_to_remove_on_completion_id TEXT;")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise # Re-raise other errors
     # Gym master (gym owner) permissions table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS gym_masters (
@@ -280,28 +287,29 @@ def reset_user_progress(user_id: str, guild_id: str):
     conn.close()
 
 # --- Server Config Functions ---
-def set_server_config(guild_id: str, channel_id: str, role_id: str):
+def set_server_config(guild_id: str, channel_id: str, role_to_add_id: str = None, role_to_remove_id: str = None):
     """Saves or updates a server's configuration in the database."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO server_configs (guild_id, challenge_channel_id, master_role_id)
-        VALUES (?, ?, ?)
+        INSERT INTO server_configs (guild_id, challenge_channel_id, master_role_id, role_to_remove_on_completion_id)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET
         challenge_channel_id = excluded.challenge_channel_id,
-        master_role_id = excluded.master_role_id
-    ''', (guild_id, channel_id, role_id))
+        master_role_id = excluded.master_role_id,
+        role_to_remove_on_completion_id = excluded.role_to_remove_on_completion_id
+    ''', (guild_id, channel_id, role_to_add_id, role_to_remove_id))
     conn.commit()
     conn.close()
 
 def get_server_config(guild_id: str) -> tuple:
-    """Gets a server's configuration from the database."""
+    """Gets a server's configuration from the database. Returns (role_to_add_id, role_to_remove_id)."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT master_role_id FROM server_configs WHERE guild_id = ?", (guild_id,))
+    cursor.execute("SELECT master_role_id, role_to_remove_on_completion_id FROM server_configs WHERE guild_id = ?", (guild_id,))
     row = cursor.fetchone()
     conn.close()
-    return row if row else (None,)
+    return row if row else (None, None)
 
 # --- Permission Functions ---
 def add_gym_master(guild_id: str, target_id: str, target_type: str, permission: str):
@@ -505,7 +513,7 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         del active_challenges[str(session.user_id)]
         embed = discord.Embed(title=f"🎉 恭喜你，挑战成功！", description=f"你已经成功通过 **{session.gym_info['name']}** 的考核！你的失败记录已被清零。", color=discord.Color.green())
         await interaction.response.edit_message(embed=embed, view=None)
-        await check_and_award_master_role(interaction.user)
+        await check_and_manage_completion_roles(interaction.user)
         return
 
     q_num = session.current_question_index + 1
@@ -572,8 +580,20 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
             await interaction.response.edit_message(content="挑战已超时，请重新开始。", view=None, embed=None)
             return
         user_answer = self.answer_input.value.strip()
-        correct_answer = self.question['correct_answer']
-        if user_answer.lower() == correct_answer.lower():
+        correct_answer_field = self.question['correct_answer']
+        is_correct = False
+
+        # 检查 correct_answer_field 是列表还是字符串
+        if isinstance(correct_answer_field, list):
+            # 如果是列表，检查用户答案是否在列表中（忽略大小写）
+            if any(user_answer.lower() == str(ans).lower() for ans in correct_answer_field):
+                is_correct = True
+        else:
+            # 保持对旧格式（字符串）的兼容
+            if user_answer.lower() == str(correct_answer_field).lower():
+                is_correct = True
+        
+        if is_correct:
             session.current_question_index += 1
             await display_question(interaction, session)
         else:
@@ -590,7 +610,8 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
 
             await interaction.response.edit_message(content=message, view=None, embed=None)
 
-async def check_and_award_master_role(member: discord.Member):
+async def check_and_manage_completion_roles(member: discord.Member):
+    """Checks if a user has completed all gyms and manages roles accordingly."""
     guild_id = str(member.guild.id)
     user_id = str(member.id)
     user_progress = get_user_progress(user_id, guild_id)
@@ -602,17 +623,39 @@ async def check_and_award_master_role(member: discord.Member):
     all_gym_ids = {gym['id'] for gym in guild_gyms}
     completed_gym_ids = set(user_progress.keys())
 
+    # Proceed only if the user has completed all available gyms
     if all_gym_ids.issubset(completed_gym_ids):
-        config_row = get_server_config(guild_id)
-        if not config_row: return
-        master_role_id = int(config_row[0])
-        master_role = member.guild.get_role(master_role_id)
-        if master_role and master_role not in member.roles:
+        role_to_add_id, role_to_remove_id = get_server_config(guild_id)
+        messages = []
+
+        # --- Role to Add ---
+        if role_to_add_id:
+            role_to_add = member.guild.get_role(int(role_to_add_id))
+            if role_to_add and role_to_add not in member.roles:
+                try:
+                    await member.add_roles(role_to_add)
+                    messages.append(f"✅ **获得了身份组**: {role_to_add.mention}")
+                except Exception as e:
+                    print(f"Failed to add role {role_to_add_id} in {member.guild.name}: {e}")
+        
+        # --- Role to Remove ---
+        if role_to_remove_id:
+            role_to_remove = member.guild.get_role(int(role_to_remove_id))
+            if role_to_remove and role_to_remove in member.roles:
+                try:
+                    await member.remove_roles(role_to_remove)
+                    messages.append(f"✅ **移除了身份组**: {role_to_remove.mention}")
+                except Exception as e:
+                    print(f"Failed to remove role {role_to_remove_id} in {member.guild.name}: {e}")
+
+        # --- Send DM Notification ---
+        if messages:
+            header = f"🎉 恭喜你！你已在 **{member.guild.name}** 服务器完成了所有道馆挑战！"
+            full_message = header + "\n\n" + "\n".join(messages)
             try:
-                await member.add_roles(master_role)
-                await member.send(f"恭喜你！你已在 **{member.guild.name}** 服务器完成了所有道馆挑战，并获得了“徽章大师”身份组！")
-            except Exception as e:
-                print(f"Failed to assign role in {member.guild.name}: {e}")
+                await member.send(full_message)
+            except discord.Forbidden:
+                print(f"Cannot send DM to {member.name} (ID: {member.id}).")
 
 # --- Bot Events ---
 @bot.event
@@ -703,17 +746,39 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
 
 @gym_management_group.command(name="召唤", description="在该频道召唤道馆挑战面板 (馆主、管理员、开发者)。")
 @has_gym_management_permission("召唤")
-@app_commands.describe(master_role="用户完成所有道馆后将获得的身份组。")
-async def gym_summon(interaction: discord.Interaction, master_role: discord.Role):
+@app_commands.describe(
+    role_to_add="[可选] 用户完成所有道馆后将获得的身份组。",
+    role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。"
+)
+async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
+    
     guild_id = str(interaction.guild.id)
     channel_id = str(interaction.channel.id)
-    role_id = str(master_role.id)
+    role_add_id = str(role_to_add.id) if role_to_add else None
+    role_remove_id = str(role_to_remove.id) if role_to_remove else None
+
     try:
-        set_server_config(guild_id, channel_id, role_id)
-        embed = discord.Embed(title="道馆挑战中心", description="欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n完成所有道馆挑战后，你将获得特殊身份组，并获得提前离开缓冲区的资格（仅限首次）。\n\n点击下方的按钮，开始你的挑战吧！", color=discord.Color.gold())
+        set_server_config(guild_id, channel_id, role_add_id, role_remove_id)
+        
+        embed = discord.Embed(
+            title="道馆挑战中心",
+            description="欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
+                        "完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n"
+                        "点击下方的按钮，开始你的挑战吧！",
+            color=discord.Color.gold()
+        )
         await interaction.channel.send(embed=embed, view=MainView())
-        await interaction.followup.send(f"✅ 道馆系统已成功设置！\n- **挑战频道**: {interaction.channel.mention}\n- **大师身份组**: {master_role.mention}", ephemeral=True)
+        
+        # Build confirmation message
+        confirm_messages = [f"✅ 道馆系统已成功设置于 {interaction.channel.mention}！"]
+        if role_to_add:
+            confirm_messages.append(f"- **通关奖励身份组**: {role_to_add.mention}")
+        if role_to_remove:
+            confirm_messages.append(f"- **通关移除身份组**: {role_to_remove.mention}")
+        
+        await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
+
     except Exception as e:
         await interaction.followup.send(f"❌ 设置失败: {e}", ephemeral=True)
 

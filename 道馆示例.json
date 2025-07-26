@@ -36,7 +36,11 @@
       "id": "q2_announcement",
       "type": "fill_in_blank",
       "text": "所有官方的重要通知都会在哪个频道发布？（提示：请填写完整的频道名称，以#开头）",
-      "correct_answer": "#📢｜公告发布"
+      "correct_answer": [
+        "#📢｜公告发布",
+        "公告发布",
+        "公告"
+      ]
     },
     {
       "id": "q3_etiquette",
