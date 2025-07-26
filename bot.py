@@ -558,6 +558,9 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         if question['type'] == 'multiple_choice':
             for option in question['options']:
                 view.add_item(QuestionAnswerButton(option, question['correct_answer']))
+        elif question['type'] == 'true_false':
+            view.add_item(QuestionAnswerButton('正确', question['correct_answer']))
+            view.add_item(QuestionAnswerButton('错误', question['correct_answer']))
         elif question['type'] == 'fill_in_blank':
             view.add_item(FillInBlankButton())
         view.add_item(CancelChallengeButton())
@@ -855,8 +858,8 @@ def validate_gym_json(data: dict) -> str:
         if len(q.get('text', '')) > EMBED_DESC_LIMIT:
             return f"问题 {q_num} 的 `text` 字段长度超出了Discord {EMBED_DESC_LIMIT} 字符的限制。"
 
-        if q['type'] not in ['multiple_choice', 'fill_in_blank']:
-            return f"问题 {q_num} 的 `type` 无效，必须是 'multiple_choice' 或 'fill_in_blank'。"
+        if q['type'] not in ['multiple_choice', 'fill_in_blank', 'true_false']:
+            return f"问题 {q_num} 的 `type` 无效，必须是 'multiple_choice', 'fill_in_blank' 或 'true_false'。"
             
         if q['type'] == 'multiple_choice':
             if 'options' not in q or not isinstance(q['options'], list) or len(q['options']) < 2:
@@ -867,6 +870,10 @@ def validate_gym_json(data: dict) -> str:
             for opt in q['options']:
                 if len(str(opt)) > BUTTON_LABEL_LIMIT:
                     return f"问题 {q_num} 的选项 '{str(opt)[:20]}...' 长度超出了Discord按钮 {BUTTON_LABEL_LIMIT} 字符的限制。"
+
+        if q['type'] == 'true_false':
+            if q['correct_answer'] not in ['正确', '错误']:
+                return f"问题 {q_num} (判断题) 的 `correct_answer` 必须是 '正确' 或 '错误'。"
 
     return "" # All good
 
