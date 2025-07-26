@@ -20,7 +20,7 @@
     "---",
     "准备好后，请点击下方的按钮开始考核，检验你的学习成果吧！"
   ],
-  "questions_to_ask": 2,
+  "questions_to_ask": 3,
   "allowed_mistakes": 1,
   "questions": [
     {
@@ -54,6 +54,12 @@
         "C: 详细描述自己的问题"
       ],
       "correct_answer": "B: 在答疑频道和别人闲聊"
+    },
+    {
+      "id": "q4_true_false_example",
+      "type": "true_false",
+      "text": "判断题：在提问时，为了尽快得到答案，可以直接私信管理员或热心成员。",
+      "correct_answer": "错误"
     }
   ]
 }
