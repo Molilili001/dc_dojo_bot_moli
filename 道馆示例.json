@@ -20,6 +20,8 @@
     "---",
     "准备好后，请点击下方的按钮开始考核，检验你的学习成果吧！"
   ],
+  "questions_to_ask": 2,
+  "allowed_mistakes": 1,
   "questions": [
     {
       "id": "q1_channel_function",
