@@ -9,6 +9,9 @@ import datetime
 import aiohttp
 import random
 import logging
+from logging.handlers import TimedRotatingFileHandler
+import asyncio
+from collections import defaultdict
 
 # --- Configuration Loading ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,21 +20,23 @@ db_path = os.path.join(script_dir, 'progress.db')
 log_path = os.path.join(script_dir, 'bot.log')
 
 # --- Logging Setup ---
-# Clear log file on startup
-if os.path.exists(log_path):
-    os.remove(log_path)
-
+# The log file is no longer cleared on startup to preserve history.
+# Configures a logger that rotates the log file at midnight every day and keeps the last 7 days of logs.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_path, encoding='utf-8'),
+        TimedRotatingFileHandler(log_path, when='midnight', interval=1, backupCount=7, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
 with open(config_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
+
+# --- Concurrency Locks ---
+# Create a defaultdict of asyncio.Locks to prevent race conditions on a per-user basis.
+user_db_locks = defaultdict(asyncio.Lock)
 
 # --- Database Management ---
 async def setup_database():
@@ -119,6 +124,14 @@ async def setup_database():
                 timestamp TEXT NOT NULL
             )
         ''')
+
+        # --- Create Indexes for Performance ---
+        # These indexes significantly speed up common queries in a large server.
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_progress_user_guild ON user_progress (user_id, guild_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_challenge_failures_user_guild ON challenge_failures (user_id, guild_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_gyms_guild ON gyms (guild_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_gym_masters_guild_target ON gym_masters (guild_id, target_id);")
+
         await conn.commit()
 
 # --- Gym Data Functions ---
@@ -228,57 +241,61 @@ async def get_user_failure_status(user_id: str, guild_id: str, gym_id: str) -> t
 
 async def increment_user_failure(user_id: str, guild_id: str, gym_id: str) -> datetime.timedelta:
     """Increments failure count, calculates and sets ban duration. Returns the duration."""
-    current_failures, _ = await get_user_failure_status(user_id, guild_id, gym_id)
-    new_failure_count = current_failures + 1
+    async with user_db_locks[user_id]:
+        current_failures, _ = await get_user_failure_status(user_id, guild_id, gym_id)
+        new_failure_count = current_failures + 1
 
-    ban_duration = datetime.timedelta(seconds=0)
-    if new_failure_count == 3:
-        ban_duration = datetime.timedelta(hours=1)
-    elif new_failure_count == 4:
-        ban_duration = datetime.timedelta(hours=6)
-    elif new_failure_count >= 5:
-        ban_duration = datetime.timedelta(hours=12)
+        ban_duration = datetime.timedelta(seconds=0)
+        if new_failure_count == 3:
+            ban_duration = datetime.timedelta(hours=1)
+        elif new_failure_count == 4:
+            ban_duration = datetime.timedelta(hours=6)
+        elif new_failure_count >= 5:
+            ban_duration = datetime.timedelta(hours=12)
 
-    banned_until_dt = datetime.datetime.now(datetime.timezone.utc) + ban_duration
-    banned_until_iso = banned_until_dt.isoformat()
+        banned_until_dt = datetime.datetime.now(datetime.timezone.utc) + ban_duration
+        banned_until_iso = banned_until_dt.isoformat()
 
-    async with aiosqlite.connect(db_path) as conn:
-        await conn.execute('''
-            INSERT INTO challenge_failures (user_id, guild_id, gym_id, failure_count, banned_until)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, guild_id, gym_id) DO UPDATE SET
-            failure_count = excluded.failure_count,
-            banned_until = excluded.banned_until
-        ''', (user_id, guild_id, gym_id, new_failure_count, banned_until_iso))
-        await conn.commit()
-    return ban_duration
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute('''
+                INSERT INTO challenge_failures (user_id, guild_id, gym_id, failure_count, banned_until)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, guild_id, gym_id) DO UPDATE SET
+                failure_count = excluded.failure_count,
+                banned_until = excluded.banned_until
+            ''', (user_id, guild_id, gym_id, new_failure_count, banned_until_iso))
+            await conn.commit()
+        return ban_duration
 
 async def reset_user_failures_for_gym(user_id: str, guild_id: str, gym_id: str):
     """Resets a user's failure count for a specific gym upon success."""
-    async with aiosqlite.connect(db_path) as conn:
-        await conn.execute(
-            "DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ? AND gym_id = ?",
-            (user_id, guild_id, gym_id)
-        )
-        await conn.commit()
+    async with user_db_locks[user_id]:
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ? AND gym_id = ?",
+                (user_id, guild_id, gym_id)
+            )
+            await conn.commit()
 
 async def set_gym_completed(user_id: str, guild_id: str, gym_id: str):
     """Marks a gym as completed for a user in a specific guild."""
-    try:
-        async with aiosqlite.connect(db_path, timeout=10) as conn:
-            await conn.execute("INSERT OR IGNORE INTO user_progress (user_id, guild_id, gym_id) VALUES (?, ?, ?)", (user_id, guild_id, gym_id))
-            await conn.commit()
-        logging.info(f"DATABASE: Marked gym '{gym_id}' as completed for user '{user_id}'.")
-    except aiosqlite.OperationalError as e:
-        logging.error(f"DATABASE_LOCKED: Failed to set gym completed for user '{user_id}'. Reason: {e}")
-    except Exception as e:
-        logging.error(f"DATABASE_ERROR: An unexpected error occurred in set_gym_completed: {e}")
+    async with user_db_locks[user_id]:
+        try:
+            async with aiosqlite.connect(db_path, timeout=10) as conn:
+                await conn.execute("INSERT OR IGNORE INTO user_progress (user_id, guild_id, gym_id) VALUES (?, ?, ?)", (user_id, guild_id, gym_id))
+                await conn.commit()
+            logging.info(f"DATABASE: Marked gym '{gym_id}' as completed for user '{user_id}'.")
+        except aiosqlite.OperationalError as e:
+            logging.error(f"DATABASE_LOCKED: Failed to set gym completed for user '{user_id}'. Reason: {e}")
+        except Exception as e:
+            logging.error(f"DATABASE_ERROR: An unexpected error occurred in set_gym_completed: {e}")
 
 async def reset_user_progress(user_id: str, guild_id: str):
     """Resets all progress for a user in a specific guild."""
-    async with aiosqlite.connect(db_path) as conn:
-        await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
-        await conn.commit()
+    async with user_db_locks[user_id]:
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            await conn.commit()
 
 # --- Server Config Functions ---
 async def set_server_config(guild_id: str, channel_id: str, role_to_add_id: str = None, role_to_remove_id: str = None):
@@ -666,7 +683,7 @@ async def check_and_manage_completion_roles(member: discord.Member):
                     await member.add_roles(role_to_add)
                     messages.append(f"✅ **获得了身份组**: {role_to_add.mention}")
                 except Exception as e:
-                    print(f"Failed to add role {role_to_add_id} in {member.guild.name}: {e}")
+                    logging.error(f"Failed to add role {role_to_add_id} to {member.id} in {member.guild.name}: {e}")
         
         # --- Role to Remove ---
         if role_to_remove_id:
@@ -676,7 +693,7 @@ async def check_and_manage_completion_roles(member: discord.Member):
                     await member.remove_roles(role_to_remove)
                     messages.append(f"✅ **移除了身份组**: {role_to_remove.mention}")
                 except Exception as e:
-                    print(f"Failed to remove role {role_to_remove_id} in {member.guild.name}: {e}")
+                    logging.error(f"Failed to remove role {role_to_remove_id} from {member.id} in {member.guild.name}: {e}")
 
         # --- Send DM Notification ---
         if messages:
@@ -685,7 +702,7 @@ async def check_and_manage_completion_roles(member: discord.Member):
             try:
                 await member.send(full_message)
             except discord.Forbidden:
-                print(f"Cannot send DM to {member.name} (ID: {member.id}).")
+                logging.warning(f"Cannot send DM to {member.name} (ID: {member.id}). They may have DMs disabled.")
 
 # --- Bot Events ---
 @bot.event
@@ -707,7 +724,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message("❌ 你没有执行此指令所需的权限。", ephemeral=True)
     else:
         # For other errors, you might want to log them and send a generic message.
-        print(f"Unhandled error in command {interaction.command.name if interaction.command else 'unknown'}: {error}")
+        logging.error(f"Unhandled error in command {interaction.command.name if interaction.command else 'unknown'}: {error}", exc_info=True)
         await interaction.response.send_message("🤖 执行指令时发生未知错误。", ephemeral=True)
 
 # --- Permission Check Functions ---
@@ -810,8 +827,11 @@ async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optio
         
         await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
 
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 设置失败：我没有权限在此频道发送消息或管理身份组。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 设置失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 召唤 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
 def validate_gym_json(data: dict) -> str:
     """Validates the structure and content length of the gym JSON. Returns an error string or empty string if valid."""
@@ -896,12 +916,16 @@ async def gym_create(interaction: discord.Interaction, json_data: str):
             await create_gym(str(interaction.guild.id), data, conn)
             await log_gym_action(str(interaction.guild.id), data['id'], str(interaction.user.id), 'create', conn)
             await conn.commit()
+        logging.info(f"ADMIN: User '{interaction.user.id}' created gym '{data['id']}' in guild '{interaction.guild.id}'.")
         await interaction.followup.send(f"✅ 成功创建了道馆: **{data['name']}**", ephemeral=True)
     except aiosqlite.IntegrityError:
         gym_id = data.get('id', '未知')
         await interaction.followup.send(f"❌ 操作失败：道馆ID `{gym_id}` 已存在。如需修改，请使用 `/道馆 更新` 指令。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 建造 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="更新", description="用新的JSON数据覆盖一个现有道馆 (馆主、管理员、开发者)。")
 @has_gym_management_permission("更新")
@@ -928,11 +952,15 @@ async def gym_update(interaction: discord.Interaction, gym_id: str, json_data: s
             if updated_rows > 0:
                 await log_gym_action(str(interaction.guild.id), gym_id, str(interaction.user.id), 'update', conn)
                 await conn.commit()
+                logging.info(f"ADMIN: User '{interaction.user.id}' updated gym '{gym_id}' in guild '{interaction.guild.id}'.")
                 await interaction.followup.send(f"✅ 成功更新了道馆: **{data['name']}**", ephemeral=True)
             else:
                 await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。如需创建，请使用 `/道馆 建造` 指令。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 删除 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="删除", description="删除一个道馆 (仅限管理员或开发者)。")
 @is_admin_or_owner()
@@ -951,9 +979,13 @@ async def gym_delete(interaction: discord.Interaction, gym_id: str):
             await conn.execute("DELETE FROM user_progress WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id))
             await delete_gym(guild_id, gym_id, conn)
             await conn.commit()
+        logging.info(f"ADMIN: User '{interaction.user.id}' deleted gym '{gym_id}' from guild '{guild_id}'.")
         await interaction.followup.send(f"✅ 道馆 `{gym_id}` 及其所有相关进度已被成功删除。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 更新 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="后门", description="获取一个现有道馆的JSON数据 (馆主、管理员、开发者)。")
 @has_gym_management_permission("后门")
@@ -1036,8 +1068,11 @@ async def set_gym_master(interaction: discord.Interaction, action: str, target: 
         elif action == "remove":
             await remove_gym_master(guild_id, target_id, permission)
             await interaction.followup.send(f"✅ 已从 {target.mention} 移除 `{permission}` 权限。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 设置馆主 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="重置进度", description="重置一个用户的道馆挑战进度 (馆主、管理员、开发者)。")
 @has_gym_management_permission("重置进度")
@@ -1055,8 +1090,11 @@ async def reset_progress(interaction: discord.Interaction, user: discord.Member)
         
         await reset_user_progress(user_id, guild_id)
         await interaction.followup.send(f"✅ 已成功重置用户 {user.mention} 的所有道馆挑战进度和失败记录。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 重置失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 重置失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 重置进度 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 重置失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="解除处罚", description="解除用户在特定道馆的挑战冷却 (馆主、管理员、开发者)。")
 @has_gym_management_permission("解除处罚")
@@ -1076,8 +1114,11 @@ async def gym_pardon(interaction: discord.Interaction, user: discord.Member, gym
     try:
         await reset_user_failures_for_gym(user_id, guild_id, gym_id)
         await interaction.followup.send(f"✅ 已成功解除用户 {user.mention} 在道馆 `{gym_id}` 的挑战处罚。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 操作失败: {e}", ephemeral=True)
+        logging.error(f"Error in /道馆 解除处罚 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 bot.tree.add_command(gym_management_group)
 
