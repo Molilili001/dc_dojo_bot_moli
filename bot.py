@@ -416,7 +416,8 @@ class GymSelect(discord.ui.Select):
         super().__init__(placeholder="请选择一个道馆进行挑战...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        # Defer the component interaction response, allowing us to edit the message later.
+        await interaction.response.defer()
         user_id = str(interaction.user.id)
         guild_id = str(interaction.guild.id)
         gym_id = self.values[0]
@@ -459,6 +460,7 @@ class GymSelect(discord.ui.Select):
         
         view = discord.ui.View()
         view.add_item(StartChallengeButton(gym_id))
+        # After deferring, we must use edit_original_response to update the message.
         await interaction.edit_original_response(content=None, embed=embed, view=view)
 
 class GymSelectView(discord.ui.View):
