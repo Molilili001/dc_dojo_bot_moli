@@ -586,9 +586,9 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
     final_view = None if is_final_result else view
     
     if from_modal:
-        # The interaction comes from a modal submission. We must edit the original message.
-        if interaction.message:
-            await interaction.message.edit(embed=embed, view=final_view)
+        # The interaction comes from a modal submission that has been deferred.
+        # We must edit the original response to the interaction.
+        await interaction.edit_original_response(embed=embed, view=final_view)
     elif interaction.response.is_done():
         # The interaction has already been responded to (e.g., deferred).
         await interaction.edit_original_response(embed=embed, view=final_view)
@@ -630,21 +630,26 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
         self.question = question
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Defer the interaction immediately to prevent it from timing out.
+        await interaction.response.defer()
+
         session = active_challenges.get(str(interaction.user.id))
         if not session:
-            await interaction.response.edit_message(content="挑战已超时，请重新开始。", view=None, embed=None)
+            # If the session has timed out, edit the deferred response to inform the user.
+            await interaction.edit_original_response(content="挑战已超时，请重新开始。", view=None, embed=None)
             return
+
         user_answer = self.answer_input.value.strip()
         correct_answer_field = self.question['correct_answer']
         is_correct = False
 
-        # 检查 correct_answer_field 是列表还是字符串
+        # Check if correct_answer_field is a list or a string
         if isinstance(correct_answer_field, list):
-            # 如果是列表，检查用户答案是否在列表中（忽略大小写）
+            # If it's a list, check if the user's answer is in the list (case-insensitive)
             if any(user_answer.lower() == str(ans).lower() for ans in correct_answer_field):
                 is_correct = True
         else:
-            # 保持对旧格式（字符串）的兼容
+            # Maintain compatibility with the old format (string)
             if user_answer.lower() == str(correct_answer_field).lower():
                 is_correct = True
         
@@ -653,8 +658,7 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
             logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
 
         session.current_question_index += 1
-        # Acknowledge the modal submission, then display the next question.
-        await interaction.response.defer()
+        # The interaction is already deferred, now update the original message with the next question.
         await display_question(interaction, session, from_modal=True)
 
 async def check_and_manage_completion_roles(member: discord.Member):
