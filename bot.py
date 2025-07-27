@@ -12,6 +12,10 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import asyncio
 from collections import defaultdict
+import pytz
+
+# --- Timezone Configuration ---
+BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
 # --- Configuration Loading ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,16 +24,41 @@ db_path = os.path.join(script_dir, 'progress.db')
 log_path = os.path.join(script_dir, 'bot.log')
 
 # --- Logging Setup ---
-# The log file is no longer cleared on startup to preserve history.
-# Configures a logger that rotates the log file at midnight every day and keeps the last 7 days of logs.
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        TimedRotatingFileHandler(log_path, when='midnight', interval=1, backupCount=7, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+class TimezoneFormatter(logging.Formatter):
+    """Custom formatter to use a specific timezone."""
+    def __init__(self, fmt=None, datefmt=None, tz=None):
+        super().__init__(fmt, datefmt)
+        self.tz = tz if tz else pytz.utc
+
+    def formatTime(self, record, datefmt=None):
+        # Use the timezone to format the record's creation time
+        dt = datetime.datetime.fromtimestamp(record.created, self.tz)
+        if datefmt:
+            return dt.strftime(datefmt)
+        # Fallback to a readable ISO-like format
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+# Configure the root logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create a formatter instance with Beijing timezone
+formatter = TimezoneFormatter('%(asctime)s - %(levelname)s - %(message)s', tz=BEIJING_TZ)
+
+# Create a file handler that rotates daily
+# The rotation time will be based on the server's local time, but the log timestamps will be in Beijing time.
+file_handler = TimedRotatingFileHandler(log_path, when='midnight', interval=1, backupCount=7, encoding='utf-8')
+file_handler.setFormatter(formatter)
+
+# Create a stream handler for console output
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+
+# Add handlers to the logger, but clear existing ones first to avoid duplicates
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
 with open(config_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -215,7 +244,7 @@ async def delete_gym(guild_id: str, gym_id: str, conn: aiosqlite.Connection):
 # --- Gym Audit Log Functions ---
 async def log_gym_action(guild_id: str, gym_id: str, user_id: str, action: str, conn: aiosqlite.Connection):
     """Logs a gym management action using the provided connection."""
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
     await conn.execute('''
         INSERT INTO gym_audit_log (guild_id, gym_id, user_id, action, timestamp)
         VALUES (?, ?, ?, ?, ?)
@@ -1288,7 +1317,7 @@ async def backup_single_gym(guild_id: str, gym_id: str):
                 return
 
         # Content has changed or no backup exists, create a new one with a precise timestamp.
-        timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')
+        timestamp_str = datetime.datetime.now(BEIJING_TZ).strftime('%Y-%m-%d_%H-%M-%S')
         backup_filepath = os.path.join(backup_dir, f"{timestamp_str}.json")
 
         with open(backup_filepath, 'w', encoding='utf-8') as f:
