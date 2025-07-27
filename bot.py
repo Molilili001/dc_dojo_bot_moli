@@ -58,15 +58,19 @@ async def setup_database():
                 guild_id TEXT PRIMARY KEY,
                 challenge_channel_id TEXT,
                 master_role_id TEXT, -- Role to ADD on completion
-                role_to_remove_on_completion_id TEXT -- Role to REMOVE on completion
+                role_to_remove_on_completion_id TEXT, -- Role to REMOVE on completion
+                associated_gyms TEXT -- JSON list of gym IDs for this specific panel, or NULL for all
             )
         ''')
-        # Safely add the new column if it doesn't exist for existing databases
+        # Safely add new columns for existing databases
         try:
             await conn.execute("ALTER TABLE server_configs ADD COLUMN role_to_remove_on_completion_id TEXT;")
         except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e):
-                raise # Re-raise other errors
+            if "duplicate column name" not in str(e): raise
+        try:
+            await conn.execute("ALTER TABLE server_configs ADD COLUMN associated_gyms TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e): raise
         # Gym master (gym owner) permissions table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gym_masters (
@@ -298,25 +302,34 @@ async def reset_user_progress(user_id: str, guild_id: str):
             await conn.commit()
 
 # --- Server Config Functions ---
-async def set_server_config(guild_id: str, channel_id: str, role_to_add_id: str = None, role_to_remove_id: str = None):
+async def set_server_config(guild_id: str, channel_id: str, role_to_add_id: str = None, role_to_remove_id: str = None, associated_gyms_json: str = None):
     """Saves or updates a server's configuration in the database."""
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute('''
-            INSERT INTO server_configs (guild_id, challenge_channel_id, master_role_id, role_to_remove_on_completion_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO server_configs (guild_id, challenge_channel_id, master_role_id, role_to_remove_on_completion_id, associated_gyms)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
             challenge_channel_id = excluded.challenge_channel_id,
             master_role_id = excluded.master_role_id,
-            role_to_remove_on_completion_id = excluded.role_to_remove_on_completion_id
-        ''', (guild_id, channel_id, role_to_add_id, role_to_remove_id))
+            role_to_remove_on_completion_id = excluded.role_to_remove_on_completion_id,
+            associated_gyms = excluded.associated_gyms
+        ''', (guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms_json))
         await conn.commit()
 
 async def get_server_config(guild_id: str) -> tuple:
-    """Gets a server's configuration from the database. Returns (role_to_add_id, role_to_remove_id)."""
+    """
+    Gets a server's configuration from the database.
+    Returns (role_to_add_id, role_to_remove_id, associated_gyms_list).
+    """
     async with aiosqlite.connect(db_path) as conn:
-        async with conn.execute("SELECT master_role_id, role_to_remove_on_completion_id FROM server_configs WHERE guild_id = ?", (guild_id,)) as cursor:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT master_role_id, role_to_remove_on_completion_id, associated_gyms FROM server_configs WHERE guild_id = ?", (guild_id,)) as cursor:
             row = await cursor.fetchone()
-    return row if row else (None, None)
+    if not row:
+        return None, None, None
+    
+    gym_list = json.loads(row['associated_gyms']) if row['associated_gyms'] else None
+    return row['master_role_id'], row['role_to_remove_on_completion_id'], gym_list
 
 # --- Permission Functions ---
 async def add_gym_master(guild_id: str, target_id: str, target_type: str, permission: str):
@@ -479,12 +492,22 @@ class MainView(discord.ui.View):
         guild_id = str(interaction.guild.id)
         
         user_gym_progress = await get_user_progress(user_id, guild_id)
-        guild_gyms = await get_guild_gyms(guild_id)
+        all_guild_gyms = await get_guild_gyms(guild_id)
         
+        # Check if this panel is associated with a specific list of gyms
+        _, _, associated_gyms = await get_server_config(guild_id)
+        
+        if associated_gyms:
+            # Filter the gyms to only those specified for this panel
+            gyms_for_this_panel = [gym for gym in all_guild_gyms if gym['id'] in associated_gyms]
+        else:
+            # If no specific list, show all gyms
+            gyms_for_this_panel = all_guild_gyms
+            
         try:
             await interaction.followup.send(
                 "请从下面的列表中选择你要挑战的道馆。",
-                view=GymSelectView(guild_gyms, user_gym_progress),
+                view=GymSelectView(gyms_for_this_panel, user_gym_progress),
                 ephemeral=True
             )
         except aiohttp.ClientConnectorError:
@@ -668,17 +691,28 @@ async def check_and_manage_completion_roles(member: discord.Member):
     guild_id = str(member.guild.id)
     user_id = str(member.id)
     user_progress = await get_user_progress(user_id, guild_id)
-    guild_gyms = await get_guild_gyms(guild_id)
+    
+    # Get server config, which now includes the list of associated gyms
+    role_to_add_id, role_to_remove_id, associated_gyms = await get_server_config(guild_id)
 
-    if not user_progress or not guild_gyms:
+    # Determine the set of gyms required for role changes
+    if associated_gyms:
+        # If a specific list of gyms is defined for the panel, use that
+        all_gym_ids = set(associated_gyms)
+    else:
+        # Otherwise, use all gyms in the server
+        guild_gyms = await get_guild_gyms(guild_id)
+        if not guild_gyms:
+            return
+        all_gym_ids = {gym['id'] for gym in guild_gyms}
+
+    if not user_progress or not all_gym_ids:
         return
 
-    all_gym_ids = {gym['id'] for gym in guild_gyms}
     completed_gym_ids = set(user_progress.keys())
 
-    # Proceed only if the user has completed all available gyms
+    # Proceed only if the user has completed all *required* gyms
     if all_gym_ids.issubset(completed_gym_ids):
-        role_to_add_id, role_to_remove_id = await get_server_config(guild_id)
         messages = []
 
         # --- Role to Add ---
@@ -802,24 +836,47 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
 @has_gym_management_permission("召唤")
 @app_commands.describe(
     role_to_add="[可选] 用户完成所有道馆后将获得的身份组。",
-    role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。"
+    role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。",
+    introduction="[可选] 自定义挑战面板的介绍文字。",
+    gym_ids="[可选] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。"
 )
-async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None):
+async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
     channel_id = str(interaction.channel.id)
     role_add_id = str(role_to_add.id) if role_to_add else None
     role_remove_id = str(role_to_remove.id) if role_to_remove else None
+    
+    associated_gyms_list = None
+    if gym_ids:
+        associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')]
+        
+        # --- Validation Step ---
+        all_guild_gyms = await get_guild_gyms(guild_id)
+        all_gym_ids_set = {gym['id'] for gym in all_guild_gyms}
+        invalid_ids = [gid for gid in associated_gyms_list if gid not in all_gym_ids_set]
+        
+        if invalid_ids:
+            await interaction.followup.send(f"❌ 操作失败：以下道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+            return
+        # --- End Validation ---
+        
+    associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
     try:
-        await set_server_config(guild_id, channel_id, role_add_id, role_remove_id)
+        await set_server_config(guild_id, channel_id, role_add_id, role_remove_id, associated_gyms_json)
+        
+        # Use the custom introduction if provided, otherwise use the default text.
+        description = introduction if introduction else (
+            "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
+            "完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n"
+            "点击下方的按钮，开始你的挑战吧！"
+        )
         
         embed = discord.Embed(
             title="道馆挑战中心",
-            description="欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
-                        "完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n"
-                        "点击下方的按钮，开始你的挑战吧！",
+            description=description,
             color=discord.Color.gold()
         )
         await interaction.channel.send(embed=embed, view=MainView())
@@ -830,6 +887,8 @@ async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optio
             confirm_messages.append(f"- **通关奖励身份组**: {role_to_add.mention}")
         if role_to_remove:
             confirm_messages.append(f"- **通关移除身份组**: {role_to_remove.mention}")
+        if associated_gyms_list:
+            confirm_messages.append(f"- **关联道馆列表**: `{', '.join(associated_gyms_list)}`")
         
         await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
 
