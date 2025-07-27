@@ -54,23 +54,15 @@ async def setup_database():
         ''')
         # Server configuration table
         await conn.execute('''
-            CREATE TABLE IF NOT EXISTS server_configs (
-                guild_id TEXT PRIMARY KEY,
-                challenge_channel_id TEXT,
-                master_role_id TEXT, -- Role to ADD on completion
-                role_to_remove_on_completion_id TEXT, -- Role to REMOVE on completion
-                associated_gyms TEXT -- JSON list of gym IDs for this specific panel, or NULL for all
+            CREATE TABLE IF NOT EXISTS challenge_panels (
+                message_id TEXT PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                role_to_add_id TEXT,
+                role_to_remove_id TEXT,
+                associated_gyms TEXT -- JSON list of gym IDs, or NULL for all
             )
         ''')
-        # Safely add new columns for existing databases
-        try:
-            await conn.execute("ALTER TABLE server_configs ADD COLUMN role_to_remove_on_completion_id TEXT;")
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e): raise
-        try:
-            await conn.execute("ALTER TABLE server_configs ADD COLUMN associated_gyms TEXT;")
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e): raise
         # Gym master (gym owner) permissions table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gym_masters (
@@ -301,35 +293,7 @@ async def reset_user_progress(user_id: str, guild_id: str):
             await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
             await conn.commit()
 
-# --- Server Config Functions ---
-async def set_server_config(guild_id: str, channel_id: str, role_to_add_id: str = None, role_to_remove_id: str = None, associated_gyms_json: str = None):
-    """Saves or updates a server's configuration in the database."""
-    async with aiosqlite.connect(db_path) as conn:
-        await conn.execute('''
-            INSERT INTO server_configs (guild_id, challenge_channel_id, master_role_id, role_to_remove_on_completion_id, associated_gyms)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET
-            challenge_channel_id = excluded.challenge_channel_id,
-            master_role_id = excluded.master_role_id,
-            role_to_remove_on_completion_id = excluded.role_to_remove_on_completion_id,
-            associated_gyms = excluded.associated_gyms
-        ''', (guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms_json))
-        await conn.commit()
-
-async def get_server_config(guild_id: str) -> tuple:
-    """
-    Gets a server's configuration from the database.
-    Returns (role_to_add_id, role_to_remove_id, associated_gyms_list).
-    """
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT master_role_id, role_to_remove_on_completion_id, associated_gyms FROM server_configs WHERE guild_id = ?", (guild_id,)) as cursor:
-            row = await cursor.fetchone()
-    if not row:
-        return None, None, None
-    
-    gym_list = json.loads(row['associated_gyms']) if row['associated_gyms'] else None
-    return row['master_role_id'], row['role_to_remove_on_completion_id'], gym_list
+# (This space is intentionally left blank after removing the old server config functions)
 
 # --- Permission Functions ---
 async def add_gym_master(guild_id: str, target_id: str, target_type: str, permission: str):
@@ -381,11 +345,12 @@ active_challenges = {}
 
 class ChallengeSession:
     """Represents a user's current challenge session."""
-    def __init__(self, user_id: int, guild_id: int, gym_id: str, gym_info: dict):
+    def __init__(self, user_id: int, guild_id: int, gym_id: str, gym_info: dict, panel_message_id: int):
         self.user_id = user_id
         self.guild_id = guild_id
         self.gym_id = gym_id
         self.gym_info = gym_info
+        self.panel_message_id = panel_message_id # The ID of the panel message this challenge originated from
         self.current_question_index = 0
         self.mistakes_made = 0
         self.allowed_mistakes = self.gym_info.get('allowed_mistakes', 0)
@@ -413,7 +378,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- Views ---
 class GymSelect(discord.ui.Select):
-    def __init__(self, guild_gyms: list, user_progress: dict):
+    def __init__(self, guild_gyms: list, user_progress: dict, panel_message_id: int):
+        self.panel_message_id = panel_message_id
         options = []
         if not guild_gyms:
             options.append(discord.SelectOption(label="本服务器暂无道馆", description="请管理员使用 /道馆 建造 来创建道馆。", value="no_gyms", emoji="🤷"))
@@ -434,6 +400,7 @@ class GymSelect(discord.ui.Select):
         user_id = str(interaction.user.id)
         guild_id = str(interaction.guild.id)
         gym_id = self.values[0]
+        panel_message_id = self.panel_message_id # Get the ID from the view state
 
         if gym_id == "no_gyms":
             await interaction.edit_original_response(content="本服务器还没有创建任何道馆哦。", view=None)
@@ -464,9 +431,9 @@ class GymSelect(discord.ui.Select):
             await interaction.edit_original_response(content="错误：找不到该道馆的数据。可能已被删除。", view=None)
             return
             
-        session = ChallengeSession(user_id, interaction.guild.id, gym_id, gym_info)
+        session = ChallengeSession(user_id, interaction.guild.id, gym_id, gym_info, panel_message_id)
         active_challenges[user_id] = session
-        logging.info(f"CHALLENGE: Session created for user '{user_id}' in gym '{gym_id}'.")
+        logging.info(f"CHALLENGE: Session created for user '{user_id}' in gym '{gym_id}' from panel '{panel_message_id}'.")
         
         tutorial_text = "\n".join(session.gym_info['tutorial'])
         embed = discord.Embed(title=f"欢迎来到 {session.gym_info['name']}", description=tutorial_text, color=discord.Color.blue())
@@ -477,9 +444,9 @@ class GymSelect(discord.ui.Select):
         await interaction.edit_original_response(content=None, embed=embed, view=view)
 
 class GymSelectView(discord.ui.View):
-    def __init__(self, guild_gyms: list, user_progress: dict):
+    def __init__(self, guild_gyms: list, user_progress: dict, panel_message_id: int):
         super().__init__(timeout=180)
-        self.add_item(GymSelect(guild_gyms, user_progress))
+        self.add_item(GymSelect(guild_gyms, user_progress, panel_message_id))
 
 class MainView(discord.ui.View):
     def __init__(self):
@@ -490,13 +457,19 @@ class MainView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         user_id = str(interaction.user.id)
         guild_id = str(interaction.guild.id)
+        panel_message_id = interaction.message.id # Get the ID of the panel message this button belongs to
         
         user_gym_progress = await get_user_progress(user_id, guild_id)
         all_guild_gyms = await get_guild_gyms(guild_id)
         
-        # Check if this panel is associated with a specific list of gyms
-        _, _, associated_gyms = await get_server_config(guild_id)
-        
+        # Get the specific configuration for THIS panel from the database
+        async with aiosqlite.connect(db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT associated_gyms FROM challenge_panels WHERE message_id = ?", (str(panel_message_id),)) as cursor:
+                panel_config = await cursor.fetchone()
+
+        associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config and panel_config['associated_gyms'] else None
+
         if associated_gyms:
             # Filter the gyms to only those specified for this panel
             gyms_for_this_panel = [gym for gym in all_guild_gyms if gym['id'] in associated_gyms]
@@ -507,7 +480,7 @@ class MainView(discord.ui.View):
         try:
             await interaction.followup.send(
                 "请从下面的列表中选择你要挑战的道馆。",
-                view=GymSelectView(gyms_for_this_panel, user_gym_progress),
+                view=GymSelectView(gyms_for_this_panel, user_gym_progress, panel_message_id),
                 ephemeral=True
             )
         except aiohttp.ClientConnectorError:
@@ -569,7 +542,7 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                            f"允许错题数: **{session.allowed_mistakes}**\n\n" \
                            "你的道馆挑战失败记录已被清零。"
             embed = discord.Embed(title="🎉 恭喜你，挑战成功！", description=success_desc, color=discord.Color.green())
-            await check_and_manage_completion_roles(interaction.user)
+            await check_and_manage_completion_roles(interaction.user, session)
         else:
             # --- CHALLENGE FAILURE ---
             ban_duration = await increment_user_failure(user_id_str, guild_id_str, session.gym_id)
@@ -686,33 +659,48 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
         # The interaction is already deferred, now update the original message with the next question.
         await display_question(interaction, session, from_modal=True)
 
-async def check_and_manage_completion_roles(member: discord.Member):
-    """Checks if a user has completed all gyms and manages roles accordingly."""
+async def check_and_manage_completion_roles(member: discord.Member, session: ChallengeSession):
+    """Checks if a user has completed all gyms required by a specific panel and manages roles."""
     guild_id = str(member.guild.id)
     user_id = str(member.id)
-    user_progress = await get_user_progress(user_id, guild_id)
+    panel_message_id = str(session.panel_message_id)
     
-    # Get server config, which now includes the list of associated gyms
-    role_to_add_id, role_to_remove_id, associated_gyms = await get_server_config(guild_id)
+    user_progress = await get_user_progress(user_id, guild_id)
 
-    # Determine the set of gyms required for role changes
+    # Get the specific configuration for the panel the user interacted with
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT role_to_add_id, role_to_remove_id, associated_gyms FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+            panel_config = await cursor.fetchone()
+
+    if not panel_config:
+        logging.warning(f"Could not find panel config for message_id {panel_message_id} during role check.")
+        return
+
+    role_to_add_id = panel_config['role_to_add_id']
+    role_to_remove_id = panel_config['role_to_remove_id']
+    associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config['associated_gyms'] else None
+
+    # Get all gyms that currently exist in the server
+    all_guild_gyms = await get_guild_gyms(guild_id)
+    all_existing_gym_ids = {gym['id'] for gym in all_guild_gyms}
+
+    # Determine the set of gyms required for role changes based on the panel's config
     if associated_gyms:
-        # If a specific list of gyms is defined for the panel, use that
-        all_gym_ids = set(associated_gyms)
+        # If a specific list is defined, the requirement is to complete all *existing* gyms from that list.
+        required_gyms_set = set(associated_gyms)
+        required_ids_for_panel = required_gyms_set.intersection(all_existing_gym_ids)
     else:
-        # Otherwise, use all gyms in the server
-        guild_gyms = await get_guild_gyms(guild_id)
-        if not guild_gyms:
-            return
-        all_gym_ids = {gym['id'] for gym in guild_gyms}
+        # Otherwise, use all existing gyms in the server
+        required_ids_for_panel = all_existing_gym_ids
 
-    if not user_progress or not all_gym_ids:
+    if not user_progress or not required_ids_for_panel:
         return
 
     completed_gym_ids = set(user_progress.keys())
 
-    # Proceed only if the user has completed all *required* gyms
-    if all_gym_ids.issubset(completed_gym_ids):
+    # Proceed only if the user has completed all gyms required by this specific panel
+    if required_ids_for_panel.issubset(completed_gym_ids):
         messages = []
 
         # --- Role to Add ---
@@ -737,7 +725,7 @@ async def check_and_manage_completion_roles(member: discord.Member):
 
         # --- Send DM Notification ---
         if messages:
-            header = f"🎉 恭喜你！你已在 **{member.guild.name}** 服务器完成了所有道馆挑战！"
+            header = f"🎉 恭喜你！你已在 **{member.guild.name}** 服务器完成了指定道馆挑战！"
             full_message = header + "\n\n" + "\n".join(messages)
             try:
                 await member.send(full_message)
@@ -844,7 +832,6 @@ async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optio
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
-    channel_id = str(interaction.channel.id)
     role_add_id = str(role_to_add.id) if role_to_add else None
     role_remove_id = str(role_to_remove.id) if role_to_remove else None
     
@@ -865,8 +852,6 @@ async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optio
     associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
     try:
-        await set_server_config(guild_id, channel_id, role_add_id, role_remove_id, associated_gyms_json)
-        
         # Use the custom introduction if provided, otherwise use the default text.
         description = introduction if introduction else (
             "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
@@ -879,10 +864,20 @@ async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optio
             description=description,
             color=discord.Color.gold()
         )
-        await interaction.channel.send(embed=embed, view=MainView())
         
+        # Send the panel message first to get its ID
+        panel_message = await interaction.channel.send(embed=embed, view=MainView())
+        
+        # Now, save the configuration for this specific panel to the database
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute('''
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json))
+            await conn.commit()
+
         # Build confirmation message
-        confirm_messages = [f"✅ 道馆系统已成功设置于 {interaction.channel.mention}！"]
+        confirm_messages = [f"✅ 道馆面板已成功创建于 {interaction.channel.mention}！"]
         if role_to_add:
             confirm_messages.append(f"- **通关奖励身份组**: {role_to_add.mention}")
         if role_to_remove:
