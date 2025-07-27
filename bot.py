@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import os
@@ -571,8 +571,19 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=question['text'], color=discord.Color.orange())
         
         if question['type'] == 'multiple_choice':
-            for option in question['options']:
-                view.add_item(QuestionAnswerButton(option, question['correct_answer']))
+            # Format the question with A, B, C options in the embed
+            formatted_options = []
+            for i, option_text in enumerate(question['options']):
+                letter = chr(ord('A') + i)
+                formatted_options.append(f"**{letter}:** {option_text}")
+            
+            embed.description = question['text'] + "\n\n" + "\n".join(formatted_options)
+
+            # Create buttons with letter labels
+            for i, option_text in enumerate(question['options']):
+                letter = chr(ord('A') + i)
+                view.add_item(QuestionAnswerButton(label=letter, correct_answer=question['correct_answer'], value=option_text))
+
         elif question['type'] == 'true_false':
             view.add_item(QuestionAnswerButton('正确', question['correct_answer']))
             view.add_item(QuestionAnswerButton('错误', question['correct_answer']))
@@ -595,16 +606,21 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         await interaction.response.edit_message(embed=embed, view=final_view)
 
 class QuestionAnswerButton(discord.ui.Button):
-    def __init__(self, label: str, correct_answer: str):
+    # The `value` parameter holds the actual answer content to check.
+    # If not provided, it defaults to the button's visible `label`.
+    def __init__(self, label: str, correct_answer: str, value: str = None):
         super().__init__(label=label, style=discord.ButtonStyle.secondary)
         self.correct_answer = correct_answer
+        self.value = value if value is not None else label
 
     async def callback(self, interaction: discord.Interaction):
         session = active_challenges.get(str(interaction.user.id))
         if not session:
             await interaction.response.edit_message(content="挑战已超时，请重新开始。", view=None, embed=None)
             return
-        if self.label != self.correct_answer:
+        
+        # Check the button's actual value against the correct answer
+        if self.value != self.correct_answer:
             session.mistakes_made += 1
             logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
 
@@ -744,6 +760,7 @@ async def on_ready():
         logging.error(f"Error syncing commands globally: {e}")
     logging.info('Bot is ready to accept commands.')
     bot.add_view(MainView())
+    daily_backup_task.start()
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -946,10 +963,6 @@ def validate_gym_json(data: dict) -> str:
                 return f"问题 {q_num} (选择题) 必须包含一个至少有2个选项的 `options` 列表。"
             if q['correct_answer'] not in q['options']:
                 return f"问题 {q_num} (选择题) 的 `correct_answer` 必须是 `options` 列表中的一个。"
-            # Validate button label length
-            for opt in q['options']:
-                if len(str(opt)) > BUTTON_LABEL_LIMIT:
-                    return f"问题 {q_num} 的选项 '{str(opt)[:20]}...' 长度超出了Discord按钮 {BUTTON_LABEL_LIMIT} 字符的限制。"
 
         if q['type'] == 'true_false':
             if q['correct_answer'] not in ['正确', '错误']:
@@ -1006,6 +1019,9 @@ async def gym_create(interaction: discord.Interaction, json_file: discord.Attach
 async def gym_update(interaction: discord.Interaction, gym_id: str, json_file: discord.Attachment):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
+    # Trigger a backup for the specific gym before making changes
+    await backup_single_gym(str(interaction.guild.id), gym_id)
+
     if not json_file.filename.lower().endswith('.json'):
         return await interaction.followup.send("❌ 文件格式错误，请上传一个 `.json` 文件。", ephemeral=True)
 
@@ -1055,9 +1071,13 @@ async def gym_delete(interaction: discord.Interaction, gym_id: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
-    # First, check if the gym exists.
+    
+    # First, check if the gym exists. If not, we can't back it up or delete it.
     if not await get_single_gym(guild_id, gym_id):
         return await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
+
+    # Now that we know the gym exists, trigger a backup before deleting.
+    await backup_single_gym(guild_id, gym_id)
 
     try:
         async with aiosqlite.connect(db_path) as conn:
@@ -1205,6 +1225,75 @@ async def gym_pardon(interaction: discord.Interaction, user: discord.Member, gym
     except Exception as e:
         logging.error(f"Error in /道馆 解除处罚 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
+
+# --- Automatic Backup Task ---
+
+async def backup_single_gym(guild_id: str, gym_id: str):
+    """Backs up the current state of a single gym."""
+    try:
+        gym_data = await get_single_gym(guild_id, gym_id)
+        if not gym_data:
+            logging.warning(f"BACKUP: Attempted to back up non-existent gym '{gym_id}' in guild '{guild_id}'.")
+            return
+
+        # Create a structured directory path for backups
+        backup_dir = os.path.join(script_dir, 'gym_backups', guild_id, gym_id)
+        os.makedirs(backup_dir, exist_ok=True)
+
+        # Prepare the new backup content as a sorted JSON string for consistent comparison
+        new_backup_json_string = json.dumps(gym_data, indent=4, ensure_ascii=False, sort_keys=True)
+
+        # Find the most recent backup file for this specific gym to compare against
+        existing_backups = sorted(
+            [f for f in os.listdir(backup_dir) if f.endswith(".json")],
+            reverse=True
+        )
+
+        if existing_backups:
+            latest_backup_file = os.path.join(backup_dir, existing_backups[0])
+            with open(latest_backup_file, 'r', encoding='utf-8') as f:
+                last_backup_json_string = f.read()
+
+            if new_backup_json_string == last_backup_json_string:
+                # No changes, so no backup needed for this trigger.
+                return
+
+        # Content has changed or no backup exists, create a new one with a precise timestamp.
+        timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')
+        backup_filepath = os.path.join(backup_dir, f"{timestamp_str}.json")
+
+        with open(backup_filepath, 'w', encoding='utf-8') as f:
+            f.write(new_backup_json_string)
+        logging.info(f"BACKUP: Successfully created on-demand backup for gym {gym_id} in guild {guild_id}.")
+
+    except Exception as e:
+        logging.error(f"BACKUP: Failed to process on-demand backup for gym {gym_id} in guild {guild_id}. Reason: {e}", exc_info=True)
+
+@tasks.loop(hours=24)
+async def daily_backup_task():
+    """A background task that automatically backs up all gyms for all guilds daily."""
+    logging.info("BACKUP: Starting daily full backup process...")
+    try:
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute("SELECT DISTINCT guild_id FROM gyms")
+            guild_ids = [row[0] for row in await cursor.fetchall()]
+        
+        for guild_id in guild_ids:
+            async with aiosqlite.connect(db_path) as conn:
+                cursor = await conn.execute("SELECT DISTINCT gym_id FROM gyms WHERE guild_id = ?", (guild_id,))
+                gym_ids = [row[0] for row in await cursor.fetchall()]
+            
+            for gym_id in gym_ids:
+                await backup_single_gym(guild_id, gym_id)
+        
+        logging.info("BACKUP: Daily full backup process finished.")
+    except Exception as e:
+        logging.error(f"BACKUP: A critical error occurred during the daily backup task. Reason: {e}", exc_info=True)
+
+@daily_backup_task.before_loop
+async def before_daily_backup_task():
+    """Ensures the bot is fully ready before the backup loop starts."""
+    await bot.wait_until_ready()
 
 bot.tree.add_command(gym_management_group)
 
