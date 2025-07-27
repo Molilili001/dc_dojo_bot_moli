@@ -82,6 +82,16 @@ pip install discord.py aiosqlite aiohttp pytz
 python bot.py
 ```
 
+## 📁 项目结构
+
+机器人在运行时会自动生成和使用以下文件和文件夹：
+
+*   `config.json`: 存放您的机器人令牌。
+*   `progress.db`: SQLite 数据库文件，存储所有用户进度和服务器设置。
+*   `botlog/`: 存放机器人运行日志 (`bot.log`) 的文件夹。
+*   `gym_backups/`: 存放所有道馆数据备份的文件夹。
+*   `requirements.txt`: 项目的 Python 依赖库列表。
+
 ## 🔑 所需权限
 
 要让机器人正常工作，请确保完成以下两部分配置：

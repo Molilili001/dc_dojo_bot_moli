@@ -21,7 +21,9 @@ BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, 'config.json')
 db_path = os.path.join(script_dir, 'progress.db')
-log_path = os.path.join(script_dir, 'bot.log')
+log_dir = os.path.join(script_dir, 'botlog')
+os.makedirs(log_dir, exist_ok=True)
+log_path = os.path.join(log_dir, 'bot.log')
 
 # --- Logging Setup ---
 class TimezoneFormatter(logging.Formatter):
