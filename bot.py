@@ -568,7 +568,7 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         question = session.get_current_question()
         q_num = session.current_question_index + 1
         total_q = len(session.questions_for_session)
-        embed = discord.Embed(title=f"问题 {q_num}/{total_q}: {session.gym_info['name']}", description=question['text'], color=discord.Color.orange())
+        embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=question['text'], color=discord.Color.orange())
         
         if question['type'] == 'multiple_choice':
             for option in question['options']:
@@ -957,15 +957,28 @@ def validate_gym_json(data: dict) -> str:
 
     return "" # All good
 
-@gym_management_group.command(name="建造", description="通过JSON创建一个新道馆 (馆主、管理员、开发者)。")
+@gym_management_group.command(name="建造", description="通过上传JSON文件创建一个新道馆 (馆主、管理员、开发者)。")
 @has_gym_management_permission("建造")
-@app_commands.describe(json_data="包含道馆完整信息的JSON字符串。")
-async def gym_create(interaction: discord.Interaction, json_data: str):
+@app_commands.describe(json_file="包含道馆完整信息的JSON文件。")
+async def gym_create(interaction: discord.Interaction, json_file: discord.Attachment):
     await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not json_file.filename.lower().endswith('.json'):
+        return await interaction.followup.send("❌ 文件格式错误，请上传一个 `.json` 文件。", ephemeral=True)
+    
+    # Add a file size check (e.g., 1MB) to prevent abuse
+    if json_file.size > 1 * 1024 * 1024:
+        return await interaction.followup.send("❌ 文件过大，请确保JSON文件大小不超过 1MB。", ephemeral=True)
+
     try:
-        data = json.loads(json_data)
+        json_bytes = await json_file.read()
+        # Use 'utf-8-sig' to handle potential BOM in the file
+        data = json.loads(json_bytes.decode('utf-8-sig'))
     except json.JSONDecodeError:
-        return await interaction.followup.send("❌ 无效的JSON格式。请检查您的输入。", ephemeral=True)
+        return await interaction.followup.send("❌ 无效的JSON格式。请检查您的文件内容。", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error reading attachment in /道馆 建造: {e}")
+        return await interaction.followup.send("❌ 读取文件时发生错误。", ephemeral=True)
 
     validation_error = validate_gym_json(data)
     if validation_error:
@@ -987,15 +1000,28 @@ async def gym_create(interaction: discord.Interaction, json_data: str):
         logging.error(f"Error in /道馆 建造 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
-@gym_management_group.command(name="更新", description="用新的JSON数据覆盖一个现有道馆 (馆主、管理员、开发者)。")
+@gym_management_group.command(name="更新", description="用新的JSON文件覆盖一个现有道馆 (馆主、管理员、开发者)。")
 @has_gym_management_permission("更新")
-@app_commands.describe(gym_id="要更新的道馆ID", json_data="新的道馆JSON数据。")
-async def gym_update(interaction: discord.Interaction, gym_id: str, json_data: str):
+@app_commands.describe(gym_id="要更新的道馆ID", json_file="新的道馆JSON文件。")
+async def gym_update(interaction: discord.Interaction, gym_id: str, json_file: discord.Attachment):
     await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not json_file.filename.lower().endswith('.json'):
+        return await interaction.followup.send("❌ 文件格式错误，请上传一个 `.json` 文件。", ephemeral=True)
+
+    # Add a file size check (e.g., 1MB) to prevent abuse
+    if json_file.size > 1 * 1024 * 1024:
+        return await interaction.followup.send("❌ 文件过大，请确保JSON文件大小不超过 1MB。", ephemeral=True)
+
     try:
-        data = json.loads(json_data)
+        json_bytes = await json_file.read()
+        # Use 'utf-8-sig' to handle potential BOM in the file
+        data = json.loads(json_bytes.decode('utf-8-sig'))
     except json.JSONDecodeError:
-        return await interaction.followup.send("❌ 无效的JSON格式。请检查您的输入。", ephemeral=True)
+        return await interaction.followup.send("❌ 无效的JSON格式。请检查您的文件内容。", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error reading attachment in /道馆 更新: {e}")
+        return await interaction.followup.send("❌ 读取文件时发生错误。", ephemeral=True)
 
     # Ensure the ID in the JSON matches the provided gym_id
     if 'id' not in data or data['id'] != gym_id:
@@ -1019,8 +1045,8 @@ async def gym_update(interaction: discord.Interaction, gym_id: str, json_data: s
     except discord.Forbidden:
         await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        logging.error(f"Error in /道馆 删除 command: {e}", exc_info=True)
-        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
+       logging.error(f"Error in /道馆 更新 command: {e}", exc_info=True)
+       await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="删除", description="删除一个道馆 (仅限管理员或开发者)。")
 @is_admin_or_owner()
