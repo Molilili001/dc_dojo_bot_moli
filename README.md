@@ -91,8 +91,10 @@ python bot.py
 *   `Manage Roles` (管理身份组) - **必需**，用于自动授予奖励。
 *   `Send Messages` (发送消息)
 *   `Embed Links` (嵌入链接) - **必需**，所有界面都基于此。
-*   `Attach Files` (附加文件) - **必需**，用于导入/导出道馆数据。
-*   `Read Message History` (读取消息历史)
+*   `Attach Files` (附加文件) - **必需**，用于上传和下载道馆的JSON数据。
+*   `Read Message History` (读取消息历史) - **必需**，用于响应挑战面板的交互。
+*   `Use Slash Commands` (使用应用命令) - **必需**，机器人所有功能都基于此。
+*   `View Channels` (查看频道) - **必需**，允许机器人在特定频道工作。
 
 ## 🔧 如何使用
 
