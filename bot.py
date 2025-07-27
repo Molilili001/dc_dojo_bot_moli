@@ -84,9 +84,16 @@ async def setup_database():
                 questions TEXT, -- Stored as JSON string
                 questions_to_ask INTEGER, -- Number of questions to randomly select
                 allowed_mistakes INTEGER, -- Number of allowed mistakes before failing
+                is_enabled BOOLEAN DEFAULT TRUE,
                 PRIMARY KEY (guild_id, gym_id)
             )
         ''')
+        # Safely add the new column if it doesn't exist
+        try:
+            await conn.execute("ALTER TABLE gyms ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
         # Safely add the new columns if they don't exist for existing databases
         try:
             await conn.execute("ALTER TABLE gyms ADD COLUMN questions_to_ask INTEGER;")
@@ -135,7 +142,7 @@ async def get_guild_gyms(guild_id: str) -> list:
     """Gets all gyms for a specific guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, is_enabled FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
             rows = await cursor.fetchall()
     
     gyms_list = []
@@ -145,7 +152,8 @@ async def get_guild_gyms(guild_id: str) -> list:
             "name": row["name"],
             "description": row["description"],
             "tutorial": json.loads(row["tutorial"]),
-            "questions": json.loads(row["questions"])
+            "questions": json.loads(row["questions"]),
+            "is_enabled": row["is_enabled"]
         }
         if row["questions_to_ask"]:
             gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -158,7 +166,7 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
     """Gets a single gym's data for a guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, is_enabled FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
             row = await cursor.fetchone()
 
     if not row:
@@ -168,7 +176,8 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
         "name": row["name"],
         "description": row["description"],
         "tutorial": json.loads(row["tutorial"]),
-        "questions": json.loads(row["questions"])
+        "questions": json.loads(row["questions"]),
+        "is_enabled": row["is_enabled"]
     }
     if row["questions_to_ask"]:
         gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -179,8 +188,8 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
 async def create_gym(guild_id: str, gym_data: dict, conn: aiosqlite.Connection):
     """Creates a new gym using the provided connection."""
     await conn.execute('''
-        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, is_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
     ''', (
         guild_id, gym_data['id'], gym_data['name'], gym_data['description'],
         json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions']),
@@ -387,10 +396,22 @@ class GymSelect(discord.ui.Select):
             for gym in guild_gyms:
                 gym_id = gym['id']
                 completed = user_progress.get(gym_id, False)
-                status_emoji = "✅" if completed else "❌"
-                label = f"{status_emoji} {gym['name']}"
-                description = "已通关" if completed else "未通关"
-                options.append(discord.SelectOption(label=label, description=description, value=gym_id))
+                
+                if not gym.get('is_enabled', True):
+                    status_emoji = "⏸️"
+                    label = f"{status_emoji} {gym['name']}"
+                    description = "道馆维护中，暂不可用"
+                    options.append(discord.SelectOption(label=label, description=description, value=gym_id))
+                elif completed:
+                    status_emoji = "✅"
+                    label = f"{status_emoji} {gym['name']}"
+                    description = "已通关"
+                    options.append(discord.SelectOption(label=label, description=description, value=gym_id))
+                else:
+                    status_emoji = "❌"
+                    label = f"{status_emoji} {gym['name']}"
+                    description = "未通关"
+                    options.append(discord.SelectOption(label=label, description=description, value=gym_id))
         
         super().__init__(placeholder="请选择一个道馆进行挑战...", min_values=1, max_values=1, options=options)
 
@@ -404,6 +425,15 @@ class GymSelect(discord.ui.Select):
 
         if gym_id == "no_gyms":
             await interaction.edit_original_response(content="本服务器还没有创建任何道馆哦。", view=None)
+            return
+
+        gym_info = await get_single_gym(guild_id, gym_id)
+        if not gym_info:
+            await interaction.edit_original_response(content="错误：找不到该道馆的数据。可能已被删除。", view=None)
+            return
+        
+        if not gym_info.get('is_enabled', True):
+            await interaction.edit_original_response(content="此道馆正在维护中，暂时无法挑战。", view=None)
             return
 
         user_progress = await get_user_progress(user_id, guild_id)
@@ -426,10 +456,6 @@ class GymSelect(discord.ui.Select):
         if user_id in active_challenges:
             del active_challenges[user_id]
 
-        gym_info = await get_single_gym(guild_id, gym_id)
-        if not gym_info:
-            await interaction.edit_original_response(content="错误：找不到该道馆的数据。可能已被删除。", view=None)
-            return
             
         session = ChallengeSession(user_id, interaction.guild.id, gym_id, gym_info, panel_message_id)
         active_challenges[user_id] = session
@@ -1130,11 +1156,13 @@ async def gym_list(interaction: discord.Interaction):
 
     embed = discord.Embed(title=f"「{interaction.guild.name}」的道馆列表", color=discord.Color.purple())
     
-    description = ""
+    description_lines = []
     for gym in guild_gyms:
-        description += f"**名称:** {gym['name']}\n**ID:** `{gym['id']}`\n\n"
+        status_emoji = "✅" if gym.get('is_enabled', True) else "⏸️"
+        status_text = "开启" if gym.get('is_enabled', True) else "关闭"
+        description_lines.append(f"{status_emoji} **{gym['name']}** `(ID: {gym['id']})` - **状态:** {status_text}")
     
-    embed.description = description
+    embed.description = "\n".join(description_lines)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # --- Permission Management Command ---
@@ -1158,7 +1186,8 @@ async def gym_list(interaction: discord.Interaction):
         app_commands.Choice(name="后门 (/道馆 后门)", value="后门"),
         app_commands.Choice(name="列表 (/道馆 列表)", value="列表"),
         app_commands.Choice(name="重置进度 (/道馆 重置进度)", value="重置进度"),
-        app_commands.Choice(name="解除处罚 (/道馆 解除处罚)", value="解除处罚")
+        app_commands.Choice(name="解除处罚 (/道馆 解除处罚)", value="解除处罚"),
+        app_commands.Choice(name="停业 (/道馆 停业)", value="停业")
     ]
 )
 async def set_gym_master(interaction: discord.Interaction, action: str, target: typing.Union[discord.Member, discord.Role], permission: str):
@@ -1294,6 +1323,32 @@ async def daily_backup_task():
 async def before_daily_backup_task():
     """Ensures the bot is fully ready before the backup loop starts."""
     await bot.wait_until_ready()
+
+@gym_management_group.command(name="停业", description="设置一个道馆的营业状态 (馆主、管理员、开发者)。")
+@has_gym_management_permission("停业")
+@app_commands.describe(
+    gym_id="要操作的道馆ID。",
+    status="选择要执行的操作。"
+)
+@app_commands.choices(status=[
+    app_commands.Choice(name="开启", value="enable"),
+    app_commands.Choice(name="停业", value="disable"),
+])
+async def gym_status(interaction: discord.Interaction, gym_id: str, status: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild_id = str(interaction.guild.id)
+    
+    is_enabled = True if status == "enable" else False
+    
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute("UPDATE gyms SET is_enabled = ? WHERE guild_id = ? AND gym_id = ?", (is_enabled, guild_id, gym_id))
+        await conn.commit()
+        
+    if cursor.rowcount > 0:
+        status_text = "开启" if is_enabled else "停业"
+        await interaction.followup.send(f"✅ 道馆 `{gym_id}` 已{status_text}。", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
 
 bot.tree.add_command(gym_management_group)
 
