@@ -1121,8 +1121,8 @@ async def gym_update(interaction: discord.Interaction, gym_id: str, json_file: d
        logging.error(f"Error in /道馆 更新 command: {e}", exc_info=True)
        await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
-@gym_management_group.command(name="删除", description="删除一个道馆 (仅限管理员或开发者)。")
-@is_admin_or_owner()
+@gym_management_group.command(name="删除", description="删除一个道馆 (馆主、管理员、开发者)。")
+@has_gym_management_permission("删除")
 @app_commands.describe(gym_id="要删除的道馆ID。")
 async def gym_delete(interaction: discord.Interaction, gym_id: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1218,7 +1218,8 @@ async def gym_list(interaction: discord.Interaction):
         app_commands.Choice(name="列表 (/道馆 列表)", value="列表"),
         app_commands.Choice(name="重置进度 (/道馆 重置进度)", value="重置进度"),
         app_commands.Choice(name="解除处罚 (/道馆 解除处罚)", value="解除处罚"),
-        app_commands.Choice(name="停业 (/道馆 停业)", value="停业")
+        app_commands.Choice(name="停业 (/道馆 停业)", value="停业"),
+        app_commands.Choice(name="删除 (/道馆 删除)", value="删除")
     ]
 )
 async def set_gym_master(interaction: discord.Interaction, action: str, target: typing.Union[discord.Member, discord.Role], permission: str):
