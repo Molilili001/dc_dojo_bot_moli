@@ -13,6 +13,8 @@ from logging.handlers import TimedRotatingFileHandler
 import asyncio
 from collections import defaultdict
 import pytz
+import psutil
+import time
 
 # --- Timezone Configuration ---
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
@@ -416,6 +418,7 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.start_time = time.time() # Store bot start time
 
 # --- Views ---
 class GymSelect(discord.ui.Select):
@@ -902,6 +905,65 @@ async def clear_commands(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ 施法失败: {e}", ephemeral=True)
 
 # --- Admin & Owner Commands ---
+
+@bot.tree.command(name="状态", description="[仅限开发者] 查看服务器和机器人的当前状态。")
+@app_commands.check(is_owner_check)
+async def system_status(interaction: discord.Interaction):
+    """Displays the current status of the VPS and the bot."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # --- System Info ---
+    cpu_usage = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    ram_usage_percent = ram.percent
+    ram_used_gb = ram.used / (1024**3)
+    ram_total_gb = ram.total / (1024**3)
+    
+    try:
+        disk = psutil.disk_usage('/')
+        disk_usage_percent = disk.percent
+        disk_used_gb = disk.used / (1024**3)
+        disk_total_gb = disk.total / (1024**3)
+        disk_str = f"**磁盘空间:** `{disk_usage_percent}%` ({disk_used_gb:.2f} GB / {disk_total_gb:.2f} GB)"
+    except FileNotFoundError:
+        # Handle cases where '/' might not be the correct path (e.g., on Windows)
+        disk_str = "**磁盘空间:** `无法获取`"
+
+
+    # --- Bot Info ---
+    process = psutil.Process(os.getpid())
+    bot_ram_usage_mb = process.memory_info().rss / (1024**2)
+    
+    # Uptime
+    uptime_seconds = time.time() - bot.start_time
+    uptime_delta = datetime.timedelta(seconds=uptime_seconds)
+    days = uptime_delta.days
+    hours, rem = divmod(uptime_delta.seconds, 3600)
+    minutes, _ = divmod(rem, 60)
+    uptime_str = f"{days}天 {hours}小时 {minutes}分钟"
+
+    # --- Create Embed ---
+    embed = discord.Embed(title="📊 服务器与机器人状态", color=discord.Color.blue())
+    embed.timestamp = datetime.datetime.now(BEIJING_TZ)
+
+    embed.add_field(
+        name="🖥️ 系统资源",
+        value=f"**CPU 负载:** `{cpu_usage}%`\n"
+              f"**内存占用:** `{ram_usage_percent}%` ({ram_used_gb:.2f} GB / {ram_total_gb:.2f} GB)\n"
+              f"{disk_str}",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🤖 机器人进程",
+        value=f"**内存占用:** `{bot_ram_usage_mb:.2f} MB`\n"
+              f"**运行时间:** `{uptime_str}`",
+        inline=False
+    )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 def has_gym_management_permission(command_name: str):
     async def predicate(interaction: discord.Interaction) -> bool:
         # Always allow bot owner
