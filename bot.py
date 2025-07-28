@@ -393,6 +393,7 @@ class ChallengeSession:
         self.panel_message_id = panel_message_id # The ID of the panel message this challenge originated from
         self.current_question_index = 0
         self.mistakes_made = 0
+        self.wrong_answers = [] # To store tuples of (question, user_answer)
         self.allowed_mistakes = self.gym_info.get('allowed_mistakes', 0)
         
         # --- Random Question Logic ---
@@ -619,7 +620,47 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                 fail_desc += f"\n\n由于累计挑战失败次数过多，你已被禁止挑战该道馆 **{time_str}**。"
             else:
                 fail_desc += "\n\n请稍后重试。"
+            
             embed = discord.Embed(title="❌ 挑战失败", description=fail_desc, color=discord.Color.red())
+
+            # --- Add Wrong Answers Section ---
+            if session.wrong_answers:
+                # Use a temporary list to build fields to avoid exceeding embed limits
+                fields_to_add = []
+                current_field_text = ""
+
+                for i, (question, wrong_answer) in enumerate(session.wrong_answers):
+                    question_text = question['text']
+                    
+                    # Format the entry for this wrong answer
+                    entry_text = (
+                        f"**题目**: {question_text}\n"
+                        f"**你的答案**: `{wrong_answer}`\n\n"
+                    )
+                    
+                    # Discord embed field value limit is 1024 characters
+                    if len(current_field_text) + len(entry_text) > 1024:
+                        # Current field is full, add it to the list and start a new one
+                        field_name = "错题回顾" if not fields_to_add else f"错题回顾 (续)"
+                        fields_to_add.append({"name": field_name, "value": current_field_text, "inline": False})
+                        current_field_text = ""
+
+                    current_field_text += entry_text
+
+                # Add the last or only field
+                if current_field_text:
+                    field_name = "错题回顾" if not fields_to_add else f"错题回顾 (续)"
+                    fields_to_add.append({"name": field_name, "value": current_field_text, "inline": False})
+
+                # Add all collected fields to the embed, respecting the total embed character limit
+                total_embed_length = len(embed.title) + len(embed.description)
+                for field in fields_to_add:
+                    total_embed_length += len(field['name']) + len(field['value'])
+                    if total_embed_length < 6000 and len(embed.fields) < 25:
+                        embed.add_field(**field)
+                    else:
+                        # Stop adding fields if limits are approached
+                        break
     else:
         # --- Display Next Question ---
         question = session.get_current_question()
@@ -679,6 +720,8 @@ class QuestionAnswerButton(discord.ui.Button):
         # Check the button's actual value against the correct answer
         if self.value != self.correct_answer:
             session.mistakes_made += 1
+            question_info = session.get_current_question()
+            session.wrong_answers.append((question_info, self.value))
             logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
 
         session.current_question_index += 1
@@ -726,6 +769,7 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
         
         if not is_correct:
             session.mistakes_made += 1
+            session.wrong_answers.append((self.question, user_answer))
             logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
 
         session.current_question_index += 1
