@@ -95,12 +95,19 @@ async def setup_database():
                 role_to_add_id TEXT,
                 role_to_remove_id TEXT,
                 associated_gyms TEXT, -- JSON list of gym IDs, or NULL for all
-                blacklist_enabled BOOLEAN NOT NULL DEFAULT TRUE
+                blacklist_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                completion_threshold INTEGER -- How many gyms to complete for the role
             )
         ''')
         # Safely add the new column for blacklist checking
         try:
             await conn.execute("ALTER TABLE challenge_panels ADD COLUMN blacklist_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
+        # Safely add the new column for the completion threshold
+        try:
+            await conn.execute("ALTER TABLE challenge_panels ADD COLUMN completion_threshold INTEGER;")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
@@ -944,7 +951,7 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
     # Get the specific configuration for the panel the user interacted with
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+        async with conn.execute("SELECT role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
             panel_config = await cursor.fetchone()
 
     if not panel_config:
@@ -955,6 +962,7 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
     role_to_remove_id = panel_config['role_to_remove_id']
     associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config['associated_gyms'] else None
     blacklist_enabled_for_panel = panel_config['blacklist_enabled']
+    completion_threshold = panel_config['completion_threshold']
 
     # Get all gyms that currently exist in the server
     all_guild_gyms = await get_guild_gyms(guild_id)
@@ -974,8 +982,21 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
 
     completed_gym_ids = set(user_progress.keys())
 
-    # Proceed only if the user has completed all gyms required by this specific panel
-    if required_ids_for_panel.issubset(completed_gym_ids):
+    # Check if the user has met the completion criteria
+    all_checks_passed = False
+    if completion_threshold and completion_threshold > 0:
+        # Case 1: A specific number of gyms is required.
+        # Count how many of the *required* gyms for this panel the user has completed.
+        completed_required_gyms = completed_gym_ids.intersection(required_ids_for_panel)
+        if len(completed_required_gyms) >= completion_threshold:
+            all_checks_passed = True
+    else:
+        # Case 2: Default behavior - all required gyms for this panel must be completed.
+        if required_ids_for_panel.issubset(completed_gym_ids):
+            all_checks_passed = True
+
+    # Proceed only if the user has met the completion criteria
+    if all_checks_passed:
         # --- Blacklist Check (only if enabled for this panel) ---
         if blacklist_enabled_for_panel:
             blacklist_entry = await is_user_blacklisted(guild_id, member)
@@ -1179,14 +1200,15 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
     role_to_add="[可选] 用户完成所有道馆后将获得的身份组。",
     role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。",
     introduction="[可选] 自定义挑战面板的介绍文字。",
-    gym_ids="[可选] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。"
+    gym_ids="[可选] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。",
+    completion_threshold="[可选] 完成多少个道馆后触发奖励，不填则为全部。"
 )
-@app_commands.rename(enable_blacklist='启用黑名单')
+@app_commands.rename(enable_blacklist='启用黑名单', completion_threshold='通关数量')
 @app_commands.choices(enable_blacklist=[
     app_commands.Choice(name="是 (默认)", value="yes"),
     app_commands.Choice(name="否", value="no"),
 ])
-async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None):
+async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None, completion_threshold: typing.Optional[app_commands.Range[int, 1]] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
@@ -1194,23 +1216,38 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
     role_remove_id = str(role_to_remove.id) if role_to_remove else None
     blacklist_enabled = True if enable_blacklist == 'yes' else False
     
-    associated_gyms_list = None
-    if gym_ids:
-        associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')]
-        
-        # --- Validation Step ---
-        all_guild_gyms = await get_guild_gyms(guild_id)
-        all_gym_ids_set = {gym['id'] for gym in all_guild_gyms}
-        invalid_ids = [gid for gid in associated_gyms_list if gid not in all_gym_ids_set]
-        
-        if invalid_ids:
-            await interaction.followup.send(f"❌ 操作失败：以下道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
-            return
-        # --- End Validation ---
-        
+    associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')] if gym_ids else None
     associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
     try:
+        # --- Validation Block ---
+        all_guild_gyms = await get_guild_gyms(guild_id)
+        all_gym_ids_set = {gym['id'] for gym in all_guild_gyms}
+
+        # 1. Validate that specified gym_ids actually exist
+        if associated_gyms_list:
+            invalid_ids = [gid for gid in associated_gyms_list if gid not in all_gym_ids_set]
+            if invalid_ids:
+                await interaction.followup.send(f"❌ 操作失败：以下道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+                return
+
+        # 2. Validate completion_threshold against the correct gym pool
+        if completion_threshold:
+            # Determine the size of the gym pool this panel applies to
+            gym_pool_size = len(associated_gyms_list) if associated_gyms_list is not None else len(all_guild_gyms)
+
+            if gym_pool_size == 0:
+                await interaction.followup.send(f"❌ 操作失败：服务器内没有任何道馆，无法设置通关数量要求。", ephemeral=True)
+                return
+
+            if completion_threshold > gym_pool_size:
+                await interaction.followup.send(
+                    f"❌ 操作失败：设置的通关数量要求 ({completion_threshold}) 不能大于将要应用的道馆总数 ({gym_pool_size})。",
+                    ephemeral=True
+                )
+                return
+        # --- End Validation Block ---
+
         # Use the custom introduction if provided, otherwise use the default text.
         description = introduction if introduction else (
             "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
@@ -1230,9 +1267,9 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
         # Now, save the configuration for this specific panel to the database
         async with aiosqlite.connect(db_path) as conn:
             await conn.execute('''
-                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled))
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled, completion_threshold))
             await conn.commit()
 
         # Build confirmation message
@@ -1245,6 +1282,8 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
             confirm_messages.append(f"- **通关移除身份组**: {role_to_remove.mention}")
         if associated_gyms_list:
             confirm_messages.append(f"- **关联道馆列表**: `{', '.join(associated_gyms_list)}`")
+        if completion_threshold:
+            confirm_messages.append(f"- **通关数量要求**: {completion_threshold} 个")
         
         await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
 
