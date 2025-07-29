@@ -11,6 +11,7 @@ import random
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import asyncio
+import aiofiles
 from collections import defaultdict
 import pytz
 import psutil
@@ -93,9 +94,16 @@ async def setup_database():
                 channel_id TEXT NOT NULL,
                 role_to_add_id TEXT,
                 role_to_remove_id TEXT,
-                associated_gyms TEXT -- JSON list of gym IDs, or NULL for all
+                associated_gyms TEXT, -- JSON list of gym IDs, or NULL for all
+                blacklist_enabled BOOLEAN NOT NULL DEFAULT TRUE
             )
         ''')
+        # Safely add the new column for blacklist checking
+        try:
+            await conn.execute("ALTER TABLE challenge_panels ADD COLUMN blacklist_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
         # Gym master (gym owner) permissions table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gym_masters (
@@ -160,6 +168,18 @@ async def setup_database():
                 timestamp TEXT NOT NULL
             )
         ''')
+        # Table for cheating blacklist
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS cheating_blacklist (
+                guild_id TEXT NOT NULL,
+                target_id TEXT NOT NULL, -- User ID or Role ID
+                target_type TEXT NOT NULL, -- 'user' or 'role'
+                reason TEXT,
+                added_by TEXT,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (guild_id, target_id)
+            )
+        ''')
 
         # --- Create Indexes for Performance ---
         # These indexes significantly speed up common queries in a large server.
@@ -167,6 +187,7 @@ async def setup_database():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_challenge_failures_user_guild ON challenge_failures (user_id, guild_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_gyms_guild ON gyms (guild_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_gym_masters_guild_target ON gym_masters (guild_id, target_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cheating_blacklist_guild_target ON cheating_blacklist (guild_id, target_id);")
 
         await conn.commit()
 
@@ -382,6 +403,92 @@ async def check_gym_master_permission(guild_id: str, user: discord.Member, permi
                     return True
     return False
 
+# --- Blacklist Functions ---
+async def add_to_blacklist(guild_id: str, target_id: str, target_type: str, reason: str, added_by: str):
+    """Adds a user or role to the cheating blacklist."""
+    timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute('''
+            INSERT OR REPLACE INTO cheating_blacklist (guild_id, target_id, target_type, reason, added_by, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (guild_id, target_id, target_type, reason, added_by, timestamp))
+        await conn.commit()
+
+async def add_to_blacklist_bulk(guild_id: str, members: list[discord.Member], reason: str, added_by: str):
+    """Adds a list of members to the cheating blacklist in a single transaction."""
+    timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
+    records = [
+        (guild_id, str(member.id), 'user', reason, added_by, timestamp)
+        for member in members
+    ]
+    
+    if not records:
+        return 0
+
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executemany('''
+            INSERT OR REPLACE INTO cheating_blacklist (guild_id, target_id, target_type, reason, added_by, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', records)
+        await conn.commit()
+    return len(records)
+
+async def remove_from_blacklist(guild_id: str, target_id: str):
+    """Removes a user or role from the cheating blacklist."""
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM cheating_blacklist WHERE guild_id = ? AND target_id = ?",
+            (guild_id, target_id)
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+async def clear_blacklist(guild_id: str) -> int:
+    """Removes all entries from the cheating blacklist for a specific guild. Returns the number of rows deleted."""
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM cheating_blacklist WHERE guild_id = ?",
+            (guild_id,)
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+
+async def is_user_blacklisted(guild_id: str, user: discord.Member) -> typing.Optional[dict]:
+    """
+    Checks if a user or any of their roles are in the blacklist.
+    Returns the blacklist entry dictionary if found, otherwise None.
+    """
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        
+        # 1. Check user ID directly
+        async with conn.execute(
+            "SELECT * FROM cheating_blacklist WHERE guild_id = ? AND target_id = ? AND target_type = 'user'",
+            (guild_id, str(user.id))
+        ) as cursor:
+            user_blacklist_entry = await cursor.fetchone()
+            if user_blacklist_entry:
+                return dict(user_blacklist_entry)
+
+        # 2. Check all user roles
+        role_ids = [str(role.id) for role in user.roles]
+        if not role_ids:
+            return None # No roles to check
+
+        placeholders = ','.join('?' for _ in role_ids)
+        query = f"""
+            SELECT * FROM cheating_blacklist
+            WHERE guild_id = ? AND target_type = 'role' AND target_id IN ({placeholders})
+        """
+        params = [guild_id] + role_ids
+        async with conn.execute(query, params) as cursor:
+            role_blacklist_entry = await cursor.fetchone()
+            if role_blacklist_entry:
+                return dict(role_blacklist_entry)
+
+    return None
+
 # --- State Management ---
 active_challenges = {}
 
@@ -416,8 +523,16 @@ class ChallengeSession:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.members = True # Members intent is still required to receive member objects from interactions and to use fetch_member.
+intents.typing = False # Optimization: disable typing events if not used.
+intents.presences = False # Optimization: disable presence events if not used.
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    chunk_guilds_at_startup=False,  # Key: Do not request all members on startup.
+    member_cache_flags=discord.MemberCacheFlags.none()  # Key: Do not cache members.
+)
 bot.start_time = time.time() # Store bot start time
 
 # --- Views ---
@@ -779,6 +894,45 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
         # The interaction is already deferred, now update the original message with the next question.
         await display_question(interaction, session, from_modal=True)
 
+class ConfirmClearView(discord.ui.View):
+    def __init__(self, guild_id: str, original_interaction: discord.Interaction):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.original_interaction = original_interaction
+
+    @discord.ui.button(label="确认清空", style=discord.ButtonStyle.danger)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await self.original_interaction.edit_original_response(view=self)
+
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            deleted_count = await clear_blacklist(self.guild_id)
+            logging.info(f"BLACKLIST: User '{interaction.user.id}' cleared the blacklist for guild '{self.guild_id}'. Deleted {deleted_count} entries.")
+            await interaction.followup.send(f"✅ 黑名单已成功清空，共删除了 {deleted_count} 条记录。", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in blacklist clear confirmation: {e}", exc_info=True)
+            await interaction.followup.send("❌ 清空黑名单时发生错误。", ephemeral=True)
+        
+        self.stop()
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await self.original_interaction.edit_original_response(content="操作已取消。", view=self)
+        await interaction.response.defer()
+        self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.original_interaction.edit_original_response(content="操作已超时，请重新发起指令。", view=self)
+        except discord.NotFound:
+            pass # The original message might have been deleted.
+
 async def check_and_manage_completion_roles(member: discord.Member, session: ChallengeSession):
     """Checks if a user has completed all gyms required by a specific panel and manages roles."""
     guild_id = str(member.guild.id)
@@ -790,7 +944,7 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
     # Get the specific configuration for the panel the user interacted with
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT role_to_add_id, role_to_remove_id, associated_gyms FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+        async with conn.execute("SELECT role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
             panel_config = await cursor.fetchone()
 
     if not panel_config:
@@ -800,6 +954,7 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
     role_to_add_id = panel_config['role_to_add_id']
     role_to_remove_id = panel_config['role_to_remove_id']
     associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config['associated_gyms'] else None
+    blacklist_enabled_for_panel = panel_config['blacklist_enabled']
 
     # Get all gyms that currently exist in the server
     all_guild_gyms = await get_guild_gyms(guild_id)
@@ -821,6 +976,23 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
 
     # Proceed only if the user has completed all gyms required by this specific panel
     if required_ids_for_panel.issubset(completed_gym_ids):
+        # --- Blacklist Check (only if enabled for this panel) ---
+        if blacklist_enabled_for_panel:
+            blacklist_entry = await is_user_blacklisted(guild_id, member)
+            if blacklist_entry:
+                reason = blacklist_entry.get('reason', '无特定原因')
+                logging.info(f"BLACKLIST: Blocked role assignment for blacklisted user '{member.id}' in guild '{guild_id}'. Reason: {reason}")
+                try:
+                    await member.send(
+                        f"🚫 **身份组获取失败** 🚫\n\n"
+                        f"你在服务器 **{member.guild.name}** 的道馆挑战奖励发放被阻止。\n"
+                        f"**原因:** {reason}\n\n"
+                        "由于你被记录在处罚名单中，即使完成了道馆挑战，也无法获得相关身份组。如有疑问，请联系服务器管理员。"
+                    )
+                except discord.Forbidden:
+                    logging.warning(f"Cannot send blacklist notification DM to {member.name} (ID: {member.id}).")
+                return # Stop further processing
+
         messages = []
 
         # --- Role to Add ---
@@ -1003,17 +1175,24 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
 @gym_management_group.command(name="召唤", description="在该频道召唤道馆挑战面板 (馆主、管理员、开发者)。")
 @has_gym_management_permission("召唤")
 @app_commands.describe(
+    enable_blacklist="是否对通过此面板完成挑战的用户启用黑名单检查。",
     role_to_add="[可选] 用户完成所有道馆后将获得的身份组。",
     role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。",
     introduction="[可选] 自定义挑战面板的介绍文字。",
     gym_ids="[可选] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。"
 )
-async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None):
+@app_commands.rename(enable_blacklist='启用黑名单')
+@app_commands.choices(enable_blacklist=[
+    app_commands.Choice(name="是 (默认)", value="yes"),
+    app_commands.Choice(name="否", value="no"),
+])
+async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
     role_add_id = str(role_to_add.id) if role_to_add else None
     role_remove_id = str(role_to_remove.id) if role_to_remove else None
+    blacklist_enabled = True if enable_blacklist == 'yes' else False
     
     associated_gyms_list = None
     if gym_ids:
@@ -1051,13 +1230,15 @@ async def gym_summon(interaction: discord.Interaction, role_to_add: typing.Optio
         # Now, save the configuration for this specific panel to the database
         async with aiosqlite.connect(db_path) as conn:
             await conn.execute('''
-                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json))
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled))
             await conn.commit()
 
         # Build confirmation message
         confirm_messages = [f"✅ 道馆面板已成功创建于 {interaction.channel.mention}！"]
+        status_text = "启用" if blacklist_enabled else "禁用"
+        confirm_messages.append(f"- **黑名单检查**: {status_text}")
         if role_to_add:
             confirm_messages.append(f"- **通关奖励身份组**: {role_to_add.mention}")
         if role_to_remove:
@@ -1244,12 +1425,35 @@ async def gym_delete(interaction: discord.Interaction, gym_id: str):
 
     try:
         async with aiosqlite.connect(db_path) as conn:
+            # --- Perform Deletion ---
             await log_gym_action(guild_id, gym_id, str(interaction.user.id), 'delete', conn)
             await conn.execute("DELETE FROM user_progress WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id))
             await delete_gym(guild_id, gym_id, conn)
+
+            # --- Clean up associated_gyms in challenge_panels ---
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT message_id, associated_gyms FROM challenge_panels WHERE guild_id = ?", (guild_id,)) as cursor:
+                panels_to_update = []
+                all_panels = await cursor.fetchall()
+                for panel in all_panels:
+                    if panel['associated_gyms']:
+                        associated_gyms_list = json.loads(panel['associated_gyms'])
+                        if gym_id in associated_gyms_list:
+                            associated_gyms_list.remove(gym_id)
+                            new_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
+                            panels_to_update.append((new_json, panel['message_id']))
+                
+                if panels_to_update:
+                    await conn.executemany(
+                        "UPDATE challenge_panels SET associated_gyms = ? WHERE message_id = ?",
+                        panels_to_update
+                    )
+            
+            # --- Commit all changes ---
             await conn.commit()
-        logging.info(f"ADMIN: User '{interaction.user.id}' deleted gym '{gym_id}' from guild '{guild_id}'.")
-        await interaction.followup.send(f"✅ 道馆 `{gym_id}` 及其所有相关进度已被成功删除。", ephemeral=True)
+
+        logging.info(f"ADMIN: User '{interaction.user.id}' deleted gym '{gym_id}' from guild '{guild_id}'. Also cleaned up challenge panels.")
+        await interaction.followup.send(f"✅ 道馆 `{gym_id}` 及其所有相关进度已被成功删除。\nℹ️ 关联的挑战面板也已自动更新。", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
@@ -1271,11 +1475,12 @@ async def gym_get_json(interaction: discord.Interaction, gym_id: str):
         # Create a unique filename to prevent race conditions
         filepath = f'gym_export_{interaction.user.id}.json'
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(json_string)
+            async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+                await f.write(json_string)
             await interaction.followup.send("道馆数据过长，已作为文件发送。", file=discord.File(filepath), ephemeral=True)
         finally:
             # Ensure the temporary file is always removed
+            # os.path.exists is sync, but it's extremely fast and acceptable here.
             if os.path.exists(filepath):
                 os.remove(filepath)
     else:
@@ -1330,6 +1535,11 @@ async def gym_list(interaction: discord.Interaction):
 )
 async def set_gym_master(interaction: discord.Interaction, action: str, target: typing.Union[discord.Member, discord.Role], permission: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # --- Security Check for @everyone role ---
+    if isinstance(target, discord.Role) and target.is_default():
+        return await interaction.followup.send("❌ **安全警告:** 出于安全考虑，禁止向 `@everyone` 角色授予道馆管理权限。", ephemeral=True)
+
     guild_id = str(interaction.guild.id)
     target_id = str(target.id)
     target_type = 'user' if isinstance(target, discord.User) or isinstance(target, discord.Member) else 'role'
@@ -1418,8 +1628,8 @@ async def backup_single_gym(guild_id: str, gym_id: str):
 
         if existing_backups:
             latest_backup_file = os.path.join(backup_dir, existing_backups[0])
-            with open(latest_backup_file, 'r', encoding='utf-8') as f:
-                last_backup_json_string = f.read()
+            async with aiofiles.open(latest_backup_file, 'r', encoding='utf-8') as f:
+                last_backup_json_string = await f.read()
 
             if new_backup_json_string == last_backup_json_string:
                 # No changes, so no backup needed for this trigger.
@@ -1429,8 +1639,8 @@ async def backup_single_gym(guild_id: str, gym_id: str):
         timestamp_str = datetime.datetime.now(BEIJING_TZ).strftime('%Y-%m-%d_%H-%M-%S')
         backup_filepath = os.path.join(backup_dir, f"{timestamp_str}.json")
 
-        with open(backup_filepath, 'w', encoding='utf-8') as f:
-            f.write(new_backup_json_string)
+        async with aiofiles.open(backup_filepath, 'w', encoding='utf-8') as f:
+            await f.write(new_backup_json_string)
         logging.info(f"BACKUP: Successfully created on-demand backup for gym {gym_id} in guild {guild_id}.")
 
     except Exception as e:
@@ -1487,6 +1697,118 @@ async def gym_status(interaction: discord.Interaction, gym_id: str, status: str)
         await interaction.followup.send(f"✅ 道馆 `{gym_id}` 已{status_text}。", ephemeral=True)
     else:
         await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
+
+@bot.tree.command(name="道馆黑名单", description="管理作弊黑名单 (管理员或开发者)。")
+@is_admin_or_owner()
+@app_commands.describe(
+    action="要执行的操作",
+    target="[添加/移除] 操作的目标用户或身份组",
+    role_target="[记录] 操作的目标身份组",
+    reason="[添加/记录] 操作的原因"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="添加 (用户或身份组)", value="add"),
+    app_commands.Choice(name="移除 (用户或身份组)", value="remove"),
+    app_commands.Choice(name="记录 (身份组成员)", value="record_role"),
+    app_commands.Choice(name="清空 (!!!)", value="clear"),
+])
+async def gym_blacklist(
+    interaction: discord.Interaction,
+    action: str,
+    target: typing.Optional[typing.Union[discord.Member, discord.Role]] = None,
+    role_target: typing.Optional[discord.Role] = None,
+    reason: typing.Optional[str] = "无"
+):
+    guild_id = str(interaction.guild.id)
+    added_by = str(interaction.user.id)
+
+    if action == "add":
+        if not target:
+            return await interaction.response.send_message("❌ `添加` 操作需要一个 `target` (用户或身份组)。", ephemeral=True)
+        
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_id = str(target.id)
+        target_type = 'user' if isinstance(target, discord.Member) else 'role'
+        
+        try:
+            await add_to_blacklist(guild_id, target_id, target_type, reason, added_by)
+            logging.info(f"BLACKLIST: User '{added_by}' added '{target_id}' ({target_type}) to blacklist in guild '{guild_id}'. Reason: {reason}")
+            await interaction.followup.send(f"✅ 已成功将 {target.mention} 添加到黑名单。\n**原因:** {reason}", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in /道馆黑名单 add command: {e}", exc_info=True)
+            await interaction.followup.send("❌ 添加到黑名单时发生错误。", ephemeral=True)
+
+    elif action == "remove":
+        if not target:
+            return await interaction.response.send_message("❌ `移除` 操作需要一个 `target` (用户或身份组)。", ephemeral=True)
+            
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_id = str(target.id)
+        
+        try:
+            removed_count = await remove_from_blacklist(guild_id, target_id)
+            if removed_count > 0:
+                logging.info(f"BLACKLIST: User '{interaction.user.id}' removed '{target_id}' from blacklist in guild '{guild_id}'.")
+                await interaction.followup.send(f"✅ 已成功将 {target.mention} 从黑名单中移除。", ephemeral=True)
+            else:
+                await interaction.followup.send(f"ℹ️ {target.mention} 不在黑名单中。", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in /道馆黑名单 remove command: {e}", exc_info=True)
+            await interaction.followup.send("❌ 从黑名单移除时发生错误。", ephemeral=True)
+
+    elif action == "record_role":
+        if not role_target:
+            return await interaction.response.send_message("❌ `记录` 操作需要一个 `role_target` (身份组)。", ephemeral=True)
+
+        members_in_role = role_target.members
+        member_count = len(members_in_role)
+
+        if not members_in_role:
+            await interaction.response.send_message(f"ℹ️ 身份组 {role_target.mention} 中没有任何成员。", ephemeral=True)
+            return
+
+        # Acknowledge the interaction immediately and inform the user that the task is running in the background.
+        await interaction.response.send_message(
+            f"✅ **任务已开始**\n正在后台记录身份组 {role_target.mention} 的 {member_count} 名成员。完成后将发送通知。",
+            ephemeral=True
+        )
+
+        # --- Run the long task in the background ---
+        async def background_task():
+            chunk_size = 1000
+            total_added_count = 0
+            try:
+                for i in range(0, member_count, chunk_size):
+                    chunk = members_in_role[i:i + chunk_size]
+                    if not chunk:
+                        continue
+                    
+                    added_count = await add_to_blacklist_bulk(guild_id, chunk, reason, added_by)
+                    total_added_count += added_count
+                    # Optional: log progress for very long tasks
+                    logging.info(f"BLACKLIST_CHUNK: Processed chunk {i//chunk_size + 1}, added {added_count} members.")
+                    await asyncio.sleep(1) # Small sleep to yield control and prevent tight loop
+
+                logging.info(f"BLACKLIST: User '{added_by}' bulk-added {total_added_count} members from role '{role_target.id}' in guild '{guild_id}'.")
+                # Send a new message upon completion using followup
+                await interaction.followup.send(
+                    f"✅ **后台记录完成**\n- **身份组:** {role_target.mention}\n- **成功添加:** {total_added_count} 名成员",
+                    ephemeral=True
+                )
+            except Exception as e:
+                logging.error(f"Error in background /道馆黑名单 record_role command: {e}", exc_info=True)
+                await interaction.followup.send("❌ 批量记录黑名单时发生严重错误。", ephemeral=True)
+
+        # Create a background task so the function can return immediately
+        bot.loop.create_task(background_task())
+
+    elif action == "clear":
+        view = ConfirmClearView(guild_id=guild_id, original_interaction=interaction)
+        await interaction.response.send_message(
+            "⚠️ **警告:** 此操作将永久删除本服务器的 **所有** 黑名单记录，且无法撤销。\n请确认你的操作。",
+            view=view,
+            ephemeral=True
+        )
 
 bot.tree.add_command(gym_management_group)
 
