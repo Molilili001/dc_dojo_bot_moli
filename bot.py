@@ -132,6 +132,7 @@ async def setup_database():
                 questions TEXT, -- Stored as JSON string
                 questions_to_ask INTEGER, -- Number of questions to randomly select
                 allowed_mistakes INTEGER, -- Number of allowed mistakes before failing
+                badge_image_url TEXT, -- URL for the badge image
                 is_enabled BOOLEAN DEFAULT TRUE,
                 PRIMARY KEY (guild_id, gym_id)
             )
@@ -150,6 +151,12 @@ async def setup_database():
                 raise # Re-raise other errors
         try:
             await conn.execute("ALTER TABLE gyms ADD COLUMN allowed_mistakes INTEGER;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
+        # Safely add the new column for badge images
+        try:
+            await conn.execute("ALTER TABLE gyms ADD COLUMN badge_image_url TEXT;")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
@@ -203,7 +210,7 @@ async def get_guild_gyms(guild_id: str) -> list:
     """Gets all gyms for a specific guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, is_enabled FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, is_enabled FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
             rows = await cursor.fetchall()
     
     gyms_list = []
@@ -214,7 +221,8 @@ async def get_guild_gyms(guild_id: str) -> list:
             "description": row["description"],
             "tutorial": json.loads(row["tutorial"]),
             "questions": json.loads(row["questions"]),
-            "is_enabled": row["is_enabled"]
+            "is_enabled": row["is_enabled"],
+            "badge_image_url": row["badge_image_url"]
         }
         if row["questions_to_ask"]:
             gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -227,7 +235,7 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
     """Gets a single gym's data for a guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, is_enabled FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, is_enabled FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
             row = await cursor.fetchone()
 
     if not row:
@@ -238,7 +246,8 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
         "description": row["description"],
         "tutorial": json.loads(row["tutorial"]),
         "questions": json.loads(row["questions"]),
-        "is_enabled": row["is_enabled"]
+        "is_enabled": row["is_enabled"],
+        "badge_image_url": row["badge_image_url"]
     }
     if row["questions_to_ask"]:
         gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -249,22 +258,24 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
 async def create_gym(guild_id: str, gym_data: dict, conn: aiosqlite.Connection):
     """Creates a new gym using the provided connection."""
     await conn.execute('''
-        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, is_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, is_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
     ''', (
         guild_id, gym_data['id'], gym_data['name'], gym_data['description'],
         json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions']),
-        gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes')
+        gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
+        gym_data.get('badge_image_url') # Can be None
     ))
 
 async def update_gym(guild_id: str, gym_id: str, gym_data: dict, conn: aiosqlite.Connection) -> int:
     """Updates an existing gym. Returns rowcount."""
     cursor = await conn.execute('''
-        UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?, questions_to_ask = ?, allowed_mistakes = ?
+        UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?, questions_to_ask = ?, allowed_mistakes = ?, badge_image_url = ?
         WHERE guild_id = ? AND gym_id = ?
     ''', (
         gym_data['name'], gym_data['description'], json.dumps(gym_data['tutorial']),
         json.dumps(gym_data['questions']), gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
+        gym_data.get('badge_image_url'), # Can be None
         guild_id, gym_id
     ))
     return cursor.rowcount
@@ -698,14 +709,59 @@ class CancelChallengeButton(discord.ui.Button):
         else:
             await interaction.response.edit_message(content="没有正在进行的挑战或已超时。", view=None, embed=None)
 
+def _create_wrong_answers_embed_fields(wrong_answers: list, show_correct_answer: bool) -> list:
+    """
+    Creates a list of embed field dictionaries for displaying wrong answers.
+    Handles embed field character limits and formats answers correctly.
+    """
+    if not wrong_answers:
+        return []
+
+    fields_to_add = []
+    current_field_text = ""
+
+    for i, (question, wrong_answer) in enumerate(wrong_answers):
+        question_text = question['text']
+        
+        # Base entry text
+        entry_text = f"**题目**: {question_text}\n**你的答案**: `{wrong_answer}`\n"
+
+        # Conditionally add the correct answer
+        if show_correct_answer:
+            correct_answer = question['correct_answer']
+            # Format correct answer if it's a list (for fill-in-the-blank)
+            if isinstance(correct_answer, list):
+                correct_answer_str = ' 或 '.join(f"`{ans}`" for ans in correct_answer)
+            else:
+                correct_answer_str = f"`{correct_answer}`"
+            entry_text += f"**正确答案**: {correct_answer_str}\n"
+        
+        entry_text += "\n" # Add final newline for spacing
+
+        # Discord embed field value limit is 1024 characters
+        if len(current_field_text) + len(entry_text) > 1024:
+            # Current field is full, add it to the list and start a new one
+            field_name = "错题回顾" if not fields_to_add else "错题回顾 (续)"
+            fields_to_add.append({"name": field_name, "value": current_field_text, "inline": False})
+            current_field_text = ""
+
+        current_field_text += entry_text
+
+    # Add the last or only field
+    if current_field_text:
+        field_name = "错题回顾" if not fields_to_add else "错题回顾 (续)"
+        fields_to_add.append({"name": field_name, "value": current_field_text, "inline": False})
+    
+    return fields_to_add
+
 async def display_question(interaction: discord.Interaction, session: ChallengeSession, from_modal: bool = False):
     # This function builds and sends/edits the message for the current question or final result.
-
+ 
     # --- Part 1: Build the Embed and View ---
     embed = None
     view = discord.ui.View(timeout=180)
     is_final_result = False
-
+ 
     # Check if all questions have been answered
     if session.current_question_index >= len(session.questions_for_session):
         is_final_result = True
@@ -725,6 +781,17 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                            f"允许错题数: **{session.allowed_mistakes}**\n\n" \
                            "你的道馆挑战失败记录已被清零。"
             embed = discord.Embed(title="🎉 恭喜你，挑战成功！", description=success_desc, color=discord.Color.green())
+
+            # Use the helper to generate and add fields
+            wrong_answer_fields = _create_wrong_answers_embed_fields(session.wrong_answers, show_correct_answer=True)
+            total_embed_length = len(embed.title) + len(embed.description)
+            for field in wrong_answer_fields:
+                total_embed_length += len(field['name']) + len(field['value'])
+                if total_embed_length < 6000 and len(embed.fields) < 25:
+                    embed.add_field(**field)
+                else:
+                    break # Stop if limits are approached
+            
             await check_and_manage_completion_roles(interaction.user, session)
         else:
             # --- CHALLENGE FAILURE ---
@@ -748,44 +815,15 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
             
             embed = discord.Embed(title="❌ 挑战失败", description=fail_desc, color=discord.Color.red())
 
-            # --- Add Wrong Answers Section ---
-            if session.wrong_answers:
-                # Use a temporary list to build fields to avoid exceeding embed limits
-                fields_to_add = []
-                current_field_text = ""
-
-                for i, (question, wrong_answer) in enumerate(session.wrong_answers):
-                    question_text = question['text']
-                    
-                    # Format the entry for this wrong answer
-                    entry_text = (
-                        f"**题目**: {question_text}\n"
-                        f"**你的答案**: `{wrong_answer}`\n\n"
-                    )
-                    
-                    # Discord embed field value limit is 1024 characters
-                    if len(current_field_text) + len(entry_text) > 1024:
-                        # Current field is full, add it to the list and start a new one
-                        field_name = "错题回顾" if not fields_to_add else f"错题回顾 (续)"
-                        fields_to_add.append({"name": field_name, "value": current_field_text, "inline": False})
-                        current_field_text = ""
-
-                    current_field_text += entry_text
-
-                # Add the last or only field
-                if current_field_text:
-                    field_name = "错题回顾" if not fields_to_add else f"错题回顾 (续)"
-                    fields_to_add.append({"name": field_name, "value": current_field_text, "inline": False})
-
-                # Add all collected fields to the embed, respecting the total embed character limit
-                total_embed_length = len(embed.title) + len(embed.description)
-                for field in fields_to_add:
-                    total_embed_length += len(field['name']) + len(field['value'])
-                    if total_embed_length < 6000 and len(embed.fields) < 25:
-                        embed.add_field(**field)
-                    else:
-                        # Stop adding fields if limits are approached
-                        break
+            # Use the helper to generate and add fields
+            wrong_answer_fields = _create_wrong_answers_embed_fields(session.wrong_answers, show_correct_answer=False)
+            total_embed_length = len(embed.title) + len(embed.description)
+            for field in wrong_answer_fields:
+                total_embed_length += len(field['name']) + len(field['value'])
+                if total_embed_length < 6000 and len(embed.fields) < 25:
+                    embed.add_field(**field)
+                else:
+                    break # Stop if limits are approached
     else:
         # --- Display Next Question ---
         question = session.get_current_question()
@@ -1321,6 +1359,16 @@ def validate_gym_json(data: dict) -> str:
         if data['allowed_mistakes'] < 0:
             return "`allowed_mistakes` 不能是负数。"
 
+    # Validate optional badge_image_url
+    if 'badge_image_url' in data and data['badge_image_url']:
+        url = data['badge_image_url']
+        if not isinstance(url, str):
+            return "`badge_image_url` 必须是一个字符串。"
+        if not (url.startswith('http://') or url.startswith('https://')):
+            return "`badge_image_url` 必须是一个有效的URL (以 http:// 或 https:// 开头)。"
+        if not any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
+             return "`badge_image_url` 似乎不是一个有效的图片直链 (应以 .png, .jpg, .jpeg, .gif, .webp 结尾)。"
+
     # Validate tutorial length
     if isinstance(data.get('tutorial'), list) and len("\n".join(data['tutorial'])) > EMBED_DESC_LIMIT:
         return f"`tutorial` 的总长度超出了Discord {EMBED_DESC_LIMIT} 字符的限制。"
@@ -1541,7 +1589,8 @@ async def gym_list(interaction: discord.Interaction):
     for gym in guild_gyms:
         status_emoji = "✅" if gym.get('is_enabled', True) else "⏸️"
         status_text = "开启" if gym.get('is_enabled', True) else "关闭"
-        description_lines.append(f"{status_emoji} **{gym['name']}** `(ID: {gym['id']})` - **状态:** {status_text}")
+        badge_text = "🖼️" if gym.get('badge_image_url') else "➖"
+        description_lines.append(f"{status_emoji} **{gym['name']}** `(ID: {gym['id']})` - **状态:** {status_text} | **徽章:** {badge_text}")
     
     embed.description = "\n".join(description_lines)
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1849,7 +1898,105 @@ async def gym_blacklist(
             ephemeral=True
         )
 
+# --- Badge Showcase Command ---
+
+class BadgeView(discord.ui.View):
+    def __init__(self, user: discord.User, gyms: list):
+        super().__init__(timeout=180)
+        self.user = user
+        self.gyms = gyms
+        self.current_index = 0
+        self.update_buttons()
+
+    async def create_embed(self) -> discord.Embed:
+        """Creates the embed for the current badge, validating the URL just-in-time."""
+        gym = self.gyms[self.current_index]
+        gym_name = gym['name']
+        url = gym.get('badge_image_url')
+
+        embed = discord.Embed(
+            title=f"{self.user.display_name}的徽章墙",
+            description=f"正在查看: **{gym_name}**",
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text=f"徽章 {self.current_index + 1}/{len(self.gyms)}")
+
+        if not isinstance(url, str) or not url:
+            embed.description += "\n\n🖼️ 此道馆未设置徽章图片。"
+            return embed
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(url, timeout=5) as response:
+                    if response.status == 200 and 'image' in response.headers.get('Content-Type', ''):
+                        embed.set_image(url=url)
+                    else:
+                        embed.description += "\n\n🖼️ 此徽章图片已失效，请联系管理员。"
+                        logging.warning(f"Invalid badge URL for gym '{gym['id']}': Status {response.status}, Content-Type {response.headers.get('Content-Type')}")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            embed.description += "\n\n🖼️ 此徽章图片链接无法访问，请联系管理员。"
+            logging.warning(f"Unreachable badge URL for gym '{gym['id']}': {url}")
+            
+        return embed
+
+    def update_buttons(self):
+        """Disables/Enables buttons based on the current index."""
+        if len(self.gyms) <= 1:
+            self.children[0].disabled = True
+            self.children[1].disabled = True
+            return
+            
+        self.children[0].disabled = self.current_index == 0
+        self.children[1].disabled = self.current_index == len(self.gyms) - 1
+
+    async def handle_interaction(self, interaction: discord.Interaction):
+        """Central handler for button interactions."""
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("你不能操作别人的徽章墙哦。", ephemeral=True)
+            return
+        
+        self.update_buttons()
+        await interaction.response.edit_message(embed=await self.create_embed(), view=self)
+
+    @discord.ui.button(label="◀️ 上一个", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_index -= 1
+        await self.handle_interaction(interaction)
+
+    @discord.ui.button(label="下一个 ▶️", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_index += 1
+        await self.handle_interaction(interaction)
+
+
+@bot.tree.command(name="我的徽章墙", description="查看你已获得的道馆徽章。")
+async def my_badges(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    user_id = str(interaction.user.id)
+    guild_id = str(interaction.guild.id)
+    
+    user_progress = await get_user_progress(user_id, guild_id)
+    if not user_progress:
+        return await interaction.followup.send("你还没有通过任何道馆的考核。", ephemeral=True)
+        
+    completed_gym_ids = list(user_progress.keys())
+    all_guild_gyms = await get_guild_gyms(guild_id)
+    
+    # We now pass all completed gyms, the view will handle URL validation.
+    completed_gyms = [gym for gym in all_guild_gyms if gym['id'] in completed_gym_ids]
+    
+    if not completed_gyms:
+        # This case should ideally not be hit if user_progress is not empty, but as a safeguard:
+        return await interaction.followup.send("你还没有通过任何道馆的考核。", ephemeral=True)
+        
+    view = BadgeView(interaction.user, completed_gyms)
+    await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=True)
+
+
 bot.tree.add_command(gym_management_group)
+# The /my_badges command is already registered via the @bot.tree.command decorator,
+# so it does not need to be added to the group.
 
 # --- Main Execution ---
 if __name__ == "__main__":

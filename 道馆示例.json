@@ -2,6 +2,7 @@
   "id": "community_navigation",
   "name": "🧭 社区导航道馆",
   "description": "学习如何高效地使用本服务器，了解核心频道功能与基本礼仪。",
+  "badge_image_url": "https://example.com/path/to/your/badge.png",
   "tutorial": [
     "欢迎来到社区导航道馆！",
     "在这里，你将学会如何在我们的社区中高效地寻找信息、提问和交流。",
