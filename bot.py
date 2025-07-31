@@ -133,6 +133,7 @@ async def setup_database():
                 questions_to_ask INTEGER, -- Number of questions to randomly select
                 allowed_mistakes INTEGER, -- Number of allowed mistakes before failing
                 badge_image_url TEXT, -- URL for the badge image
+                badge_description TEXT, -- Custom description for the badge
                 is_enabled BOOLEAN DEFAULT TRUE,
                 PRIMARY KEY (guild_id, gym_id)
             )
@@ -157,6 +158,12 @@ async def setup_database():
         # Safely add the new column for badge images
         try:
             await conn.execute("ALTER TABLE gyms ADD COLUMN badge_image_url TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
+        # Safely add the new column for badge descriptions
+        try:
+            await conn.execute("ALTER TABLE gyms ADD COLUMN badge_description TEXT;")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
@@ -210,7 +217,7 @@ async def get_guild_gyms(guild_id: str) -> list:
     """Gets all gyms for a specific guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, is_enabled FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
             rows = await cursor.fetchall()
     
     gyms_list = []
@@ -222,7 +229,8 @@ async def get_guild_gyms(guild_id: str) -> list:
             "tutorial": json.loads(row["tutorial"]),
             "questions": json.loads(row["questions"]),
             "is_enabled": row["is_enabled"],
-            "badge_image_url": row["badge_image_url"]
+            "badge_image_url": row["badge_image_url"],
+            "badge_description": row["badge_description"]
         }
         if row["questions_to_ask"]:
             gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -235,7 +243,7 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
     """Gets a single gym's data for a guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, is_enabled FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
             row = await cursor.fetchone()
 
     if not row:
@@ -247,7 +255,8 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
         "tutorial": json.loads(row["tutorial"]),
         "questions": json.loads(row["questions"]),
         "is_enabled": row["is_enabled"],
-        "badge_image_url": row["badge_image_url"]
+        "badge_image_url": row["badge_image_url"],
+        "badge_description": row["badge_description"]
     }
     if row["questions_to_ask"]:
         gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -258,24 +267,24 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
 async def create_gym(guild_id: str, gym_data: dict, conn: aiosqlite.Connection):
     """Creates a new gym using the provided connection."""
     await conn.execute('''
-        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, is_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
     ''', (
         guild_id, gym_data['id'], gym_data['name'], gym_data['description'],
         json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions']),
         gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
-        gym_data.get('badge_image_url') # Can be None
+        gym_data.get('badge_image_url'), gym_data.get('badge_description')
     ))
 
 async def update_gym(guild_id: str, gym_id: str, gym_data: dict, conn: aiosqlite.Connection) -> int:
     """Updates an existing gym. Returns rowcount."""
     cursor = await conn.execute('''
-        UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?, questions_to_ask = ?, allowed_mistakes = ?, badge_image_url = ?
+        UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?, questions_to_ask = ?, allowed_mistakes = ?, badge_image_url = ?, badge_description = ?
         WHERE guild_id = ? AND gym_id = ?
     ''', (
         gym_data['name'], gym_data['description'], json.dumps(gym_data['tutorial']),
         json.dumps(gym_data['questions']), gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
-        gym_data.get('badge_image_url'), # Can be None
+        gym_data.get('badge_image_url'), gym_data.get('badge_description'),
         guild_id, gym_id
     ))
     return cursor.rowcount
@@ -709,6 +718,34 @@ class CancelChallengeButton(discord.ui.Button):
         else:
             await interaction.response.edit_message(content="没有正在进行的挑战或已超时。", view=None, embed=None)
 
+class BadgePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None) # Persistent view
+
+    @discord.ui.button(label="我的徽章墙", style=discord.ButtonStyle.primary, custom_id="show_my_badges")
+    async def show_my_badges_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        user_id = str(interaction.user.id)
+        guild_id = str(interaction.guild.id)
+        
+        user_progress = await get_user_progress(user_id, guild_id)
+        if not user_progress:
+            await interaction.followup.send("你还没有通过任何道馆的考核。", ephemeral=True)
+            return
+            
+        completed_gym_ids = list(user_progress.keys())
+        all_guild_gyms = await get_guild_gyms(guild_id)
+        
+        completed_gyms = [gym for gym in all_guild_gyms if gym['id'] in completed_gym_ids]
+        
+        if not completed_gyms:
+            await interaction.followup.send("你还没有通过任何道馆的考核。", ephemeral=True)
+            return
+            
+        view = BadgeView(interaction.user, completed_gyms)
+        await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=True)
+
 def _create_wrong_answers_embed_fields(wrong_answers: list, show_correct_answer: bool) -> list:
     """
     Creates a list of embed field dictionaries for displaying wrong answers.
@@ -1095,6 +1132,7 @@ async def on_ready():
         logging.error(f"Error syncing commands globally: {e}")
     logging.info('Bot is ready to accept commands.')
     bot.add_view(MainView())
+    bot.add_view(BadgePanelView())
     daily_backup_task.start()
 
 @bot.tree.error
@@ -1331,6 +1369,37 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
         logging.error(f"Error in /道馆 召唤 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
+@gym_management_group.command(name="徽章墙面板", description="在该频道召唤一个徽章墙面板 (馆主、管理员、开发者)。")
+@has_gym_management_permission("召唤")
+@app_commands.describe(
+    introduction="[可选] 自定义徽章墙面板的介绍文字。"
+)
+async def summon_badge_panel(interaction: discord.Interaction, introduction: typing.Optional[str] = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        description = introduction if introduction else (
+            "这里是徽章墙展示中心。\n\n"
+            "点击下方的按钮，来展示你通过努力获得的道馆徽章吧！"
+        )
+        
+        embed = discord.Embed(
+            title="徽章墙展示中心",
+            description=description,
+            color=discord.Color.purple()
+        )
+        
+        await interaction.channel.send(embed=embed, view=BadgePanelView())
+        
+        await interaction.followup.send(f"✅ 徽章墙面板已成功创建于 {interaction.channel.mention}！", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 设置失败：我没有权限在此频道发送消息。请检查我的权限。", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error in /道馆 徽章墙面板 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
+
+
 def validate_gym_json(data: dict) -> str:
     """Validates the structure and content length of the gym JSON. Returns an error string or empty string if valid."""
     # Discord Limits
@@ -1368,6 +1437,14 @@ def validate_gym_json(data: dict) -> str:
             return "`badge_image_url` 必须是一个有效的URL (以 http:// 或 https:// 开头)。"
         if not any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
              return "`badge_image_url` 似乎不是一个有效的图片直链 (应以 .png, .jpg, .jpeg, .gif, .webp 结尾)。"
+
+    # Validate optional badge_description
+    if 'badge_description' in data and data['badge_description']:
+        desc = data['badge_description']
+        if not isinstance(desc, str):
+            return "`badge_description` 必须是一个字符串。"
+        if len(desc) > 1024:
+            return f"`badge_description` 的长度不能超过 1024 个字符。"
 
     # Validate tutorial length
     if isinstance(data.get('tutorial'), list) and len("\n".join(data['tutorial'])) > EMBED_DESC_LIMIT:
@@ -1909,33 +1986,31 @@ class BadgeView(discord.ui.View):
         self.update_buttons()
 
     async def create_embed(self) -> discord.Embed:
-        """Creates the embed for the current badge, validating the URL just-in-time."""
+        """Creates the embed for the current badge."""
         gym = self.gyms[self.current_index]
         gym_name = gym['name']
         url = gym.get('badge_image_url')
 
+        badge_desc = gym.get('badge_description')
+
         embed = discord.Embed(
             title=f"{self.user.display_name}的徽章墙",
-            description=f"正在查看: **{gym_name}**",
             color=discord.Color.gold()
         )
+        
+        # Build the description
+        description_text = f"### {gym_name}\n\n"
+        if badge_desc:
+            description_text += f"{badge_desc}\n\n"
+        
+        embed.description = description_text
         embed.set_footer(text=f"徽章 {self.current_index + 1}/{len(self.gyms)}")
 
-        if not isinstance(url, str) or not url:
-            embed.description += "\n\n🖼️ 此道馆未设置徽章图片。"
-            return embed
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.head(url, timeout=5) as response:
-                    if response.status == 200 and 'image' in response.headers.get('Content-Type', ''):
-                        embed.set_image(url=url)
-                    else:
-                        embed.description += "\n\n🖼️ 此徽章图片已失效，请联系管理员。"
-                        logging.warning(f"Invalid badge URL for gym '{gym['id']}': Status {response.status}, Content-Type {response.headers.get('Content-Type')}")
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            embed.description += "\n\n🖼️ 此徽章图片链接无法访问，请联系管理员。"
-            logging.warning(f"Unreachable badge URL for gym '{gym['id']}': {url}")
+        if isinstance(url, str) and url:
+            embed.set_image(url=url)
+        else:
+            # If there's no image, add a note to the description
+            embed.description += "🖼️ *此道馆未设置徽章图片。*"
             
         return embed
 
