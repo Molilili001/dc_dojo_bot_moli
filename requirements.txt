@@ -1,0 +1,6 @@
+discord.py
+aiosqlite
+aiohttp
+pytz
+psutil
+aiofiles
