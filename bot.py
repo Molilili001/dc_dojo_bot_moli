@@ -117,6 +117,12 @@ async def setup_database():
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
+        # Safely add the new column for ultimate gyms
+        try:
+            await conn.execute("ALTER TABLE challenge_panels ADD COLUMN is_ultimate_gym BOOLEAN DEFAULT FALSE;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
         # Gym master (gym owner) permissions table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gym_masters (
@@ -173,6 +179,12 @@ async def setup_database():
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
+        # Safely add the new column for randomizing options
+        try:
+            await conn.execute("ALTER TABLE gyms ADD COLUMN randomize_options BOOLEAN DEFAULT FALSE;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
         # Table to track user failures and cooldowns
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS challenge_failures (
@@ -219,6 +231,35 @@ async def setup_database():
                 PRIMARY KEY (guild_id, target_id)
             )
         ''')
+        # Table for the ultimate gym leaderboard
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ultimate_gym_leaderboard (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                completion_time_seconds REAL NOT NULL, -- Using REAL for float values
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        ''')
+        # Table for leaderboard panels
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS leaderboard_panels (
+                message_id TEXT PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                title TEXT,
+                description TEXT
+            )
+        ''')
+        # Safely add new columns for customization
+        try:
+            await conn.execute("ALTER TABLE leaderboard_panels ADD COLUMN title TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e): raise
+        try:
+            await conn.execute("ALTER TABLE leaderboard_panels ADD COLUMN description TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e): raise
         # Table to track one-time role rewards
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS claimed_role_rewards (
@@ -239,6 +280,8 @@ async def setup_database():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cheating_blacklist_guild_target ON cheating_blacklist (guild_id, target_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_challenge_ban_list_guild_target ON challenge_ban_list (guild_id, target_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_claimed_rewards_guild_user_role ON claimed_role_rewards (guild_id, user_id, role_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ultimate_leaderboard_guild_time ON ultimate_gym_leaderboard (guild_id, completion_time_seconds);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_leaderboard_panels_guild ON leaderboard_panels (guild_id);")
  
         await conn.commit()
 
@@ -247,7 +290,7 @@ async def get_guild_gyms(guild_id: str) -> list:
     """Gets all gyms for a specific guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled, randomize_options FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
             rows = await cursor.fetchall()
     
     gyms_list = []
@@ -260,7 +303,8 @@ async def get_guild_gyms(guild_id: str) -> list:
             "questions": json.loads(row["questions"]),
             "is_enabled": row["is_enabled"],
             "badge_image_url": row["badge_image_url"],
-            "badge_description": row["badge_description"]
+            "badge_description": row["badge_description"],
+            "randomize_options": row["randomize_options"]
         }
         if row["questions_to_ask"]:
             gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -273,7 +317,7 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
     """Gets a single gym's data for a guild."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
+        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled, randomize_options FROM gyms WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) as cursor:
             row = await cursor.fetchone()
 
     if not row:
@@ -286,7 +330,8 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
         "questions": json.loads(row["questions"]),
         "is_enabled": row["is_enabled"],
         "badge_image_url": row["badge_image_url"],
-        "badge_description": row["badge_description"]
+        "badge_description": row["badge_description"],
+        "randomize_options": row["randomize_options"]
     }
     if row["questions_to_ask"]:
         gym_data["questions_to_ask"] = row["questions_to_ask"]
@@ -297,24 +342,26 @@ async def get_single_gym(guild_id: str, gym_id: str) -> dict:
 async def create_gym(guild_id: str, gym_data: dict, conn: aiosqlite.Connection):
     """Creates a new gym using the provided connection."""
     await conn.execute('''
-        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+        INSERT INTO gyms (guild_id, gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled, randomize_options)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?)
     ''', (
         guild_id, gym_data['id'], gym_data['name'], gym_data['description'],
         json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions']),
         gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
-        gym_data.get('badge_image_url'), gym_data.get('badge_description')
+        gym_data.get('badge_image_url'), gym_data.get('badge_description'),
+        gym_data.get('randomize_options', False)
     ))
 
 async def update_gym(guild_id: str, gym_id: str, gym_data: dict, conn: aiosqlite.Connection) -> int:
     """Updates an existing gym. Returns rowcount."""
     cursor = await conn.execute('''
-        UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?, questions_to_ask = ?, allowed_mistakes = ?, badge_image_url = ?, badge_description = ?
+        UPDATE gyms SET name = ?, description = ?, tutorial = ?, questions = ?, questions_to_ask = ?, allowed_mistakes = ?, badge_image_url = ?, badge_description = ?, randomize_options = ?
         WHERE guild_id = ? AND gym_id = ?
     ''', (
         gym_data['name'], gym_data['description'], json.dumps(gym_data['tutorial']),
         json.dumps(gym_data['questions']), gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
         gym_data.get('badge_image_url'), gym_data.get('badge_description'),
+        gym_data.get('randomize_options', False),
         guild_id, gym_id
     ))
     return cursor.rowcount
@@ -391,7 +438,62 @@ async def reset_user_failures_for_gym(user_id: str, guild_id: str, gym_id: str):
                 "DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ? AND gym_id = ?",
                 (user_id, guild_id, gym_id)
             )
+
+# --- Ultimate Gym Leaderboard Functions ---
+async def get_ultimate_leaderboard(guild_id: str, limit: int = 100) -> list:
+    """Gets the top players from the ultimate gym leaderboard for a guild."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT user_id, completion_time_seconds, timestamp FROM ultimate_gym_leaderboard WHERE guild_id = ? ORDER BY completion_time_seconds ASC LIMIT ?",
+            (guild_id, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
+
+async def update_ultimate_leaderboard(guild_id: str, user_id: str, time_seconds: float):
+    """Updates a user's score on the ultimate gym leaderboard, only if it's a better time."""
+    async with user_db_locks[user_id]:
+        async with aiosqlite.connect(db_path) as conn:
+            # First, get the user's current best time, if any
+            async with conn.execute("SELECT completion_time_seconds FROM ultimate_gym_leaderboard WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)) as cursor:
+                current_best = await cursor.fetchone()
+            
+            # If the user has a previous score and the new one isn't better, do nothing
+            if current_best and time_seconds >= current_best[0]:
+                return
+
+            # Otherwise, insert or update the score
+            timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
+            await conn.execute('''
+                INSERT INTO ultimate_gym_leaderboard (guild_id, user_id, completion_time_seconds, timestamp)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                completion_time_seconds = excluded.completion_time_seconds,
+                timestamp = excluded.timestamp
+            ''', (guild_id, user_id, time_seconds, timestamp))
             await conn.commit()
+
+async def get_user_rank_on_leaderboard(guild_id: str, user_id: str) -> typing.Optional[dict]:
+    """Gets a user's specific rank and score from the ultimate gym leaderboard."""
+    query = """
+        SELECT rank, completion_time_seconds
+        FROM (
+            SELECT
+                user_id,
+                completion_time_seconds,
+                ROW_NUMBER() OVER (ORDER BY completion_time_seconds ASC) as rank
+            FROM ultimate_gym_leaderboard
+            WHERE guild_id = ?
+        )
+        WHERE user_id = ?
+    """
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (guild_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+    
+    return dict(row) if row else None
 
 async def set_gym_completed(user_id: str, guild_id: str, gym_id: str):
     """Marks a gym as completed for a user in a specific guild."""
@@ -416,15 +518,18 @@ async def fully_reset_user_progress(user_id: str, guild_id: str):
             f_cursor = await conn.execute("DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
             # Reset claimed rewards
             r_cursor = await conn.execute("DELETE FROM claimed_role_rewards WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            # Reset ultimate leaderboard score
+            u_cursor = await conn.execute("DELETE FROM ultimate_gym_leaderboard WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
             await conn.commit()
             
             p_count = p_cursor.rowcount
             f_count = f_cursor.rowcount
             r_count = r_cursor.rowcount
+            u_count = u_cursor.rowcount
             
             logging.info(
                 f"PROGRESS_RESET: Fully reset user '{user_id}' in guild '{guild_id}'. "
-                f"Removed {p_count} progress, {f_count} failures, {r_count} rewards."
+                f"Removed {p_count} progress, {f_count} failures, {r_count} rewards, {u_count} leaderboard scores."
             )
 
 # --- Role Reward Claim Functions ---
@@ -651,6 +756,47 @@ async def is_user_banned(guild_id: str, user: discord.Member) -> typing.Optional
 
     return None
 
+# --- UI Views ---
+class LeaderboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="查询我的排名", style=discord.ButtonStyle.primary, custom_id="leaderboard:show_my_rank")
+    async def show_my_rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        try:
+            guild_id = str(interaction.guild.id)
+            user_id = str(interaction.user.id)
+
+            rank_data = await get_user_rank_on_leaderboard(guild_id, user_id)
+
+            if rank_data:
+                rank = rank_data['rank']
+                score = rank_data['completion_time_seconds']
+                minutes, seconds = divmod(int(score), 60)
+                
+                embed = discord.Embed(
+                    title="📈 我的究极道馆排名",
+                    description=f"你好，{interaction.user.mention}！\n你在 **{interaction.guild.name}** 的排名信息如下：",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(name="当前排名", value=f"**第 {rank} 名**", inline=True)
+                embed.add_field(name="最佳成绩", value=f"**{minutes}分 {seconds}秒**", inline=True)
+                embed.set_footer(text="继续挑战，刷新你的记录！")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                embed = discord.Embed(
+                    title="📜 暂无排名记录",
+                    description=f"你好，{interaction.user.mention}！\n我们尚未在 **{interaction.guild.name}** 的究极道馆排行榜上找到你的记录。",
+                    color=discord.Color.orange()
+                )
+                embed.set_footer(text="快去参加究极道馆挑战，榜上留名吧！")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in show_my_rank button: {e}", exc_info=True)
+            await interaction.followup.send("❌ 查询你的排名时发生错误，请稍后再试或联系管理员。", ephemeral=True)
+
 # --- State Management ---
 active_challenges = {}
 
@@ -662,17 +808,21 @@ class ChallengeSession:
         self.gym_id = gym_id
         self.gym_info = gym_info
         self.panel_message_id = panel_message_id # The ID of the panel message this challenge originated from
+        self.is_ultimate = gym_info.get('is_ultimate', False)
+        self.start_time = time.time() # Start timer as soon as session is created
         self.current_question_index = 0
         self.mistakes_made = 0
         self.wrong_answers = [] # To store tuples of (question, user_answer)
         self.allowed_mistakes = self.gym_info.get('allowed_mistakes', 0)
+        self.randomize_options = True # Force randomize for all challenges
         
         # --- Random Question Logic ---
         self.questions_for_session = self.gym_info.get('questions', [])
         num_to_ask = self.gym_info.get('questions_to_ask')
         
         if num_to_ask and isinstance(num_to_ask, int) and num_to_ask > 0:
-            if num_to_ask <= len(self.questions_for_session):
+            # For ultimate gyms, the sampling is already done before creating the session
+            if not self.is_ultimate and num_to_ask <= len(self.questions_for_session):
                 self.questions_for_session = random.sample(self.questions_for_session, num_to_ask)
 
     def get_current_question(self):
@@ -816,55 +966,97 @@ class MainView(discord.ui.View):
         # Get the specific configuration for THIS panel from the database
         async with aiosqlite.connect(db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT associated_gyms, prerequisite_gyms FROM challenge_panels WHERE message_id = ?", (str(panel_message_id),)) as cursor:
+            async with conn.execute("SELECT associated_gyms, prerequisite_gyms, is_ultimate_gym FROM challenge_panels WHERE message_id = ?", (str(panel_message_id),)) as cursor:
                 panel_config = await cursor.fetchone()
 
-        # --- Prerequisite Check ---
-        if panel_config and panel_config['prerequisite_gyms']:
-            prerequisite_ids = set(json.loads(panel_config['prerequisite_gyms']))
-            completed_ids = set(user_gym_progress.keys())
+        # --- Ultimate Gym Logic ---
+        if panel_config and panel_config['is_ultimate_gym']:
+            all_questions = []
+            for gym in all_guild_gyms:
+                if gym.get('is_enabled', True):
+                    all_questions.extend(gym['questions'])
             
-            if not prerequisite_ids.issubset(completed_ids):
-                missing_gyms = prerequisite_ids - completed_ids
-                
-                # Fetch names of missing gyms for a user-friendly message
-                missing_gym_names = []
-                all_gyms_dict = {gym['id']: gym['name'] for gym in all_guild_gyms}
-                for gym_id in missing_gyms:
-                    missing_gym_names.append(all_gyms_dict.get(gym_id, gym_id))
+            if not all_questions:
+                return await interaction.followup.send("❌ 服务器内没有可用的题目来开启究极道馆挑战。", ephemeral=True)
 
+            # Select 50% of the total questions
+            num_to_ask = len(all_questions) // 2
+            if num_to_ask == 0 and len(all_questions) > 0:
+                num_to_ask = 1 # Ensure at least one question if possible
+
+            questions_for_session = random.sample(all_questions, num_to_ask)
+
+            # Create a virtual gym_info for the session
+            ultimate_gym_info = {
+                "id": "ultimate_gym",
+                "name": "究极道馆挑战",
+                "description": "挑战你知识的极限！",
+                "tutorial": ["你将面对从所有道馆题库中随机抽取的50%的题目。", "你的完成时间将被记录并参与排名。", "祝你好运！"],
+                "questions": questions_for_session,
+                "allowed_mistakes": 0, # Ultimate challenge is strict
+                "is_ultimate": True,
+                "randomize_options": True # Always randomize options for ultimate challenge
+            }
+            
+            session = ChallengeSession(user_id, interaction.guild.id, "ultimate_gym", ultimate_gym_info, panel_message_id)
+            active_challenges[user_id] = session
+            logging.info(f"CHALLENGE: ULTIMATE session created for user '{user_id}'.")
+            
+            tutorial_text = "\n".join(session.gym_info['tutorial'])
+            embed = discord.Embed(title=f"欢迎来到 {session.gym_info['name']}", description=tutorial_text, color=discord.Color.red())
+            
+            view = discord.ui.View()
+            view.add_item(StartChallengeButton("ultimate_gym"))
+            return await interaction.followup.send(content=None, embed=embed, view=view, ephemeral=True)
+
+        # --- Standard Gym Logic ---
+        else:
+            # --- Prerequisite Check ---
+            if panel_config and panel_config['prerequisite_gyms']:
+                prerequisite_ids = set(json.loads(panel_config['prerequisite_gyms']))
+                completed_ids = set(user_gym_progress.keys())
+                
+                if not prerequisite_ids.issubset(completed_ids):
+                    missing_gyms = prerequisite_ids - completed_ids
+                    
+                    # Fetch names of missing gyms for a user-friendly message
+                    missing_gym_names = []
+                    all_gyms_dict = {gym['id']: gym['name'] for gym in all_guild_gyms}
+                    for gym_id in missing_gyms:
+                        missing_gym_names.append(all_gyms_dict.get(gym_id, gym_id))
+
+                    await interaction.followup.send(
+                        f"❌ **前置条件未满足** ❌\n\n"
+                        f"你需要先完成以下道馆的挑战，才能挑战此面板中的道馆：\n"
+                        f"**- {', '.join(missing_gym_names)}**",
+                        ephemeral=True
+                    )
+                    return
+
+            associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config and panel_config['associated_gyms'] else None
+
+            if associated_gyms:
+                # Filter the gyms to only those specified for this panel
+                gyms_for_this_panel = [gym for gym in all_guild_gyms if gym['id'] in associated_gyms]
+            else:
+                # If no specific list, show all gyms
+                gyms_for_this_panel = all_guild_gyms
+                
+            try:
                 await interaction.followup.send(
-                    f"❌ **前置条件未满足** ❌\n\n"
-                    f"你需要先完成以下道馆的挑战，才能挑战此面板中的道馆：\n"
-                    f"**- {', '.join(missing_gym_names)}**",
+                    "请从下面的列表中选择你要挑战的道馆。",
+                    view=GymSelectView(gyms_for_this_panel, user_gym_progress, panel_message_id),
                     ephemeral=True
                 )
-                return
-
-        associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config and panel_config['associated_gyms'] else None
-
-        if associated_gyms:
-            # Filter the gyms to only those specified for this panel
-            gyms_for_this_panel = [gym for gym in all_guild_gyms if gym['id'] in associated_gyms]
-        else:
-            # If no specific list, show all gyms
-            gyms_for_this_panel = all_guild_gyms
-            
-        try:
-            await interaction.followup.send(
-                "请从下面的列表中选择你要挑战的道馆。",
-                view=GymSelectView(gyms_for_this_panel, user_gym_progress, panel_message_id),
-                ephemeral=True
-            )
-        except aiohttp.ClientConnectorError:
-            # This error happens due to network instability.
-            # We can try to send an ephemeral message to the user to inform them.
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("🤖 抱歉，与 Discord 的连接出现网络波动，请稍后再试。", ephemeral=True)
-            except Exception:
-                # If sending the response also fails, just ignore it.
-                pass
+            except aiohttp.ClientConnectorError:
+                # This error happens due to network instability.
+                # We can try to send an ephemeral message to the user to inform them.
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("🤖 抱歉，与 Discord 的连接出现网络波动，请稍后再试。", ephemeral=True)
+                except Exception:
+                    # If sending the response also fails, just ignore it.
+                    pass
 
 class StartChallengeButton(discord.ui.Button):
     def __init__(self, gym_id: str):
@@ -881,10 +1073,35 @@ class CancelChallengeButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         user_id = str(interaction.user.id)
-        if user_id in active_challenges:
-            del active_challenges[user_id]
-            logging.info(f"CHALLENGE: Session cancelled by user '{user_id}'.")
-            await interaction.response.edit_message(content="挑战已取消。", view=None, embed=None)
+        session = active_challenges.get(user_id)
+
+        if session:
+            guild_id_str = str(session.guild_id)
+            
+            # --- CHALLENGE FAILURE on Cancel ---
+            # Only apply failure penalties to standard gyms
+            if not session.is_ultimate:
+                ban_duration = await increment_user_failure(user_id, guild_id_str, session.gym_id)
+                fail_desc = "你主动放弃了本次挑战，这被计为一次失败。"
+                title = "❌ 挑战已取消并计为失败"
+                
+                if ban_duration.total_seconds() > 0:
+                    hours, remainder = divmod(int(ban_duration.total_seconds()), 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    time_str = f"{hours}小时" if hours > 0 else f"{minutes}分钟"
+                    fail_desc += f"\n\n由于累计挑战失败次数过多，你已被禁止挑战该道馆 **{time_str}**。"
+            else:
+                # For ultimate gyms, just cancel without penalty
+                fail_desc = "你主动放弃了本次究极道馆挑战。"
+                title = "↩️ 挑战已取消"
+
+            # Clean up the session
+            if user_id in active_challenges:
+                del active_challenges[user_id]
+            logging.info(f"CHALLENGE: Session CANCELLED by user '{user_id}' in gym '{session.gym_id}'.")
+            
+            embed = discord.Embed(title=title, description=fail_desc, color=discord.Color.red())
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
         else:
             await interaction.response.edit_message(content="没有正在进行的挑战或已超时。", view=None, embed=None)
 
@@ -1039,17 +1256,41 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         
         if session.mistakes_made <= session.allowed_mistakes:
             # --- CHALLENGE SUCCESS ---
-            await reset_user_failures_for_gym(user_id_str, guild_id_str, session.gym_id)
-            await set_gym_completed(user_id_str, guild_id_str, session.gym_id)
-            if user_id_str in active_challenges: del active_challenges[user_id_str]
-            logging.info(f"CHALLENGE: Session SUCCESS for user '{user_id_str}' in gym '{session.gym_id}'. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
-            
-            success_desc = f"你成功通过了 **{session.gym_info['name']}** 的考核！\n\n" \
-                           f"总题数: **{len(session.questions_for_session)}**\n" \
-                           f"答错题数: **{session.mistakes_made}**\n" \
-                           f"允许错题数: **{session.allowed_mistakes}**\n\n" \
-                           "你的道馆挑战失败记录已被清零。"
-            embed = discord.Embed(title="🎉 恭喜你，挑战成功！", description=success_desc, color=discord.Color.green())
+            # --- Handle Success based on Gym Type ---
+            if session.is_ultimate:
+                # --- ULTIMATE GYM SUCCESS ---
+                end_time = time.time()
+                completion_time = end_time - session.start_time
+                await update_ultimate_leaderboard(guild_id_str, user_id_str, completion_time)
+                if user_id_str in active_challenges: del active_challenges[user_id_str]
+                logging.info(f"CHALLENGE: ULTIMATE session SUCCESS for user '{user_id_str}'. Time: {completion_time:.2f}s")
+                
+                # Trigger the leaderboard update for the guild
+                bot.loop.create_task(trigger_leaderboard_update(session.guild_id))
+
+                # Format completion time for display
+                minutes, seconds = divmod(completion_time, 60)
+                time_str = f"{int(minutes)}分 {seconds:.2f}秒"
+
+                success_desc = f"你成功征服了 **{session.gym_info['name']}**！\n\n" \
+                               f"**用时**: `{time_str}`\n" \
+                               f"**总题数**: **{len(session.questions_for_session)}**\n\n" \
+                               "你的成绩已被记录到排行榜！"
+                embed = discord.Embed(title="🏆 究极挑战成功！", description=success_desc, color=discord.Color.gold())
+
+            else:
+                # --- STANDARD GYM SUCCESS ---
+                await reset_user_failures_for_gym(user_id_str, guild_id_str, session.gym_id)
+                await set_gym_completed(user_id_str, guild_id_str, session.gym_id)
+                if user_id_str in active_challenges: del active_challenges[user_id_str]
+                logging.info(f"CHALLENGE: Session SUCCESS for user '{user_id_str}' in gym '{session.gym_id}'. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
+                
+                success_desc = f"你成功通过了 **{session.gym_info['name']}** 的考核！\n\n" \
+                               f"总题数: **{len(session.questions_for_session)}**\n" \
+                               f"答错题数: **{session.mistakes_made}**\n" \
+                               f"允许错题数: **{session.allowed_mistakes}**\n\n" \
+                               "你的道馆挑战失败记录已被清零。"
+                embed = discord.Embed(title="🎉 恭喜你，挑战成功！", description=success_desc, color=discord.Color.green())
 
             # Use the helper to generate and add fields
             wrong_answer_fields = _create_wrong_answers_embed_fields(session.wrong_answers, show_correct_answer=True)
@@ -1061,18 +1302,29 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                 else:
                     break # Stop if limits are approached
             
-            await check_and_manage_completion_roles(interaction.user, session)
+            # Role management only applies to standard gyms
+            if not session.is_ultimate:
+                await check_and_manage_completion_roles(interaction.user, session)
         else:
             # --- CHALLENGE FAILURE ---
-            ban_duration = await increment_user_failure(user_id_str, guild_id_str, session.gym_id)
+            ban_duration = datetime.timedelta(seconds=0)
+            # Only apply failure penalties to standard gyms
+            if not session.is_ultimate:
+                ban_duration = await increment_user_failure(user_id_str, guild_id_str, session.gym_id)
+
             if user_id_str in active_challenges: del active_challenges[user_id_str]
             logging.info(f"CHALLENGE: Session FAILED for user '{user_id_str}' in gym '{session.gym_id}'. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
 
             fail_desc = f"本次挑战失败。\n\n" \
                         f"总题数: **{len(session.questions_for_session)}**\n" \
-                        f"答错题数: **{session.mistakes_made}**\n" \
-                        f"允许错题数: **{session.allowed_mistakes}**\n\n" \
-                        "你答错的题目数量超过了允许的最大值。"
+                        f"答错题数: **{session.mistakes_made}**\n"
+            
+            if not session.is_ultimate:
+                 fail_desc += f"允许错题数: **{session.allowed_mistakes}**\n\n" \
+                              "你答错的题目数量超过了允许的最大值。"
+            else:
+                fail_desc += "\n究极道馆挑战要求零错误。"
+
 
             if ban_duration.total_seconds() > 0:
                 hours, remainder = divmod(int(ban_duration.total_seconds()), 3600)
@@ -1080,9 +1332,14 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                 time_str = f"{hours}小时" if hours > 0 else f"{minutes}分钟"
                 fail_desc += f"\n\n由于累计挑战失败次数过多，你已被禁止挑战该道馆 **{time_str}**。"
             else:
-                fail_desc += "\n\n请稍后重试。"
+                if not session.is_ultimate:
+                    fail_desc += "\n\n请稍后重试。"
+                else:
+                    fail_desc += "\n\n你可以立即再次尝试！"
             
-            embed = discord.Embed(title="❌ 挑战失败", description=fail_desc, color=discord.Color.red())
+            # Final UI polish: custom title for ultimate gym failure
+            title = "⚔️ 究极挑战失败" if session.is_ultimate else "❌ 挑战失败"
+            embed = discord.Embed(title=title, description=fail_desc, color=discord.Color.red())
 
             # Use the helper to generate and add fields
             wrong_answer_fields = _create_wrong_answers_embed_fields(session.wrong_answers, show_correct_answer=False)
@@ -1101,16 +1358,24 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
         embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=question['text'], color=discord.Color.orange())
         
         if question['type'] == 'multiple_choice':
+            options = question['options']
+            # --- Option Randomization Logic ---
+            if session.randomize_options:
+                shuffled_options = options[:] # Create a copy
+                random.shuffle(shuffled_options)
+            else:
+                shuffled_options = options
+            
             # Format the question with A, B, C options in the embed
             formatted_options = []
-            for i, option_text in enumerate(question['options']):
+            for i, option_text in enumerate(shuffled_options): # Use shuffled list for display
                 letter = chr(ord('A') + i)
                 formatted_options.append(f"**{letter}:** {option_text}")
             
             embed.description = question['text'] + "\n\n" + "\n".join(formatted_options)
 
-            # Create buttons with letter labels
-            for i, option_text in enumerate(question['options']):
+            # Create buttons with letter labels, but the value is the actual option text
+            for i, option_text in enumerate(shuffled_options): # Use shuffled list for buttons
                 letter = chr(ord('A') + i)
                 view.add_item(QuestionAnswerButton(label=letter, correct_answer=question['correct_answer'], value=option_text))
 
@@ -1158,6 +1423,13 @@ class QuestionAnswerButton(discord.ui.Button):
             question_info = session.get_current_question()
             session.wrong_answers.append((question_info, self.value))
             logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
+            
+            # --- Ultimate Gym: Fail Fast ---
+            if session.is_ultimate:
+                # By setting the index past the end, we trigger the final result display immediately.
+                session.current_question_index = len(session.questions_for_session)
+                await display_question(interaction, session)
+                return
 
         session.current_question_index += 1
         await display_question(interaction, session)
@@ -1206,6 +1478,13 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
             session.mistakes_made += 1
             session.wrong_answers.append((self.question, user_answer))
             logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
+
+            # --- Ultimate Gym: Fail Fast ---
+            if session.is_ultimate:
+                # By setting the index past the end, we trigger the final result display immediately.
+                session.current_question_index = len(session.questions_for_session)
+                await display_question(interaction, session, from_modal=True)
+                return
 
         session.current_question_index += 1
         # The interaction is already deferred, now update the original message with the next question.
@@ -1450,6 +1729,7 @@ class BanListPaginatorView(discord.ui.View):
       except discord.NotFound:
           pass
 
+
 async def check_and_manage_completion_roles(member: discord.Member, session: ChallengeSession):
     """Checks if a user has completed all gyms required by a specific panel and manages roles."""
     guild_id = str(member.guild.id)
@@ -1561,6 +1841,116 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
                 await member.send(full_message)
             except discord.Forbidden:
                 logging.warning(f"Cannot send DM to {member.name} (ID: {member.id}). They may have DMs disabled.")
+
+async def create_leaderboard_embed(guild: discord.Guild, custom_title: str = None, custom_description: str = None) -> discord.Embed:
+    """Creates the embed for the ultimate gym leaderboard, with optional custom text."""
+    leaderboard_data = await get_ultimate_leaderboard(str(guild.id), limit=20) # Show top 20
+
+    # Use custom text if provided, otherwise use defaults
+    title = custom_title if custom_title else f"🏆 {guild.name} - 究极道馆排行榜 🏆"
+    description = custom_description.replace('\\n', '\n') if custom_description else "记录着本服最快完成究极道馆挑战的英雄们。"
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.gold()
+    )
+
+    if not leaderboard_data:
+        embed.description += "\n\n目前还没有人完成挑战，快来成为第一人吧！"
+    else:
+        lines = []
+        for i, entry in enumerate(leaderboard_data):
+            rank = i + 1
+            user_id = int(entry['user_id'])
+            time_seconds = entry['completion_time_seconds']
+            
+            # Format time
+            minutes, seconds = divmod(time_seconds, 60)
+            time_str = f"{int(minutes)}分 {seconds:.2f}秒"
+
+            # Try to fetch member, but don't fail if they left
+            member = guild.get_member(user_id)
+            if not member:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.NotFound:
+                    member = None
+            
+            user_display = member.display_name if member else f"未知用户 (ID: {user_id})"
+
+            # Add rank emoji
+            if rank == 1:
+                rank_emoji = "🥇"
+            elif rank == 2:
+                rank_emoji = "🥈"
+            elif rank == 3:
+                rank_emoji = "🥉"
+            else:
+                rank_emoji = f"`#{rank:02d}`"
+            
+            lines.append(f"{rank_emoji} **{user_display}** - `{time_str}`")
+        
+        embed.description += "\n\n" + "\n".join(lines)
+
+    embed.set_footer(text=f"最后更新于: {datetime.datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+    return embed
+
+async def trigger_leaderboard_update(guild_id: int):
+    """Fetches all leaderboard panels in a guild and updates them."""
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        logging.warning(f"LEADERBOARD_UPDATE: Cannot find guild with ID {guild_id} to trigger update.")
+        return
+
+    logging.info(f"LEADERBOARD_UPDATE: Triggered for guild '{guild.name}' ({guild_id}).")
+
+    # Get all panel messages for this guild, including their custom text
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT message_id, channel_id, title, description FROM leaderboard_panels WHERE guild_id = ?", (str(guild_id),)) as cursor:
+            panels = await cursor.fetchall()
+
+    if not panels:
+        logging.info(f"LEADERBOARD_UPDATE: No panels found for guild {guild_id}. Nothing to update.")
+        return
+
+    # 3. Loop and update each panel
+    updated_count = 0
+    for panel in panels:
+        try:
+            # Create a specific embed for this panel using its custom text
+            new_embed = await create_leaderboard_embed(guild, panel['title'], panel['description'])
+
+            channel = guild.get_channel(int(panel['channel_id']))
+            if not channel:
+                try:
+                    channel = await bot.fetch_channel(int(panel['channel_id']))
+                except (discord.NotFound, discord.Forbidden):
+                    channel = None
+
+            if channel:
+                message = await channel.fetch_message(int(panel['message_id']))
+                await message.edit(embed=new_embed)
+                updated_count += 1
+            else:
+                logging.warning(f"LEADERBOARD_UPDATE: Channel {panel['channel_id']} not found. Deleting panel record from DB.")
+                async with aiosqlite.connect(db_path) as conn:
+                    await conn.execute("DELETE FROM leaderboard_panels WHERE message_id = ?", (panel['message_id'],))
+                    await conn.commit()
+
+        except discord.NotFound:
+            logging.warning(f"LEADERBOARD_UPDATE: Message {panel['message_id']} not found. Deleting panel record from DB.")
+            async with aiosqlite.connect(db_path) as conn:
+                await conn.execute("DELETE FROM leaderboard_panels WHERE message_id = ?", (panel['message_id'],))
+                await conn.commit()
+        except discord.Forbidden:
+            logging.error(f"LEADERBOARD_UPDATE: Bot lacks permission to edit message {panel['message_id']} in channel {panel['channel_id']}.")
+        except Exception as e:
+            logging.error(f"LEADERBOARD_UPDATE: An unexpected error occurred while updating panel {panel['message_id']}. Reason: {e}", exc_info=True)
+    
+    logging.info(f"LEADERBOARD_UPDATE: Finished for guild {guild_id}. Successfully updated {updated_count}/{len(panels)} panels.")
+
 
 # --- Bot Events ---
 @bot.event
@@ -1706,6 +2096,7 @@ async def on_ready():
     bot.add_view(MainView())
     bot.add_view(BadgePanelView())
     bot.add_view(GraduationPanelView()) # Register the new persistent view
+    bot.add_view(LeaderboardView()) # Register the leaderboard view
     daily_backup_task.start()
 
 @bot.tree.error
@@ -1716,7 +2107,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     else:
         # For other errors, you might want to log them and send a generic message.
         logging.error(f"Unhandled error in command {interaction.command.name if interaction.command else 'unknown'}: {error}", exc_info=True)
-        await interaction.response.send_message("🤖 执行指令时发生未知错误。", ephemeral=True)
+        # Check if the interaction has already been responded to (e.g., deferred)
+        if interaction.response.is_done():
+            await interaction.followup.send("🤖 执行指令时发生未知错误。", ephemeral=True)
+        else:
+            await interaction.response.send_message("🤖 执行指令时发生未知错误。", ephemeral=True)
 
 # --- Permission Check Functions ---
 async def is_owner_check(interaction: discord.Interaction) -> bool:
@@ -1755,7 +2150,9 @@ async def system_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     # --- System Info ---
-    cpu_usage = psutil.cpu_percent(interval=1)
+    psutil.cpu_percent(interval=None) # Call once to initialize, returns 0.0
+    await asyncio.sleep(1) # Wait a second for a more accurate reading
+    cpu_usage = psutil.cpu_percent()
     ram = psutil.virtual_memory()
     ram_usage_percent = ram.percent
     ram_used_gb = ram.used / (1024**3)
@@ -1845,126 +2242,162 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
 @gym_management_group.command(name="召唤", description="在该频道召唤道馆挑战面板 (馆主、管理员、开发者)。")
 @has_gym_management_permission("召唤")
 @app_commands.describe(
-    enable_blacklist="是否对通过此面板完成挑战的用户启用黑名单检查。",
-    role_to_add="[可选] 用户完成所有道馆后将获得的身份组。",
-    role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。",
-    introduction="[可选] 自定义挑战面板的介绍文字。",
-    gym_ids="[可选] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。",
-    completion_threshold="[可选] 完成多少个道馆后触发奖励，不填则为全部。",
-    prerequisite_gym_ids="[可选] 逗号分隔的前置道馆ID，需全部完成后才能挑战此面板。"
+    panel_type="选择要召唤的面板类型。",
+    introduction="[可选] 自定义面板的介绍文字。",
+    button_label="[可选] 自定义主按钮上显示的文字。",
+    enable_blacklist="[普通] 是否对通过此面板完成挑战的用户启用黑名单检查。",
+    role_to_add="[普通] 用户完成所有道馆后将获得的身份组。",
+    role_to_remove="[普通] 用户完成所有道馆后将被移除的身份组。",
+    gym_ids="[普通] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。",
+    completion_threshold="[普通] 完成多少个道馆后触发奖励，不填则为全部。",
+    prerequisite_gym_ids="[普通] 逗号分隔的前置道馆ID，需全部完成后才能挑战此面板。"
 )
-@app_commands.rename(enable_blacklist='启用黑名单', completion_threshold='通关数量', prerequisite_gym_ids='前置道馆')
-@app_commands.choices(enable_blacklist=[
-    app_commands.Choice(name="是 (默认)", value="yes"),
-    app_commands.Choice(name="否", value="no"),
-])
-async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None, completion_threshold: typing.Optional[app_commands.Range[int, 1]] = None, prerequisite_gym_ids: typing.Optional[str] = None):
+@app_commands.rename(
+    panel_type='面板类型',
+    introduction='介绍文字',
+    button_label='按钮文字',
+    enable_blacklist='启用黑名单',
+    role_to_add='奖励身份组',
+    role_to_remove='移除身份组',
+    gym_ids='关联道馆',
+    completion_threshold='通关数量',
+    prerequisite_gym_ids='前置道馆'
+)
+@app_commands.choices(
+    panel_type=[
+        app_commands.Choice(name="普通道馆挑战", value="standard"),
+        app_commands.Choice(name="究极道馆挑战", value="ultimate"),
+    ],
+    enable_blacklist=[
+        app_commands.Choice(name="是 (默认)", value="yes"),
+        app_commands.Choice(name="否", value="no"),
+    ]
+)
+async def gym_summon(
+    interaction: discord.Interaction,
+    panel_type: str,
+    introduction: typing.Optional[str] = None,
+    button_label: typing.Optional[str] = None,
+    enable_blacklist: typing.Optional[str] = 'yes',
+    role_to_add: typing.Optional[discord.Role] = None,
+    role_to_remove: typing.Optional[discord.Role] = None,
+    gym_ids: typing.Optional[str] = None,
+    completion_threshold: typing.Optional[app_commands.Range[int, 1]] = None,
+    prerequisite_gym_ids: typing.Optional[str] = None
+):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    
     guild_id = str(interaction.guild.id)
-    role_add_id = str(role_to_add.id) if role_to_add else None
-    role_remove_id = str(role_to_remove.id) if role_to_remove else None
-    blacklist_enabled = True if enable_blacklist == 'yes' else False
-    
-    associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')] if gym_ids else None
-    associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
-    prerequisite_gyms_list = [gid.strip() for gid in prerequisite_gym_ids.split(',')] if prerequisite_gym_ids else None
-    prerequisite_gyms_json = json.dumps(prerequisite_gyms_list) if prerequisite_gyms_list else None
-
-    try:
-        # --- Validation Block ---
-        all_guild_gyms = await get_guild_gyms(guild_id)
-        all_gym_ids_set = {gym['id'] for gym in all_guild_gyms}
-
-        # 1. Validate that specified gym_ids actually exist
-        if associated_gyms_list:
-            invalid_ids = [gid for gid in associated_gyms_list if gid not in all_gym_ids_set]
-            if invalid_ids:
-                await interaction.followup.send(f"❌ 操作失败：以下关联道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
-                return
-        
-        # 1.5 Validate that prerequisite_gym_ids actually exist
-        if prerequisite_gyms_list:
-            invalid_ids = [gid for gid in prerequisite_gyms_list if gid not in all_gym_ids_set]
-            if invalid_ids:
-                await interaction.followup.send(f"❌ 操作失败：以下前置道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
-                return
-        
-        # 1.6 Validate that prerequisite gyms are not also associated gyms
-        if prerequisite_gyms_list and associated_gyms_list:
-            overlap = set(prerequisite_gyms_list).intersection(set(associated_gyms_list))
-            if overlap:
-                await interaction.followup.send(f"❌ 操作失败：一个或多个道馆ID同时存在于前置道馆和关联道馆列表中: `{', '.join(overlap)}`", ephemeral=True)
-                return
-
-        # 2. Validate completion_threshold against the correct gym pool
-        if completion_threshold:
-            # Determine the size of the gym pool this panel applies to
-            gym_pool_size = len(associated_gyms_list) if associated_gyms_list is not None else len(all_guild_gyms)
-
-            if gym_pool_size == 0:
-                await interaction.followup.send(f"❌ 操作失败：服务器内没有任何道馆，无法设置通关数量要求。", ephemeral=True)
-                return
-
-            if completion_threshold > gym_pool_size:
-                await interaction.followup.send(
-                    f"❌ 操作失败：设置的通关数量要求 ({completion_threshold}) 不能大于将要应用的道馆总数 ({gym_pool_size})。",
-                    ephemeral=True
-                )
-                return
-        # --- End Validation Block ---
-
-        # Use the custom introduction if provided, otherwise use the default text.
+    # --- Ultimate Gym Panel Logic ---
+    if panel_type == "ultimate":
         if introduction:
-            # Replace the user-provided newline marker with an actual newline character.
             description = introduction.replace('\\n', '\n')
         else:
             description = (
-                "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
-                "完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n"
-                "点击下方的按钮，开始你的挑战吧！"
+                "**欢迎来到究极道馆挑战！**\n\n"
+                "在这里，你将面临来自服务器 **所有道馆** 的终极考验。\n"
+                "系统将从总题库中随机抽取 **50%** 的题目，你的目标是在最短的时间内全部正确回答。\n\n"
+                "**规则:**\n"
+                "- **零容错**: 答错任何一题即挑战失败。\n"
+                "- **计时排名**: 你的完成时间将被记录，并计入服务器排行榜。\n\n"
+                "准备好证明你的实力了吗？"
             )
         
-        embed = discord.Embed(
-            title="道馆挑战中心",
-            description=description,
-            color=discord.Color.gold()
-        )
+        embed = discord.Embed(title="🏆 究极道馆挑战", description=description, color=discord.Color.red())
+        view = MainView()
+        view.children[0].label = button_label if button_label else "挑战究极道馆"
         
-        # Send the panel message first to get its ID
-        panel_message = await interaction.channel.send(embed=embed, view=MainView())
-        
-        # Now, save the configuration for this specific panel to the database
-        async with aiosqlite.connect(db_path) as conn:
-            await conn.execute('''
-                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold, prerequisite_gyms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled, completion_threshold, prerequisite_gyms_json))
-            await conn.commit()
+        try:
+            panel_message = await interaction.channel.send(embed=embed, view=view)
+            async with aiosqlite.connect(db_path) as conn:
+                await conn.execute(
+                    "INSERT INTO challenge_panels (message_id, guild_id, channel_id, is_ultimate_gym) VALUES (?, ?, ?, TRUE)",
+                    (str(panel_message.id), guild_id, str(interaction.channel.id))
+                )
+                await conn.commit()
+            await interaction.followup.send(f"✅ 究极道馆面板已成功创建于 {interaction.channel.mention}！", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ 设置失败：我没有权限在此频道发送消息。", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in /道馆 召唤 (ultimate) command: {e}", exc_info=True)
+            await interaction.followup.send("❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
+        return
 
-        # Build confirmation message
-        confirm_messages = [f"✅ 道馆面板已成功创建于 {interaction.channel.mention}！"]
-        status_text = "启用" if blacklist_enabled else "禁用"
-        confirm_messages.append(f"- **黑名单检查**: {status_text}")
-        if role_to_add:
-            confirm_messages.append(f"- **通关奖励身份组**: {role_to_add.mention}")
-        if role_to_remove:
-            confirm_messages.append(f"- **通关移除身份组**: {role_to_remove.mention}")
-        if associated_gyms_list:
-            confirm_messages.append(f"- **关联道馆列表**: `{', '.join(associated_gyms_list)}`")
-        if completion_threshold:
-            confirm_messages.append(f"- **通关数量要求**: {completion_threshold} 个")
-        if prerequisite_gyms_list:
-            confirm_messages.append(f"- **前置道馆要求**: `{', '.join(prerequisite_gyms_list)}`")
+    # --- Standard Gym Panel Logic ---
+    if panel_type == "standard":
+        role_add_id = str(role_to_add.id) if role_to_add else None
+        role_remove_id = str(role_to_remove.id) if role_to_remove else None
+        blacklist_enabled = True if enable_blacklist == 'yes' else False
         
-        await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
+        associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')] if gym_ids else None
+        associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
-    except discord.Forbidden:
-        await interaction.followup.send(f"❌ 设置失败：我没有权限在此频道发送消息或管理身份组。请检查我的权限。", ephemeral=True)
-    except Exception as e:
-        logging.error(f"Error in /道馆 召唤 command: {e}", exc_info=True)
-        await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
+        prerequisite_gyms_list = [gid.strip() for gid in prerequisite_gym_ids.split(',')] if prerequisite_gym_ids else None
+        prerequisite_gyms_json = json.dumps(prerequisite_gyms_list) if prerequisite_gyms_list else None
+
+        try:
+            # --- Validation Block ---
+            all_guild_gyms = await get_guild_gyms(guild_id)
+            all_gym_ids_set = {gym['id'] for gym in all_guild_gyms}
+
+            if associated_gyms_list:
+                invalid_ids = [gid for gid in associated_gyms_list if gid not in all_gym_ids_set]
+                if invalid_ids:
+                    return await interaction.followup.send(f"❌ 操作失败：以下关联道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+            
+            if prerequisite_gyms_list:
+                invalid_ids = [gid for gid in prerequisite_gyms_list if gid not in all_gym_ids_set]
+                if invalid_ids:
+                    return await interaction.followup.send(f"❌ 操作失败：以下前置道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+            
+            if prerequisite_gyms_list and associated_gyms_list:
+                # Correctly check for intersection only if both lists are not empty
+                if set(prerequisite_gyms_list).intersection(set(associated_gyms_list)):
+                    return await interaction.followup.send("❌ 操作失败：一个或多个道馆ID同时存在于前置道馆和关联道馆列表中。", ephemeral=True)
+
+            if completion_threshold:
+                gym_pool_size = len(associated_gyms_list) if associated_gyms_list is not None else len(all_guild_gyms)
+                if gym_pool_size == 0:
+                    return await interaction.followup.send("❌ 操作失败：服务器内没有任何道馆，无法设置通关数量要求。", ephemeral=True)
+                if completion_threshold > gym_pool_size:
+                    return await interaction.followup.send(f"❌ 操作失败：通关数量要求 ({completion_threshold}) 不能大于道馆总数 ({gym_pool_size})。", ephemeral=True)
+            # --- End Validation Block ---
+
+            if introduction:
+                description = introduction.replace('\\n', '\n')
+            else:
+                description = "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n点击下方的按钮，开始你的挑战吧！"
+            
+            embed = discord.Embed(title="道馆挑战中心", description=description, color=discord.Color.gold())
+            view = MainView()
+            if button_label:
+                view.children[0].label = button_label
+
+            panel_message = await interaction.channel.send(embed=embed, view=view)
+            
+            async with aiosqlite.connect(db_path) as conn:
+                await conn.execute('''
+                    INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold, prerequisite_gyms, is_ultimate_gym)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
+                ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled, completion_threshold, prerequisite_gyms_json))
+                await conn.commit()
+
+            confirm_messages = [f"✅ 普通道馆面板已成功创建于 {interaction.channel.mention}！"]
+            status_text = "启用" if blacklist_enabled else "禁用"
+            confirm_messages.append(f"- **黑名单检查**: {status_text}")
+            if role_to_add: confirm_messages.append(f"- **奖励身份组**: {role_to_add.mention}")
+            if role_to_remove: confirm_messages.append(f"- **移除身份组**: {role_to_remove.mention}")
+            if associated_gyms_list: confirm_messages.append(f"- **关联道馆**: `{', '.join(associated_gyms_list)}`")
+            if completion_threshold: confirm_messages.append(f"- **通关数量**: {completion_threshold} 个")
+            if prerequisite_gyms_list: confirm_messages.append(f"- **前置道馆**: `{', '.join(prerequisite_gyms_list)}`")
+            
+            await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
+
+        except discord.Forbidden:
+            await interaction.followup.send("❌ 设置失败：我没有权限在此频道发送消息或管理身份组。请检查我的权限。", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in /道馆 召唤 (standard) command: {e}", exc_info=True)
+            await interaction.followup.send("❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="徽章墙面板", description="在该频道召唤一个徽章墙面板 (馆主、管理员、开发者)。")
 @has_gym_management_permission("徽章墙面板")
@@ -2058,6 +2491,7 @@ async def gym_graduation_panel(interaction: discord.Interaction, role_to_grant: 
         await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
 
+
 def validate_gym_json(data: dict) -> str:
     """Validates the structure and content length of the gym JSON. Returns an error string or empty string if valid."""
     # Discord Limits
@@ -2103,6 +2537,10 @@ def validate_gym_json(data: dict) -> str:
             return "`badge_description` 必须是一个字符串。"
         if len(desc) > 1024:
             return f"`badge_description` 的长度不能超过 1024 个字符。"
+
+    # Validate optional randomize_options
+    if 'randomize_options' in data and not isinstance(data.get('randomize_options'), bool):
+        return "`randomize_options` 必须是一个布尔值 (true 或 false)。"
 
     # Validate tutorial length
     if isinstance(data.get('tutorial'), list) and len("\n".join(data['tutorial'])) > EMBED_DESC_LIMIT:
@@ -2250,24 +2688,37 @@ async def gym_delete(interaction: discord.Interaction, gym_id: str):
             # --- Perform Deletion ---
             await log_gym_action(guild_id, gym_id, str(interaction.user.id), 'delete', conn)
             await conn.execute("DELETE FROM user_progress WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id))
+            await conn.execute("DELETE FROM challenge_failures WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) # Also clear failure records
             await delete_gym(guild_id, gym_id, conn)
 
-            # --- Clean up associated_gyms in challenge_panels ---
+            # --- Clean up associated_gyms and prerequisite_gyms in challenge_panels ---
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT message_id, associated_gyms FROM challenge_panels WHERE guild_id = ?", (guild_id,)) as cursor:
+            async with conn.execute("SELECT message_id, associated_gyms, prerequisite_gyms FROM challenge_panels WHERE guild_id = ?", (guild_id,)) as cursor:
                 panels_to_update = []
                 all_panels = await cursor.fetchall()
                 for panel in all_panels:
-                    if panel['associated_gyms']:
-                        associated_gyms_list = json.loads(panel['associated_gyms'])
-                        if gym_id in associated_gyms_list:
-                            associated_gyms_list.remove(gym_id)
-                            new_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
-                            panels_to_update.append((new_json, panel['message_id']))
-                
+                    updated = False
+                    
+                    # Clean associated gyms
+                    associated_gyms_list = json.loads(panel['associated_gyms']) if panel['associated_gyms'] else []
+                    if gym_id in associated_gyms_list:
+                        associated_gyms_list.remove(gym_id)
+                        updated = True
+
+                    # Clean prerequisite gyms
+                    prerequisite_gyms_list = json.loads(panel['prerequisite_gyms']) if panel['prerequisite_gyms'] else []
+                    if gym_id in prerequisite_gyms_list:
+                        prerequisite_gyms_list.remove(gym_id)
+                        updated = True
+
+                    if updated:
+                        new_associated_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
+                        new_prerequisite_json = json.dumps(prerequisite_gyms_list) if prerequisite_gyms_list else None
+                        panels_to_update.append((new_associated_json, new_prerequisite_json, panel['message_id']))
+
                 if panels_to_update:
                     await conn.executemany(
-                        "UPDATE challenge_panels SET associated_gyms = ? WHERE message_id = ?",
+                        "UPDATE challenge_panels SET associated_gyms = ?, prerequisite_gyms = ? WHERE message_id = ?",
                         panels_to_update
                     )
             
@@ -2279,7 +2730,7 @@ async def gym_delete(interaction: discord.Interaction, gym_id: str):
     except discord.Forbidden:
         await interaction.followup.send(f"❌ 操作失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
-        logging.error(f"Error in /道馆 更新 command: {e}", exc_info=True)
+        logging.error(f"Error in /道馆 删除 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="后门", description="获取一个现有道馆的JSON数据 (馆主、管理员、开发者)。")
@@ -2357,7 +2808,7 @@ async def gym_list(interaction: discord.Interaction):
         app_commands.Choice(name="停业 (/道馆 停业)", value="停业"),
         app_commands.Choice(name="删除 (/道馆 删除)", value="删除"),
         app_commands.Choice(name="道馆黑名单 (/道馆黑名单)", value="道馆黑名单"),
-        app_commands.Choice(name="道馆封禁 (/道馆封禁)", value="道馆封禁")
+        app_commands.Choice(name="道馆封禁 (/道馆封禁)", value="道馆封禁"),
     ]
 )
 async def set_gym_master(interaction: discord.Interaction, action: str, target: typing.Union[discord.Member, discord.Role], permission: str):
@@ -2519,6 +2970,44 @@ async def gym_status(interaction: discord.Interaction, gym_id: str, status: str)
         await interaction.followup.send(f"✅ 道馆 `{gym_id}` 已{status_text}。", ephemeral=True)
     else:
         await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
+
+@gym_management_group.command(name="召唤排行榜", description="在该频道召唤一个自动更新的究极道馆排行榜 (馆主、管理员、开发者)。")
+@has_gym_management_permission("召唤排行榜")
+@app_commands.describe(
+    title="[可选] 自定义排行榜的标题。",
+    description="[可选] 自定义排行榜的描述文字 (使用 \\n 换行)。"
+)
+async def summon_leaderboard(interaction: discord.Interaction, title: typing.Optional[str] = None, description: typing.Optional[str] = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild_id = str(interaction.guild.id)
+    channel_id = str(interaction.channel.id)
+
+    # --- Input Validation ---
+    if title and len(title) > 256:
+        return await interaction.followup.send("❌ 操作失败：标题长度不能超过 256 个字符。", ephemeral=True)
+    if description and len(description.replace('\\n', '\n')) > 4096:
+        return await interaction.followup.send("❌ 操作失败：描述内容长度不能超过 4096 个字符。", ephemeral=True)
+
+    try:
+        # Create the initial embed using the provided custom text
+        embed = await create_leaderboard_embed(interaction.guild, title, description)
+        panel_message = await interaction.channel.send(embed=embed, view=LeaderboardView())
+
+        # Save the panel info, including custom text, to the database
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "INSERT INTO leaderboard_panels (message_id, guild_id, channel_id, title, description) VALUES (?, ?, ?, ?, ?)",
+                (str(panel_message.id), guild_id, channel_id, title, description)
+            )
+            await conn.commit()
+        
+        await interaction.followup.send(f"✅ 排行榜面板已成功创建于 {interaction.channel.mention}！每当有新纪录诞生时，它将自动更新。", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.followup.send("❌ 设置失败：我没有权限在此频道发送消息。", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error in /道馆 召唤排行榜 command: {e}", exc_info=True)
+        await interaction.followup.send("❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
 @bot.tree.command(name="道馆黑名单", description="管理作弊黑名单 (馆主、管理员、开发者)。")
 @has_gym_management_permission("道馆黑名单")
