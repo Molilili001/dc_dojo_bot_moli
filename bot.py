@@ -111,6 +111,12 @@ async def setup_database():
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
+        # Safely add the new column for prerequisite gyms
+        try:
+            await conn.execute("ALTER TABLE challenge_panels ADD COLUMN prerequisite_gyms TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise # Re-raise other errors
         # Gym master (gym owner) permissions table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gym_masters (
@@ -201,7 +207,29 @@ async def setup_database():
                 PRIMARY KEY (guild_id, target_id)
             )
         ''')
-
+        # Table for absolute challenge ban
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS challenge_ban_list (
+                guild_id TEXT NOT NULL,
+                target_id TEXT NOT NULL, -- User ID or Role ID
+                target_type TEXT NOT NULL, -- 'user' or 'role'
+                reason TEXT,
+                added_by TEXT,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (guild_id, target_id)
+            )
+        ''')
+        # Table to track one-time role rewards
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS claimed_role_rewards (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, role_id)
+            )
+        ''')
+ 
         # --- Create Indexes for Performance ---
         # These indexes significantly speed up common queries in a large server.
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_progress_user_guild ON user_progress (user_id, guild_id);")
@@ -209,7 +237,9 @@ async def setup_database():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_gyms_guild ON gyms (guild_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_gym_masters_guild_target ON gym_masters (guild_id, target_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cheating_blacklist_guild_target ON cheating_blacklist (guild_id, target_id);")
-
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_challenge_ban_list_guild_target ON challenge_ban_list (guild_id, target_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_claimed_rewards_guild_user_role ON claimed_role_rewards (guild_id, user_id, role_id);")
+ 
         await conn.commit()
 
 # --- Gym Data Functions ---
@@ -376,14 +406,46 @@ async def set_gym_completed(user_id: str, guild_id: str, gym_id: str):
         except Exception as e:
             logging.error(f"DATABASE_ERROR: An unexpected error occurred in set_gym_completed: {e}")
 
-async def reset_user_progress(user_id: str, guild_id: str):
-    """Resets all progress for a user in a specific guild."""
+async def fully_reset_user_progress(user_id: str, guild_id: str):
+    """Resets a user's gym completions, failure records, and claimed rewards for a guild."""
     async with user_db_locks[user_id]:
         async with aiosqlite.connect(db_path) as conn:
-            await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            # Reset gym completions
+            p_cursor = await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            # Reset failure records
+            f_cursor = await conn.execute("DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            # Reset claimed rewards
+            r_cursor = await conn.execute("DELETE FROM claimed_role_rewards WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
             await conn.commit()
+            
+            p_count = p_cursor.rowcount
+            f_count = f_cursor.rowcount
+            r_count = r_cursor.rowcount
+            
+            logging.info(
+                f"PROGRESS_RESET: Fully reset user '{user_id}' in guild '{guild_id}'. "
+                f"Removed {p_count} progress, {f_count} failures, {r_count} rewards."
+            )
 
-# (This space is intentionally left blank after removing the old server config functions)
+# --- Role Reward Claim Functions ---
+async def has_claimed_reward(guild_id: str, user_id: str, role_id: str) -> bool:
+   """Checks if a user has already claimed a specific role reward in a guild."""
+   async with aiosqlite.connect(db_path) as conn:
+       async with conn.execute(
+           "SELECT 1 FROM claimed_role_rewards WHERE guild_id = ? AND user_id = ? AND role_id = ?",
+           (guild_id, user_id, role_id)
+       ) as cursor:
+           return await cursor.fetchone() is not None
+
+async def record_reward_claim(guild_id: str, user_id: str, role_id: str):
+   """Records that a user has claimed a specific role reward."""
+   timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
+   async with aiosqlite.connect(db_path) as conn:
+       await conn.execute('''
+           INSERT OR IGNORE INTO claimed_role_rewards (guild_id, user_id, role_id, timestamp)
+           VALUES (?, ?, ?, ?)
+       ''', (guild_id, user_id, role_id, timestamp))
+       await conn.commit()
 
 # --- Permission Functions ---
 async def add_gym_master(guild_id: str, target_id: str, target_type: str, permission: str):
@@ -481,6 +543,14 @@ async def clear_blacklist(guild_id: str) -> int:
         return cursor.rowcount
 
 
+async def get_blacklist(guild_id: str) -> list:
+   """Gets all blacklist entries for a specific guild."""
+   async with aiosqlite.connect(db_path) as conn:
+       conn.row_factory = aiosqlite.Row
+       async with conn.execute("SELECT * FROM cheating_blacklist WHERE guild_id = ? ORDER BY timestamp DESC", (guild_id,)) as cursor:
+           rows = await cursor.fetchall()
+   return [dict(row) for row in rows]
+
 async def is_user_blacklisted(guild_id: str, user: discord.Member) -> typing.Optional[dict]:
     """
     Checks if a user or any of their roles are in the blacklist.
@@ -513,6 +583,71 @@ async def is_user_blacklisted(guild_id: str, user: discord.Member) -> typing.Opt
             role_blacklist_entry = await cursor.fetchone()
             if role_blacklist_entry:
                 return dict(role_blacklist_entry)
+
+    return None
+
+# --- Challenge Ban List Functions ---
+
+async def add_to_ban_list(guild_id: str, target_id: str, target_type: str, reason: str, added_by: str):
+    """Adds a user or role to the absolute challenge ban list."""
+    timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute('''
+            INSERT OR REPLACE INTO challenge_ban_list (guild_id, target_id, target_type, reason, added_by, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (guild_id, target_id, target_type, reason, added_by, timestamp))
+        await conn.commit()
+
+async def remove_from_ban_list(guild_id: str, target_id: str):
+    """Removes a user or role from the absolute challenge ban list."""
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM challenge_ban_list WHERE guild_id = ? AND target_id = ?",
+            (guild_id, target_id)
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+async def get_ban_list(guild_id: str) -> list:
+   """Gets all ban list entries for a specific guild."""
+   async with aiosqlite.connect(db_path) as conn:
+       conn.row_factory = aiosqlite.Row
+       async with conn.execute("SELECT * FROM challenge_ban_list WHERE guild_id = ? ORDER BY timestamp DESC", (guild_id,)) as cursor:
+           rows = await cursor.fetchall()
+   return [dict(row) for row in rows]
+
+async def is_user_banned(guild_id: str, user: discord.Member) -> typing.Optional[dict]:
+    """
+    Checks if a user or any of their roles are in the absolute challenge ban list.
+    Returns the ban entry dictionary if found, otherwise None.
+    """
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        
+        # 1. Check user ID directly
+        async with conn.execute(
+            "SELECT * FROM challenge_ban_list WHERE guild_id = ? AND target_id = ? AND target_type = 'user'",
+            (guild_id, str(user.id))
+        ) as cursor:
+            user_ban_entry = await cursor.fetchone()
+            if user_ban_entry:
+                return dict(user_ban_entry)
+
+        # 2. Check all user roles
+        role_ids = [str(role.id) for role in user.roles]
+        if not role_ids:
+            return None # No roles to check
+
+        placeholders = ','.join('?' for _ in role_ids)
+        query = f"""
+            SELECT * FROM challenge_ban_list
+            WHERE guild_id = ? AND target_type = 'role' AND target_id IN ({placeholders})
+        """
+        params = [guild_id] + role_ids
+        async with conn.execute(query, params) as cursor:
+            role_ban_entry = await cursor.fetchone()
+            if role_ban_entry:
+                return dict(role_ban_entry)
 
     return None
 
@@ -662,14 +797,49 @@ class MainView(discord.ui.View):
         guild_id = str(interaction.guild.id)
         panel_message_id = interaction.message.id # Get the ID of the panel message this button belongs to
         
+        # --- Absolute Ban Check ---
+        ban_entry = await is_user_banned(guild_id, interaction.user)
+        if ban_entry:
+            reason = ban_entry.get('reason', '无特定原因')
+            await interaction.followup.send(
+                f"🚫 **挑战资格已被封禁** 🚫\n\n"
+                f"由于你被记录在封禁名单中，你无法开始任何道馆挑战。\n"
+                f"**原因:** {reason}\n\n"
+                "如有疑问，请联系服务器管理员。",
+                ephemeral=True
+            )
+            return
+
         user_gym_progress = await get_user_progress(user_id, guild_id)
         all_guild_gyms = await get_guild_gyms(guild_id)
         
         # Get the specific configuration for THIS panel from the database
         async with aiosqlite.connect(db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT associated_gyms FROM challenge_panels WHERE message_id = ?", (str(panel_message_id),)) as cursor:
+            async with conn.execute("SELECT associated_gyms, prerequisite_gyms FROM challenge_panels WHERE message_id = ?", (str(panel_message_id),)) as cursor:
                 panel_config = await cursor.fetchone()
+
+        # --- Prerequisite Check ---
+        if panel_config and panel_config['prerequisite_gyms']:
+            prerequisite_ids = set(json.loads(panel_config['prerequisite_gyms']))
+            completed_ids = set(user_gym_progress.keys())
+            
+            if not prerequisite_ids.issubset(completed_ids):
+                missing_gyms = prerequisite_ids - completed_ids
+                
+                # Fetch names of missing gyms for a user-friendly message
+                missing_gym_names = []
+                all_gyms_dict = {gym['id']: gym['name'] for gym in all_guild_gyms}
+                for gym_id in missing_gyms:
+                    missing_gym_names.append(all_gyms_dict.get(gym_id, gym_id))
+
+                await interaction.followup.send(
+                    f"❌ **前置条件未满足** ❌\n\n"
+                    f"你需要先完成以下道馆的挑战，才能挑战此面板中的道馆：\n"
+                    f"**- {', '.join(missing_gym_names)}**",
+                    ephemeral=True
+                )
+                return
 
         associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config and panel_config['associated_gyms'] else None
 
@@ -745,6 +915,68 @@ class BadgePanelView(discord.ui.View):
             
         view = BadgeView(interaction.user, completed_gyms)
         await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=True)
+
+class GraduationPanelView(discord.ui.View):
+    """A persistent view for the graduation panel."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="领取毕业奖励", style=discord.ButtonStyle.success, custom_id="claim_graduation_role")
+    async def claim_graduation_role_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        guild_id = str(interaction.guild.id)
+        user_id = str(interaction.user.id)
+        member = interaction.user
+        panel_message_id = str(interaction.message.id)
+
+        # 1. Get the role associated with this specific panel
+        async with aiosqlite.connect(db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT role_to_add_id FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+                panel_config = await cursor.fetchone()
+        
+        if not panel_config or not panel_config['role_to_add_id']:
+            logging.error(f"GRADUATION_PANEL: No role_to_add_id configured for panel {panel_message_id} in guild {guild_id}.")
+            return await interaction.followup.send("❌ 此面板配置错误，请联系管理员。", ephemeral=True)
+        
+        role_to_add_id = panel_config['role_to_add_id']
+        role_to_add = interaction.guild.get_role(int(role_to_add_id))
+
+        if not role_to_add:
+            logging.error(f"GRADUATION_PANEL: Role {role_to_add_id} not found in guild {guild_id}.")
+            return await interaction.followup.send("❌ 此面板配置的身份组不存在，请联系管理员。", ephemeral=True)
+
+        # 2. Check if the user has already claimed this specific reward
+        if await has_claimed_reward(guild_id, user_id, role_to_add_id):
+            return await interaction.followup.send(f"✅ 你已经领取过 {role_to_add.mention} 这个奖励了！", ephemeral=True)
+
+        # 3. Check if the user has completed ALL gyms
+        all_guild_gyms = await get_guild_gyms(guild_id)
+        if not all_guild_gyms:
+            return await interaction.followup.send("ℹ️ 本服务器还没有任何道馆，无法判断毕业状态。", ephemeral=True)
+
+        required_gym_ids = {gym['id'] for gym in all_guild_gyms if gym.get('is_enabled', True)}
+        user_progress = await get_user_progress(user_id, guild_id)
+        completed_gym_ids = set(user_progress.keys())
+
+        if not required_gym_ids.issubset(completed_gym_ids):
+            missing_count = len(required_gym_ids - completed_gym_ids)
+            return await interaction.followup.send(f"❌ 你尚未完成所有道馆的挑战，还差 {missing_count} 个。请继续努力！", ephemeral=True)
+
+        # 4. All checks passed, grant the role
+        try:
+            await member.add_roles(role_to_add, reason="道馆全部通关奖励")
+            await record_reward_claim(guild_id, user_id, role_to_add_id)
+            logging.info(f"GRADUATION_REWARD: User '{user_id}' has completed all gyms and was granted role '{role_to_add_id}' in guild '{guild_id}'.")
+            await interaction.followup.send(f"🎉 恭喜！你已完成所有道馆挑战，成功获得身份组：{role_to_add.mention}", ephemeral=True)
+        except discord.Forbidden:
+            logging.error(f"GRADUATION_PANEL: Bot lacks permissions to add role {role_to_add_id} in guild {guild_id}.")
+            await interaction.followup.send("❌ 机器人权限不足，无法为你添加身份组，请联系管理员。", ephemeral=True)
+        except Exception as e:
+            logging.error(f"GRADUATION_PANEL: An unexpected error occurred while granting role: {e}", exc_info=True)
+            await interaction.followup.send("❌ 发放身份组时发生未知错误，请联系管理员。", ephemeral=True)
+
 
 def _create_wrong_answers_embed_fields(wrong_answers: list, show_correct_answer: bool) -> list:
     """
@@ -912,9 +1144,12 @@ class QuestionAnswerButton(discord.ui.Button):
         self.value = value if value is not None else label
 
     async def callback(self, interaction: discord.Interaction):
+        # Defer the interaction immediately to prevent it from timing out during long operations.
+        await interaction.response.defer()
+
         session = active_challenges.get(str(interaction.user.id))
         if not session:
-            await interaction.response.edit_message(content="挑战已超时，请重新开始。", view=None, embed=None)
+            await interaction.edit_original_response(content="挑战已超时，请重新开始。", view=None, embed=None)
             return
         
         # Check the button's actual value against the correct answer
@@ -1015,6 +1250,206 @@ class ConfirmClearView(discord.ui.View):
         except discord.NotFound:
             pass # The original message might have been deleted.
 
+class BlacklistPaginatorView(discord.ui.View):
+   def __init__(self, interaction: discord.Interaction, entries: list, entries_per_page: int = 5):
+       super().__init__(timeout=180)
+       self.interaction = interaction
+       self.entries = entries
+       self.entries_per_page = entries_per_page
+       self.current_page = 0
+       self.total_pages = (len(self.entries) - 1) // self.entries_per_page + 1
+       self.update_buttons()
+
+   def update_buttons(self):
+       self.children[0].disabled = self.current_page == 0
+       self.children[1].disabled = self.current_page >= self.total_pages - 1
+
+   async def create_embed(self) -> discord.Embed:
+       start_index = self.current_page * self.entries_per_page
+       end_index = start_index + self.entries_per_page
+       page_entries = self.entries[start_index:end_index]
+
+       embed = discord.Embed(
+           title=f"「{self.interaction.guild.name}」黑名单列表 (共 {len(self.entries)} 人)",
+           color=discord.Color.dark_red()
+       )
+
+       if not page_entries:
+           embed.description = "这一页没有内容。"
+       else:
+           description_lines = []
+           guild = self.interaction.guild
+           for entry in page_entries:
+               target_id_str = entry['target_id']
+               target_type = entry['target_type']
+               target_id = int(target_id_str)
+               
+               # Attempt to resolve the user/role for a more descriptive name
+               target_display = ""
+               if target_type == 'user':
+                   member = guild.get_member(target_id)
+                   if member:
+                       target_display = f"{member.display_name} (<@{target_id}>)"
+                   else:
+                       target_display = f"[已离开的用户] (`{target_id_str}`)"
+               elif target_type == 'role':
+                   role = guild.get_role(target_id)
+                   if role:
+                       target_display = f"{role.name} (<@&{target_id}>)"
+                   else:
+                       target_display = f"[已删除的身份组] (`{target_id_str}`)"
+
+               reason = entry.get('reason', '无')
+               added_by_id = entry.get('added_by', '未知')
+               
+               # If added_by_id is a numeric user ID, format as a mention. Otherwise, display as text.
+               operator_str = f"<@{added_by_id}>" if added_by_id.isdigit() else added_by_id
+
+               # Parse timestamp
+               try:
+                   timestamp_dt = datetime.datetime.fromisoformat(entry['timestamp']).astimezone(BEIJING_TZ)
+                   timestamp_str = timestamp_dt.strftime('%Y-%m-%d %H:%M')
+               except (ValueError, TypeError):
+                   timestamp_str = "未知时间"
+
+               line = (
+                   f"**对象**: {target_display}\n"
+                   f"**原因**: {reason}\n"
+                   f"**操作人**: {operator_str}\n"
+                   f"**时间**: {timestamp_str}\n"
+                   "---"
+               )
+               description_lines.append(line)
+           
+           embed.description = "\n".join(description_lines)
+
+       embed.set_footer(text=f"第 {self.current_page + 1}/{self.total_pages} 页")
+       return embed
+
+   async def show_page(self, interaction: discord.Interaction):
+       self.update_buttons()
+       embed = await self.create_embed()
+       await interaction.response.edit_message(embed=embed, view=self)
+
+   @discord.ui.button(label="◀️ 上一页", style=discord.ButtonStyle.secondary)
+   async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+       if self.current_page > 0:
+           self.current_page -= 1
+           await self.show_page(interaction)
+
+   @discord.ui.button(label="下一页 ▶️", style=discord.ButtonStyle.secondary)
+   async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+       if self.current_page < self.total_pages - 1:
+           self.current_page += 1
+           await self.show_page(interaction)
+
+   async def on_timeout(self):
+       for item in self.children:
+           item.disabled = True
+       try:
+           # Use the original interaction to edit the message
+           await self.interaction.edit_original_response(view=self)
+       except discord.NotFound:
+           pass
+
+class BanListPaginatorView(discord.ui.View):
+  def __init__(self, interaction: discord.Interaction, entries: list, entries_per_page: int = 5):
+      super().__init__(timeout=180)
+      self.interaction = interaction
+      self.entries = entries
+      self.entries_per_page = entries_per_page
+      self.current_page = 0
+      self.total_pages = (len(self.entries) - 1) // self.entries_per_page + 1
+      self.update_buttons()
+
+  def update_buttons(self):
+      self.children[0].disabled = self.current_page == 0
+      self.children[1].disabled = self.current_page >= self.total_pages - 1
+
+  async def create_embed(self) -> discord.Embed:
+      start_index = self.current_page * self.entries_per_page
+      end_index = start_index + self.entries_per_page
+      page_entries = self.entries[start_index:end_index]
+
+      embed = discord.Embed(
+          title=f"「{self.interaction.guild.name}」挑战封禁列表 (共 {len(self.entries)} 条)",
+          color=discord.Color.from_rgb(139, 0, 0) # Dark Red
+      )
+
+      if not page_entries:
+          embed.description = "这一页没有内容。"
+      else:
+          description_lines = []
+          guild = self.interaction.guild
+          for entry in page_entries:
+              target_id_str = entry['target_id']
+              target_type = entry['target_type']
+              target_id = int(target_id_str)
+              
+              target_display = ""
+              if target_type == 'user':
+                  member = guild.get_member(target_id)
+                  if member:
+                      target_display = f"{member.display_name} (<@{target_id}>)"
+                  else:
+                      target_display = f"[已离开的用户] (`{target_id_str}`)"
+              elif target_type == 'role':
+                  role = guild.get_role(target_id)
+                  if role:
+                      target_display = f"{role.name} (<@&{target_id}>)"
+                  else:
+                      target_display = f"[已删除的身份组] (`{target_id_str}`)"
+
+              reason = entry.get('reason', '无')
+              added_by_id = entry.get('added_by', '未知')
+              
+              operator_str = f"<@{added_by_id}>" if added_by_id.isdigit() else added_by_id
+
+              try:
+                  timestamp_dt = datetime.datetime.fromisoformat(entry['timestamp']).astimezone(BEIJING_TZ)
+                  timestamp_str = timestamp_dt.strftime('%Y-%m-%d %H:%M')
+              except (ValueError, TypeError):
+                  timestamp_str = "未知时间"
+
+              line = (
+                  f"**对象**: {target_display}\n"
+                  f"**原因**: {reason}\n"
+                  f"**操作人**: {operator_str}\n"
+                  f"**时间**: {timestamp_str}\n"
+                  "---"
+              )
+              description_lines.append(line)
+          
+          embed.description = "\n".join(description_lines)
+
+      embed.set_footer(text=f"第 {self.current_page + 1}/{self.total_pages} 页")
+      return embed
+
+  async def show_page(self, interaction: discord.Interaction):
+      self.update_buttons()
+      embed = await self.create_embed()
+      await interaction.response.edit_message(embed=embed, view=self)
+
+  @discord.ui.button(label="◀️ 上一页", style=discord.ButtonStyle.secondary)
+  async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+      if self.current_page > 0:
+          self.current_page -= 1
+          await self.show_page(interaction)
+
+  @discord.ui.button(label="下一页 ▶️", style=discord.ButtonStyle.secondary)
+  async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+      if self.current_page < self.total_pages - 1:
+          self.current_page += 1
+          await self.show_page(interaction)
+
+  async def on_timeout(self):
+      for item in self.children:
+          item.disabled = True
+      try:
+          await self.interaction.edit_original_response(view=self)
+      except discord.NotFound:
+          pass
+
 async def check_and_manage_completion_roles(member: discord.Member, session: ChallengeSession):
     """Checks if a user has completed all gyms required by a specific panel and manages roles."""
     guild_id = str(member.guild.id)
@@ -1093,13 +1528,20 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
 
         # --- Role to Add ---
         if role_to_add_id:
-            role_to_add = member.guild.get_role(int(role_to_add_id))
-            if role_to_add and role_to_add not in member.roles:
-                try:
-                    await member.add_roles(role_to_add)
-                    messages.append(f"✅ **获得了身份组**: {role_to_add.mention}")
-                except Exception as e:
-                    logging.error(f"Failed to add role {role_to_add_id} to {member.id} in {member.guild.name}: {e}")
+            # First, check if the user has already claimed this specific reward.
+            if await has_claimed_reward(guild_id, user_id, role_to_add_id):
+                logging.info(f"REWARD_BLOCK: User '{user_id}' in guild '{guild_id}' has already claimed role '{role_to_add_id}'. Skipping role assignment.")
+            else:
+                role_to_add = member.guild.get_role(int(role_to_add_id))
+                if role_to_add and role_to_add not in member.roles:
+                    try:
+                        await member.add_roles(role_to_add)
+                        # IMPORTANT: Record the claim immediately after successfully adding the role.
+                        await record_reward_claim(guild_id, user_id, role_to_add_id)
+                        messages.append(f"✅ **获得了身份组**: {role_to_add.mention}")
+                        logging.info(f"REWARD_GRANT: Granted and recorded role '{role_to_add_id}' for user '{user_id}' in guild '{guild_id}'.")
+                    except Exception as e:
+                        logging.error(f"Failed to add role {role_to_add_id} to {member.id} in {member.guild.name}: {e}")
         
         # --- Role to Remove ---
         if role_to_remove_id:
@@ -1122,6 +1564,136 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
 
 # --- Bot Events ---
 @bot.event
+async def on_message(message: discord.Message):
+    # Ignore messages from the bot itself
+    if message.author == bot.user:
+        return
+
+    # --- Auto Blacklist Monitor ---
+    monitor_config = config.get("AUTO_BLACKLIST_MONITOR", {})
+    if not monitor_config.get("enabled", False):
+        return
+
+    target_bot_id = monitor_config.get("target_bot_id")
+    if not target_bot_id:
+        return # Exit if no target bot is configured
+
+    # --- New: Auto Blacklist via DM JSON ---
+    if message.guild is None and str(message.author.id) == str(target_bot_id):
+        logging.info(f"AUTO_DM_HANDLER: Received DM from target bot {message.author.id}")
+        try:
+            data = json.loads(message.content)
+            
+            # --- Feature: Auto Blacklist via DM ---
+            punished_user_id = data.get("punish")
+            if isinstance(punished_user_id, (str, int)) and str(punished_user_id).isdigit():
+                punished_user_id_str = str(punished_user_id)
+                reason = "因答题处罚被自动同步"
+                added_by = f"自动同步自 ({message.author.name})"
+                
+                synced_guilds_count = 0
+                for guild in bot.guilds:
+                    # Check if the user is actually in the guild before proceeding
+                    member = guild.get_member(int(punished_user_id_str))
+                    if not member:
+                        try:
+                            member = await guild.fetch_member(int(punished_user_id_str))
+                        except discord.NotFound:
+                            continue # Skip if user is not in this guild
+
+                    try:
+                        # Add to blacklist for the current guild
+                        await add_to_blacklist(str(guild.id), punished_user_id_str, 'user', reason, added_by)
+                        
+                        # Reset all progress for the user in the current guild
+                        await fully_reset_user_progress(punished_user_id_str, str(guild.id))
+                        
+                        synced_guilds_count += 1
+                    except Exception as e:
+                        logging.error(f"AUTO_BLACKLIST_DM: Failed to process punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {e}")
+                
+                logging.info(f"AUTO_BLACKLIST_DM: Successfully processed punishment for user '{punished_user_id_str}' in {synced_guilds_count} guilds.")
+
+            # --- Feature: Grant Role via DM ---
+            passed_user_id = data.get("pass")
+            pass_role_id = monitor_config.get("pass_role_id")
+            if isinstance(passed_user_id, (str, int)) and str(passed_user_id).isdigit() and pass_role_id:
+                passed_user_id_str = str(passed_user_id)
+                granted_guilds_count = 0
+                for guild in bot.guilds:
+                    try:
+                        role = guild.get_role(int(pass_role_id))
+                        if not role:
+                            logging.warning(f"PASS_ROLE_DM: Role ID '{pass_role_id}' not found in guild '{guild.name}' ({guild.id}).")
+                            continue
+                        
+                        member = guild.get_member(int(passed_user_id_str))
+                        if not member:
+                            # If member is not in cache, try fetching
+                            try:
+                                member = await guild.fetch_member(int(passed_user_id_str))
+                            except discord.NotFound:
+                                logging.info(f"PASS_ROLE_DM: User '{passed_user_id_str}' not found in guild '{guild.name}' ({guild.id}).")
+                                continue
+                        
+                        if role not in member.roles:
+                            await member.add_roles(role, reason=f"通过私信自动授予 by {message.author.name}")
+                            granted_guilds_count += 1
+                            logging.info(f"PASS_ROLE_DM: Granted role '{role.name}' to user '{member.name}' in guild '{guild.name}'.")
+
+                    except discord.Forbidden:
+                        logging.error(f"PASS_ROLE_DM: Bot lacks permissions to grant role '{pass_role_id}' in guild '{guild.id}'.")
+                    except Exception as e:
+                        logging.error(f"PASS_ROLE_DM: Failed to grant role for user '{passed_user_id_str}' in guild '{guild.id}'. Reason: {e}")
+                
+                if granted_guilds_count > 0:
+                    logging.info(f"PASS_ROLE_DM: Successfully granted role to user '{passed_user_id_str}' in {granted_guilds_count} guild(s).")
+
+        except json.JSONDecodeError:
+            logging.warning(f"AUTO_DM_HANDLER: Received a non-JSON DM from target bot {message.author.id}. Content: {message.content}")
+        except Exception as e:
+            logging.error(f"AUTO_DM_HANDLER: An unexpected error occurred while processing DM: {e}", exc_info=True)
+        
+        return # Stop further processing of this DM
+
+    # --- Legacy: Auto Blacklist via Embed in public channels ---
+    elif message.guild is not None and str(message.author.id) == str(target_bot_id):
+        trigger_embed_title = monitor_config.get("trigger_embed_title")
+        if not trigger_embed_title:
+            return
+
+        if not message.embeds:
+            return
+
+        for embed in message.embeds:
+            # Use 'in' for flexible matching and strip whitespace/emojis
+            if embed.title and trigger_embed_title in embed.title.strip() and embed.description:
+                if embed.mentions:
+                    punished_user = embed.mentions[0]
+                    reason = "因答题处罚被自动记录"
+                    try:
+                        if "因" in embed.description and "被" in embed.description:
+                            start_index = embed.description.find("因") + 1
+                            end_index = embed.description.find("被")
+                            parsed_reason = embed.description[start_index:end_index].strip()
+                            if parsed_reason:
+                                reason = f"因“{parsed_reason}”被自动记录"
+                    except Exception:
+                        pass
+
+                    await add_to_blacklist(
+                        guild_id=str(message.guild.id),
+                        target_id=str(punished_user.id),
+                        target_type='user',
+                        reason=reason,
+                        added_by=f"自动监控 ({bot.user.name})"
+                    )
+                    logging.info(f"AUTO_BLACKLIST_EMBED: SUCCESS! User '{punished_user.id}' automatically added to blacklist in guild '{message.guild.id}'. Reason: {reason}")
+                else:
+                    logging.warning("AUTO_BLACKLIST_EMBED: Embed title matched, but no user was mentioned.")
+                break
+
+@bot.event
 async def on_ready():
     logging.info(f'Logged in as {bot.user.name}')
     await setup_database()
@@ -1133,6 +1705,7 @@ async def on_ready():
     logging.info('Bot is ready to accept commands.')
     bot.add_view(MainView())
     bot.add_view(BadgePanelView())
+    bot.add_view(GraduationPanelView()) # Register the new persistent view
     daily_backup_task.start()
 
 @bot.tree.error
@@ -1277,14 +1850,15 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
     role_to_remove="[可选] 用户完成所有道馆后将被移除的身份组。",
     introduction="[可选] 自定义挑战面板的介绍文字。",
     gym_ids="[可选] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。",
-    completion_threshold="[可选] 完成多少个道馆后触发奖励，不填则为全部。"
+    completion_threshold="[可选] 完成多少个道馆后触发奖励，不填则为全部。",
+    prerequisite_gym_ids="[可选] 逗号分隔的前置道馆ID，需全部完成后才能挑战此面板。"
 )
-@app_commands.rename(enable_blacklist='启用黑名单', completion_threshold='通关数量')
+@app_commands.rename(enable_blacklist='启用黑名单', completion_threshold='通关数量', prerequisite_gym_ids='前置道馆')
 @app_commands.choices(enable_blacklist=[
     app_commands.Choice(name="是 (默认)", value="yes"),
     app_commands.Choice(name="否", value="no"),
 ])
-async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None, completion_threshold: typing.Optional[app_commands.Range[int, 1]] = None):
+async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, role_to_add: typing.Optional[discord.Role] = None, role_to_remove: typing.Optional[discord.Role] = None, introduction: typing.Optional[str] = None, gym_ids: typing.Optional[str] = None, completion_threshold: typing.Optional[app_commands.Range[int, 1]] = None, prerequisite_gym_ids: typing.Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
@@ -1295,6 +1869,9 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
     associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')] if gym_ids else None
     associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
+    prerequisite_gyms_list = [gid.strip() for gid in prerequisite_gym_ids.split(',')] if prerequisite_gym_ids else None
+    prerequisite_gyms_json = json.dumps(prerequisite_gyms_list) if prerequisite_gyms_list else None
+
     try:
         # --- Validation Block ---
         all_guild_gyms = await get_guild_gyms(guild_id)
@@ -1304,7 +1881,21 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
         if associated_gyms_list:
             invalid_ids = [gid for gid in associated_gyms_list if gid not in all_gym_ids_set]
             if invalid_ids:
-                await interaction.followup.send(f"❌ 操作失败：以下道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+                await interaction.followup.send(f"❌ 操作失败：以下关联道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+                return
+        
+        # 1.5 Validate that prerequisite_gym_ids actually exist
+        if prerequisite_gyms_list:
+            invalid_ids = [gid for gid in prerequisite_gyms_list if gid not in all_gym_ids_set]
+            if invalid_ids:
+                await interaction.followup.send(f"❌ 操作失败：以下前置道馆ID在本服务器不存在: `{', '.join(invalid_ids)}`", ephemeral=True)
+                return
+        
+        # 1.6 Validate that prerequisite gyms are not also associated gyms
+        if prerequisite_gyms_list and associated_gyms_list:
+            overlap = set(prerequisite_gyms_list).intersection(set(associated_gyms_list))
+            if overlap:
+                await interaction.followup.send(f"❌ 操作失败：一个或多个道馆ID同时存在于前置道馆和关联道馆列表中: `{', '.join(overlap)}`", ephemeral=True)
                 return
 
         # 2. Validate completion_threshold against the correct gym pool
@@ -1325,11 +1916,15 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
         # --- End Validation Block ---
 
         # Use the custom introduction if provided, otherwise use the default text.
-        description = introduction if introduction else (
-            "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
-            "完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n"
-            "点击下方的按钮，开始你的挑战吧！"
-        )
+        if introduction:
+            # Replace the user-provided newline marker with an actual newline character.
+            description = introduction.replace('\\n', '\n')
+        else:
+            description = (
+                "欢迎来到道馆挑战中心！在这里，你可以通过挑战不同的道馆来学习和证明你的能力。\n\n"
+                "完成所有道馆挑战后，可能会有特殊的身份组奖励或变动。\n\n"
+                "点击下方的按钮，开始你的挑战吧！"
+            )
         
         embed = discord.Embed(
             title="道馆挑战中心",
@@ -1343,9 +1938,9 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
         # Now, save the configuration for this specific panel to the database
         async with aiosqlite.connect(db_path) as conn:
             await conn.execute('''
-                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled, completion_threshold))
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold, prerequisite_gyms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled, completion_threshold, prerequisite_gyms_json))
             await conn.commit()
 
         # Build confirmation message
@@ -1360,6 +1955,8 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
             confirm_messages.append(f"- **关联道馆列表**: `{', '.join(associated_gyms_list)}`")
         if completion_threshold:
             confirm_messages.append(f"- **通关数量要求**: {completion_threshold} 个")
+        if prerequisite_gyms_list:
+            confirm_messages.append(f"- **前置道馆要求**: `{', '.join(prerequisite_gyms_list)}`")
         
         await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
 
@@ -1370,7 +1967,7 @@ async def gym_summon(interaction: discord.Interaction, enable_blacklist: str, ro
         await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
 @gym_management_group.command(name="徽章墙面板", description="在该频道召唤一个徽章墙面板 (馆主、管理员、开发者)。")
-@has_gym_management_permission("召唤")
+@has_gym_management_permission("徽章墙面板")
 @app_commands.describe(
     introduction="[可选] 自定义徽章墙面板的介绍文字。"
 )
@@ -1378,10 +1975,14 @@ async def summon_badge_panel(interaction: discord.Interaction, introduction: typ
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
-        description = introduction if introduction else (
-            "这里是徽章墙展示中心。\n\n"
-            "点击下方的按钮，来展示你通过努力获得的道馆徽章吧！"
-        )
+        if introduction:
+            # Replace the user-provided newline marker with an actual newline character.
+            description = introduction.replace('\\n', '\n')
+        else:
+            description = (
+                "这里是徽章墙展示中心。\n\n"
+                "点击下方的按钮，来展示你通过努力获得的道馆徽章吧！"
+            )
         
         embed = discord.Embed(
             title="徽章墙展示中心",
@@ -1397,6 +1998,63 @@ async def summon_badge_panel(interaction: discord.Interaction, introduction: typ
         await interaction.followup.send(f"❌ 设置失败：我没有权限在此频道发送消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
         logging.error(f"Error in /道馆 徽章墙面板 command: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
+
+@gym_management_group.command(name="毕业面板", description="召唤一个用于领取“全部通关”奖励的面板 (馆主、管理员、开发者)。")
+@has_gym_management_permission("毕业面板")
+@app_commands.describe(
+    role_to_grant="用户完成所有道馆后将获得的身份组。",
+    introduction="[可选] 自定义面板的介绍文字。",
+    button_label="[可选] 自定义按钮上显示的文字。"
+)
+async def gym_graduation_panel(interaction: discord.Interaction, role_to_grant: discord.Role, introduction: typing.Optional[str] = None, button_label: typing.Optional[str] = "领取毕业奖励"):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    guild_id = str(interaction.guild.id)
+    role_add_id = str(role_to_grant.id)
+
+    try:
+        # Default description if none is provided
+        if not introduction:
+            introduction = (
+                "祝贺所有坚持不懈的挑战者！\n\n"
+                f"当你完成了本服务器 **所有** 的道馆挑战后，点击下方的按钮，即可领取属于你的最终荣誉：**{role_to_grant.name}** 身份组！"
+            )
+        
+        # Replace newline markers
+        description = introduction.replace('\\n', '\n')
+
+        embed = discord.Embed(
+            title="道馆毕业资格认证",
+            description=description,
+            color=discord.Color.gold()
+        )
+        
+        # Create a view and update the button label
+        view = GraduationPanelView()
+        view.children[0].label = button_label
+
+        # Send the panel message to get its ID
+        panel_message = await interaction.channel.send(embed=embed, view=view)
+        
+        # Save the configuration for this specific panel to the database
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute('''
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id)
+                VALUES (?, ?, ?, ?)
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id))
+            await conn.commit()
+
+        await interaction.followup.send(
+            f"✅ 毕业面板已成功创建于 {interaction.channel.mention}！\n"
+            f"- **奖励身份组**: {role_to_grant.mention}",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 设置失败：我没有权限在此频道发送消息或管理身份组。请检查我的权限。", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error in /道馆 毕业面板 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
 
@@ -1688,6 +2346,8 @@ async def gym_list(interaction: discord.Interaction):
     permission=[
         app_commands.Choice(name="所有管理指令 (包括召唤)", value="all"),
         app_commands.Choice(name="召唤 (/道馆 召唤)", value="召唤"),
+        app_commands.Choice(name="徽章墙面板 (/道馆 徽章墙面板)", value="徽章墙面板"),
+        app_commands.Choice(name="毕业面板 (/道馆 毕业面板)", value="毕业面板"),
         app_commands.Choice(name="建造 (/道馆 建造)", value="建造"),
         app_commands.Choice(name="更新 (/道馆 更新)", value="更新"),
         app_commands.Choice(name="后门 (/道馆 后门)", value="后门"),
@@ -1695,7 +2355,9 @@ async def gym_list(interaction: discord.Interaction):
         app_commands.Choice(name="重置进度 (/道馆 重置进度)", value="重置进度"),
         app_commands.Choice(name="解除处罚 (/道馆 解除处罚)", value="解除处罚"),
         app_commands.Choice(name="停业 (/道馆 停业)", value="停业"),
-        app_commands.Choice(name="删除 (/道馆 删除)", value="删除")
+        app_commands.Choice(name="删除 (/道馆 删除)", value="删除"),
+        app_commands.Choice(name="道馆黑名单 (/道馆黑名单)", value="道馆黑名单"),
+        app_commands.Choice(name="道馆封禁 (/道馆封禁)", value="道馆封禁")
     ]
 )
 async def set_gym_master(interaction: discord.Interaction, action: str, target: typing.Union[discord.Member, discord.Role], permission: str):
@@ -1731,13 +2393,8 @@ async def reset_progress(interaction: discord.Interaction, user: discord.Member)
     guild_id = str(interaction.guild.id)
     user_id = str(user.id)
     try:
-        # Also reset failure records
-        async with aiosqlite.connect(db_path) as conn:
-            await conn.execute("DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
-            await conn.commit()
-        
-        await reset_user_progress(user_id, guild_id)
-        await interaction.followup.send(f"✅ 已成功重置用户 {user.mention} 的所有道馆挑战进度和失败记录。", ephemeral=True)
+        await fully_reset_user_progress(user_id, guild_id)
+        await interaction.followup.send(f"✅ 已成功重置用户 {user.mention} 的所有道馆挑战进度、失败记录和身份组领取记录。", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(f"❌ 重置失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
@@ -1863,8 +2520,8 @@ async def gym_status(interaction: discord.Interaction, gym_id: str, status: str)
     else:
         await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
 
-@bot.tree.command(name="道馆黑名单", description="管理作弊黑名单 (管理员或开发者)。")
-@is_admin_or_owner()
+@bot.tree.command(name="道馆黑名单", description="管理作弊黑名单 (馆主、管理员、开发者)。")
+@has_gym_management_permission("道馆黑名单")
 @app_commands.describe(
     action="要执行的操作",
     target="[添加/移除] 操作的目标用户或身份组",
@@ -1875,6 +2532,7 @@ async def gym_status(interaction: discord.Interaction, gym_id: str, status: str)
     app_commands.Choice(name="添加 (用户或身份组)", value="add"),
     app_commands.Choice(name="移除 (用户或身份组)", value="remove"),
     app_commands.Choice(name="记录 (身份组成员)", value="record_role"),
+    app_commands.Choice(name="查看列表", value="view_list"),
     app_commands.Choice(name="清空 (!!!)", value="clear"),
 ])
 async def gym_blacklist(
@@ -1893,7 +2551,7 @@ async def gym_blacklist(
         
         await interaction.response.defer(ephemeral=True, thinking=True)
         target_id = str(target.id)
-        target_type = 'user' if isinstance(target, discord.Member) else 'role'
+        target_type = 'user' if isinstance(target, (discord.User, discord.Member)) else 'role'
         
         try:
             await add_to_blacklist(guild_id, target_id, target_type, reason, added_by)
@@ -1974,6 +2632,85 @@ async def gym_blacklist(
             view=view,
             ephemeral=True
         )
+
+    elif action == "view_list":
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        blacklist_entries = await get_blacklist(guild_id)
+
+        if not blacklist_entries:
+            await interaction.followup.send("✅ 本服务器的黑名单是空的。", ephemeral=True)
+            return
+
+        view = BlacklistPaginatorView(interaction, blacklist_entries)
+        embed = await view.create_embed()
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="道馆封禁", description="管理挑战封禁名单 (馆主、管理员、开发者)。")
+@has_gym_management_permission("道馆封禁")
+@app_commands.describe(
+   action="要执行的操作",
+   target="[添加/移除] 操作的目标用户或身份组",
+   reason="[添加] 操作的原因"
+)
+@app_commands.choices(action=[
+   app_commands.Choice(name="添加 (用户或身份组)", value="add"),
+   app_commands.Choice(name="移除 (用户或身份组)", value="remove"),
+   app_commands.Choice(name="查看列表", value="view_list"),
+])
+async def gym_ban(
+   interaction: discord.Interaction,
+   action: str,
+   target: typing.Optional[typing.Union[discord.Member, discord.Role]] = None,
+   reason: typing.Optional[str] = "无"
+):
+   guild_id = str(interaction.guild.id)
+   added_by = str(interaction.user.id)
+
+   if action == "add":
+       if not target:
+           return await interaction.response.send_message("❌ `添加` 操作需要一个 `target` (用户或身份组)。", ephemeral=True)
+       
+       await interaction.response.defer(ephemeral=True, thinking=True)
+       target_id = str(target.id)
+       target_type = 'user' if isinstance(target, (discord.User, discord.Member)) else 'role'
+       
+       try:
+           await add_to_ban_list(guild_id, target_id, target_type, reason, added_by)
+           logging.info(f"BAN_LIST: User '{added_by}' added '{target_id}' ({target_type}) to ban list in guild '{guild_id}'. Reason: {reason}")
+           await interaction.followup.send(f"✅ 已成功将 {target.mention} 添加到挑战封禁名单。\n**原因:** {reason}", ephemeral=True)
+       except Exception as e:
+           logging.error(f"Error in /道馆封禁 add command: {e}", exc_info=True)
+           await interaction.followup.send("❌ 添加到封禁名单时发生错误。", ephemeral=True)
+
+   elif action == "remove":
+       if not target:
+           return await interaction.response.send_message("❌ `移除` 操作需要一个 `target` (用户或身份组)。", ephemeral=True)
+           
+       await interaction.response.defer(ephemeral=True, thinking=True)
+       target_id = str(target.id)
+       
+       try:
+           removed_count = await remove_from_ban_list(guild_id, target_id)
+           if removed_count > 0:
+               logging.info(f"BAN_LIST: User '{interaction.user.id}' removed '{target_id}' from ban list in guild '{guild_id}'.")
+               await interaction.followup.send(f"✅ 已成功将 {target.mention} 从挑战封禁名单中移除。", ephemeral=True)
+           else:
+               await interaction.followup.send(f"ℹ️ {target.mention} 不在挑战封禁名单中。", ephemeral=True)
+       except Exception as e:
+           logging.error(f"Error in /道馆封禁 remove command: {e}", exc_info=True)
+           await interaction.followup.send("❌ 从封禁名单移除时发生错误。", ephemeral=True)
+
+   elif action == "view_list":
+       await interaction.response.defer(ephemeral=True, thinking=True)
+       ban_list_entries = await get_ban_list(guild_id)
+
+       if not ban_list_entries:
+           await interaction.followup.send("✅ 本服务器的挑战封禁名单是空的。", ephemeral=True)
+           return
+
+       view = BanListPaginatorView(interaction, ban_list_entries)
+       embed = await view.create_embed()
+       await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 # --- Badge Showcase Command ---
 
