@@ -508,6 +508,25 @@ async def set_gym_completed(user_id: str, guild_id: str, gym_id: str):
         except Exception as e:
             logging.error(f"DATABASE_ERROR: An unexpected error occurred in set_gym_completed: {e}")
 
+async def reset_ultimate_gym_progress(user_id: str, guild_id: str):
+    """Resets a user's ultimate gym progress, clearing the leaderboard."""
+    async with user_db_locks[user_id]:
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("DELETE FROM ultimate_gym_leaderboard WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            await conn.commit()
+    logging.info(f"PROGRESS_RESET: Reset ultimate gym progress for user '{user_id}' in guild '{guild_id}'.")
+
+async def reset_specific_gym_progress(user_id: str, guild_id: str, gym_id: str):
+    """Resets a user's progress for a single, specific gym."""
+    async with user_db_locks[user_id]:
+        async with aiosqlite.connect(db_path) as conn:
+            # Delete from user_progress for the specific gym
+            await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ? AND gym_id = ?", (user_id, guild_id, gym_id))
+            # Delete from challenge_failures for the specific gym
+            await conn.execute("DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ? AND gym_id = ?", (user_id, guild_id, gym_id))
+            await conn.commit()
+    logging.info(f"PROGRESS_RESET: Reset progress for user '{user_id}' in guild '{guild_id}' for gym '{gym_id}'.")
+
 async def fully_reset_user_progress(user_id: str, guild_id: str):
     """Resets a user's gym completions, failure records, and claimed rewards for a guild."""
     async with user_db_locks[user_id]:
@@ -2143,10 +2162,29 @@ async def clear_commands(interaction: discord.Interaction):
 
 # --- Admin & Owner Commands ---
 
-@bot.tree.command(name="状态", description="[仅限开发者] 查看服务器和机器人的当前状态。")
+@bot.tree.command(name="状态", description="[仅限开发者] 查看服务器和机器人的当前状态或下载日志。")
 @app_commands.check(is_owner_check)
-async def system_status(interaction: discord.Interaction):
-    """Displays the current status of the VPS and the bot."""
+@app_commands.describe(action="选择要执行的操作。")
+@app_commands.choices(action=[
+    app_commands.Choice(name="查看状态", value="view_status"),
+    app_commands.Choice(name="下载今日日志", value="download_log"),
+])
+async def system_status(interaction: discord.Interaction, action: str = "view_status"):
+    """Displays the current status of the VPS and the bot or downloads the log file."""
+    if action == "download_log":
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            # log_path is defined globally at the top of the script
+            if os.path.exists(log_path):
+                await interaction.followup.send("✅ 这是今天的最新日志文件。", file=discord.File(log_path), ephemeral=True)
+            else:
+                await interaction.followup.send("❌ 未找到日志文件。", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error during log download: {e}", exc_info=True)
+            await interaction.followup.send("❌ 下载日志文件时发生错误。", ephemeral=True)
+        return
+
+    # --- The original status viewing logic ---
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     # --- System Info ---
@@ -2159,13 +2197,13 @@ async def system_status(interaction: discord.Interaction):
     ram_total_gb = ram.total / (1024**3)
     
     try:
-        disk = psutil.disk_usage('/')
+        disk = psutil.disk_usage(os.path.abspath(os.sep))
         disk_usage_percent = disk.percent
         disk_used_gb = disk.used / (1024**3)
         disk_total_gb = disk.total / (1024**3)
         disk_str = f"**磁盘空间:** `{disk_usage_percent}%` ({disk_used_gb:.2f} GB / {disk_total_gb:.2f} GB)"
     except FileNotFoundError:
-        # Handle cases where '/' might not be the correct path (e.g., on Windows)
+        # Handle cases where the root path might not be accessible
         disk_str = "**磁盘空间:** `无法获取`"
 
 
@@ -2835,17 +2873,64 @@ async def set_gym_master(interaction: discord.Interaction, action: str, target: 
         logging.error(f"Error in /道馆 设置馆主 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 操作失败: 发生了一个未知错误。", ephemeral=True)
 
-@gym_management_group.command(name="重置进度", description="重置一个用户的道馆挑战进度 (馆主、管理员、开发者)。")
+# --- Autocomplete Functions ---
+async def gym_id_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """An autocomplete function for gym IDs."""
+    guild_id = str(interaction.guild.id)
+    all_gyms = await get_guild_gyms(guild_id)
+    
+    choices = []
+    for gym in all_gyms:
+        # Match against gym name or ID
+        if current.lower() in gym['name'].lower() or current in gym['id']:
+            # The name parameter is what the user sees, the value is what's sent to the command
+            choices.append(app_commands.Choice(name=f"{gym['name']} ({gym['id']})", value=gym['id']))
+    
+    # Return up to 25 choices, as per Discord's limit
+    return choices[:25]
+
+@gym_management_group.command(name="重置进度", description="重置用户的道馆进度 (馆主、管理员、开发者)。")
 @has_gym_management_permission("重置进度")
-@app_commands.describe(user="要重置进度的用户。")
-async def reset_progress(interaction: discord.Interaction, user: discord.Member):
-    """Resets a user's gym progress for the guild."""
+@app_commands.describe(
+    user="要重置进度的用户。",
+    scope="选择要重置的数据范围。",
+    gym_id="[如果重置特定道馆] 请输入道馆ID。"
+)
+@app_commands.choices(scope=[
+    app_commands.Choice(name="全部进度 (不可恢复)", value="all"),
+    app_commands.Choice(name="仅究极道馆进度", value="ultimate"),
+    app_commands.Choice(name="仅特定道馆进度", value="specific_gym"),
+])
+@app_commands.autocomplete(gym_id=gym_id_autocomplete)
+async def reset_progress(interaction: discord.Interaction, user: discord.Member, scope: str, gym_id: typing.Optional[str] = None):
+    """Resets a user's gym progress based on the selected scope."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     guild_id = str(interaction.guild.id)
     user_id = str(user.id)
+
+    # --- Validation ---
+    if scope == "specific_gym":
+        if not gym_id:
+            await interaction.followup.send("❌ 操作失败：选择“仅特定道馆进度”时，必须提供道馆ID。", ephemeral=True)
+            return
+        # Check if the gym exists
+        if not await get_single_gym(guild_id, gym_id):
+            await interaction.followup.send(f"❌ 操作失败：找不到ID为 `{gym_id}` 的道馆。", ephemeral=True)
+            return
+
     try:
-        await fully_reset_user_progress(user_id, guild_id)
-        await interaction.followup.send(f"✅ 已成功重置用户 {user.mention} 的所有道馆挑战进度、失败记录和身份组领取记录。", ephemeral=True)
+        if scope == "all":
+            await fully_reset_user_progress(user_id, guild_id)
+            await interaction.followup.send(f"✔️ 已成功重置用户 {user.mention} 的**所有**道馆挑战进度、失败记录和身份组领取记录。", ephemeral=True)
+        
+        elif scope == "ultimate":
+            await reset_ultimate_gym_progress(user_id, guild_id)
+            await interaction.followup.send(f"✔️ 已成功重置用户 {user.mention} 的**究极道馆**排行榜进度。", ephemeral=True)
+
+        elif scope == "specific_gym":
+            await reset_specific_gym_progress(user_id, guild_id, gym_id)
+            await interaction.followup.send(f"✔️ 已成功重置用户 {user.mention} 在道馆 `{gym_id}` 的进度和失败记录。", ephemeral=True)
+
     except discord.Forbidden:
         await interaction.followup.send(f"❌ 重置失败：我没有权限回复此消息。请检查我的权限。", ephemeral=True)
     except Exception as e:
@@ -2858,6 +2943,7 @@ async def reset_progress(interaction: discord.Interaction, user: discord.Member)
     user="要解除处罚的用户",
     gym_id="要解除处罚的道馆ID"
 )
+@app_commands.autocomplete(gym_id=gym_id_autocomplete)
 async def gym_pardon(interaction: discord.Interaction, user: discord.Member, gym_id: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     guild_id = str(interaction.guild.id)
@@ -3293,6 +3379,56 @@ async def my_badges(interaction: discord.Interaction):
         
     view = BadgeView(interaction.user, completed_gyms)
     await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=True)
+
+@bot.tree.command(name="say", description="让机器人发送一条消息，可以附带图片 (管理员或开发者)。")
+@is_admin_or_owner()
+@app_commands.describe(
+    message="要发送的文字内容。",
+    channel="[可选] 要发送消息的频道 (默认为当前频道)。",
+    image="[可选] 要附加的图片文件。"
+)
+async def say(
+    interaction: discord.Interaction,
+    message: str,
+    channel: typing.Optional[discord.TextChannel] = None,
+    image: typing.Optional[discord.Attachment] = None
+):
+    """Sends a message as the bot, with an optional image."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # If no channel is specified, use the current channel
+    target_channel = channel or interaction.channel
+
+    # --- Validation Checks ---
+    # Check message length
+    if len(message) > 2000:
+        await interaction.followup.send("❌ 发送失败：消息内容不能超过 2000 个字符。", ephemeral=True)
+        return
+
+    # Check for attachment content type to ensure it's an image
+    if image and image.content_type and not image.content_type.startswith('image/'):
+        await interaction.followup.send("❌ 文件类型错误，请上传一个图片文件 (e.g., PNG, JPG, GIF)。", ephemeral=True)
+        return
+        
+    # Check attachment size (limit is 25MB for bots)
+    if image and image.size > 25 * 1024 * 1024:
+        await interaction.followup.send("❌ 发送失败：图片文件大小不能超过 25MB。", ephemeral=True)
+        return
+
+    try:
+        image_file = await image.to_file() if image else None
+        await target_channel.send(content=message, file=image_file)
+        
+        if target_channel == interaction.channel:
+            await interaction.followup.send("✅ 消息已成功发送。", ephemeral=True)
+        else:
+            await interaction.followup.send(f"✅ 消息已成功发送至 {target_channel.mention}。", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 发送失败：我没有权限在 {target_channel.mention} 频道发送消息或上传文件。", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error in /say command: {e}", exc_info=True)
+        await interaction.followup.send("❌ 发送消息时发生未知错误。", ephemeral=True)
 
 
 bot.tree.add_command(gym_management_group)
