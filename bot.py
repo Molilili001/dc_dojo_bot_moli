@@ -1974,8 +1974,8 @@ async def trigger_leaderboard_update(guild_id: int):
 # --- Bot Events ---
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore messages from the bot itself
-    if message.author == bot.user:
+    # Ignore messages from the bot itself or messages outside of guilds
+    if message.author == bot.user or not message.guild:
         return
 
     # --- Auto Blacklist Monitor ---
@@ -1984,123 +1984,53 @@ async def on_message(message: discord.Message):
         return
 
     target_bot_id = monitor_config.get("target_bot_id")
-    if not target_bot_id:
-        return # Exit if no target bot is configured
+    monitor_channel_id = monitor_config.get("monitor_channel_id")
 
-    # --- New: Auto Blacklist via DM JSON ---
-    if message.guild is None and str(message.author.id) == str(target_bot_id):
-        logging.info(f"AUTO_DM_HANDLER: Received DM from target bot {message.author.id}")
-        try:
-            data = json.loads(message.content)
-            
-            # --- Feature: Auto Blacklist via DM ---
-            punished_user_id = data.get("punish")
-            if isinstance(punished_user_id, (str, int)) and str(punished_user_id).isdigit():
-                punished_user_id_str = str(punished_user_id)
-                reason = "因答题处罚被自动同步"
-                added_by = f"自动同步自 ({message.author.name})"
-                
-                synced_guilds_count = 0
-                for guild in bot.guilds:
-                    # Check if the user is actually in the guild before proceeding
-                    member = guild.get_member(int(punished_user_id_str))
-                    if not member:
-                        try:
-                            member = await guild.fetch_member(int(punished_user_id_str))
-                        except discord.NotFound:
-                            continue # Skip if user is not in this guild
+    # Check if the message is from the target bot in the target channel
+    if not target_bot_id or not monitor_channel_id:
+        return
+    if str(message.author.id) != str(target_bot_id) or str(message.channel.id) != str(monitor_channel_id):
+        return
 
-                    try:
-                        # Add to blacklist for the current guild
-                        await add_to_blacklist(str(guild.id), punished_user_id_str, 'user', reason, added_by)
-                        
-                        # Reset all progress for the user in the current guild
-                        await fully_reset_user_progress(punished_user_id_str, str(guild.id))
-                        
-                        synced_guilds_count += 1
-                    except Exception as e:
-                        logging.error(f"AUTO_BLACKLIST_DM: Failed to process punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {e}")
-                
-                logging.info(f"AUTO_BLACKLIST_DM: Successfully processed punishment for user '{punished_user_id_str}' in {synced_guilds_count} guilds.")
-
-            # --- Feature: Grant Role via DM ---
-            passed_user_id = data.get("pass")
-            pass_role_id = monitor_config.get("pass_role_id")
-            if isinstance(passed_user_id, (str, int)) and str(passed_user_id).isdigit() and pass_role_id:
-                passed_user_id_str = str(passed_user_id)
-                granted_guilds_count = 0
-                for guild in bot.guilds:
-                    try:
-                        role = guild.get_role(int(pass_role_id))
-                        if not role:
-                            logging.warning(f"PASS_ROLE_DM: Role ID '{pass_role_id}' not found in guild '{guild.name}' ({guild.id}).")
-                            continue
-                        
-                        member = guild.get_member(int(passed_user_id_str))
-                        if not member:
-                            # If member is not in cache, try fetching
-                            try:
-                                member = await guild.fetch_member(int(passed_user_id_str))
-                            except discord.NotFound:
-                                logging.info(f"PASS_ROLE_DM: User '{passed_user_id_str}' not found in guild '{guild.name}' ({guild.id}).")
-                                continue
-                        
-                        if role not in member.roles:
-                            await member.add_roles(role, reason=f"通过私信自动授予 by {message.author.name}")
-                            granted_guilds_count += 1
-                            logging.info(f"PASS_ROLE_DM: Granted role '{role.name}' to user '{member.name}' in guild '{guild.name}'.")
-
-                    except discord.Forbidden:
-                        logging.error(f"PASS_ROLE_DM: Bot lacks permissions to grant role '{pass_role_id}' in guild '{guild.id}'.")
-                    except Exception as e:
-                        logging.error(f"PASS_ROLE_DM: Failed to grant role for user '{passed_user_id_str}' in guild '{guild.id}'. Reason: {e}")
-                
-                if granted_guilds_count > 0:
-                    logging.info(f"PASS_ROLE_DM: Successfully granted role to user '{passed_user_id_str}' in {granted_guilds_count} guild(s).")
-
-        except json.JSONDecodeError:
-            logging.warning(f"AUTO_DM_HANDLER: Received a non-JSON DM from target bot {message.author.id}. Content: {message.content}")
-        except Exception as e:
-            logging.error(f"AUTO_DM_HANDLER: An unexpected error occurred while processing DM: {e}", exc_info=True)
+    # --- New: Auto Blacklist via JSON in a specific channel ---
+    logging.info(f"AUTO_CHANNEL_HANDLER: Received message from target bot {message.author.id} in channel {message.channel.id}")
+    try:
+        data = json.loads(message.content)
         
-        return # Stop further processing of this DM
+        punished_user_id = data.get("punish")
+        if isinstance(punished_user_id, (str, int)) and str(punished_user_id).isdigit():
+            punished_user_id_str = str(punished_user_id)
+            guild = message.guild
+            
+            # Check if the user is actually in the guild before proceeding
+            member = guild.get_member(int(punished_user_id_str))
+            if not member:
+                try:
+                    member = await guild.fetch_member(int(punished_user_id_str))
+                except discord.NotFound:
+                    logging.warning(f"AUTO_BLACKLIST_CHANNEL: User '{punished_user_id_str}' not found in guild '{guild.name}' ({guild.id}). Skipping.")
+                    return # Skip if user is not in this guild
 
-    # --- Legacy: Auto Blacklist via Embed in public channels ---
-    elif message.guild is not None and str(message.author.id) == str(target_bot_id):
-        trigger_embed_title = monitor_config.get("trigger_embed_title")
-        if not trigger_embed_title:
-            return
+            reason = "因答题处罚被自动同步"
+            added_by = f"自动同步自 ({message.author.name})"
+            
+            try:
+                # Add to blacklist for the current guild
+                await add_to_blacklist(str(guild.id), punished_user_id_str, 'user', reason, added_by)
+                
+                # Reset all progress for the user in the current guild
+                await fully_reset_user_progress(punished_user_id_str, str(guild.id))
+                
+                logging.info(f"AUTO_BLACKLIST_CHANNEL: Successfully processed punishment for user '{punished_user_id_str}' in guild '{guild.id}'.")
 
-        if not message.embeds:
-            return
+            except Exception as e:
+                logging.error(f"AUTO_BLACKLIST_CHANNEL: Failed to process punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {e}")
 
-        for embed in message.embeds:
-            # Use 'in' for flexible matching and strip whitespace/emojis
-            if embed.title and trigger_embed_title in embed.title.strip() and embed.description:
-                if embed.mentions:
-                    punished_user = embed.mentions[0]
-                    reason = "因答题处罚被自动记录"
-                    try:
-                        if "因" in embed.description and "被" in embed.description:
-                            start_index = embed.description.find("因") + 1
-                            end_index = embed.description.find("被")
-                            parsed_reason = embed.description[start_index:end_index].strip()
-                            if parsed_reason:
-                                reason = f"因“{parsed_reason}”被自动记录"
-                    except Exception:
-                        pass
-
-                    await add_to_blacklist(
-                        guild_id=str(message.guild.id),
-                        target_id=str(punished_user.id),
-                        target_type='user',
-                        reason=reason,
-                        added_by=f"自动监控 ({bot.user.name})"
-                    )
-                    logging.info(f"AUTO_BLACKLIST_EMBED: SUCCESS! User '{punished_user.id}' automatically added to blacklist in guild '{message.guild.id}'. Reason: {reason}")
-                else:
-                    logging.warning("AUTO_BLACKLIST_EMBED: Embed title matched, but no user was mentioned.")
-                break
+    except json.JSONDecodeError:
+        # This is expected if the bot posts non-JSON messages, so we can log it at a lower level or ignore it.
+        logging.debug(f"AUTO_CHANNEL_HANDLER: Received a non-JSON message from target bot {message.author.id}. Content: {message.content}")
+    except Exception as e:
+        logging.error(f"AUTO_CHANNEL_HANDLER: An unexpected error occurred while processing message: {e}", exc_info=True)
 
 @bot.event
 async def on_ready():
