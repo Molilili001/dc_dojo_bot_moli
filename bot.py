@@ -71,6 +71,7 @@ with open(config_path, 'r', encoding='utf-8') as f:
 # --- Concurrency Locks ---
 # Create a defaultdict of asyncio.Locks to prevent race conditions on a per-user basis.
 user_db_locks = defaultdict(asyncio.Lock)
+user_challenge_locks = defaultdict(asyncio.Lock) # Lock for active challenges
 
 # --- Database Management ---
 async def setup_database():
@@ -283,6 +284,11 @@ async def setup_database():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_ultimate_leaderboard_guild_time ON ultimate_gym_leaderboard (guild_id, completion_time_seconds);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_leaderboard_panels_guild ON leaderboard_panels (guild_id);")
  
+        # --- Data Migration for Older Panels ---
+        # Ensure any panels created before the blacklist_enabled flag was explicitly set
+        # are defaulted to having the check enabled. This runs on startup.
+        await conn.execute("UPDATE challenge_panels SET blacklist_enabled = 1 WHERE blacklist_enabled IS NULL;")
+
         await conn.commit()
 
 # --- Gym Data Functions ---
@@ -428,6 +434,10 @@ async def increment_user_failure(user_id: str, guild_id: str, gym_id: str) -> da
                 banned_until = excluded.banned_until
             ''', (user_id, guild_id, gym_id, new_failure_count, banned_until_iso))
             await conn.commit()
+        
+        if ban_duration.total_seconds() > 0:
+            logging.info(f"TEMP_BAN: User '{user_id}' in guild '{guild_id}' for gym '{gym_id}' has been temporarily banned for {ban_duration} due to reaching {new_failure_count} failures.")
+
         return ban_duration
 
 async def reset_user_failures_for_gym(user_id: str, guild_id: str, gym_id: str):
@@ -1169,7 +1179,7 @@ class GraduationPanelView(discord.ui.View):
         # 1. Get the role associated with this specific panel
         async with aiosqlite.connect(db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT role_to_add_id FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+            async with conn.execute("SELECT role_to_add_id, blacklist_enabled FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
                 panel_config = await cursor.fetchone()
         
         if not panel_config or not panel_config['role_to_add_id']:
@@ -1187,7 +1197,28 @@ class GraduationPanelView(discord.ui.View):
         if await has_claimed_reward(guild_id, user_id, role_to_add_id):
             return await interaction.followup.send(f"✅ 你已经领取过 {role_to_add.mention} 这个奖励了！", ephemeral=True)
 
-        # 3. Check if the user has completed ALL gyms
+        # 3. Blacklist Check
+        # Safely check if the blacklist is enabled for this panel.
+        # If the column doesn't exist in an old DB, default to True for security.
+        if 'blacklist_enabled' in panel_config.keys():
+            blacklist_enabled_for_panel = panel_config['blacklist_enabled'] if panel_config['blacklist_enabled'] is not None else True
+        else:
+            blacklist_enabled_for_panel = True # Default to enabled if column is missing
+
+        if blacklist_enabled_for_panel:
+            blacklist_entry = await is_user_blacklisted(guild_id, member)
+            if blacklist_entry:
+                reason = blacklist_entry.get('reason', '无特定原因')
+                logging.info(f"BLACKLIST: Blocked graduation role for blacklisted user '{member.id}' in guild '{guild_id}'. Reason: {reason}")
+                return await interaction.followup.send(
+                    f"🚫 **身份组获取失败** 🚫\n\n"
+                    f"由于你被记录在处罚名单中，即使完成了所有道馆挑战，也无法领取毕业奖励。\n"
+                    f"**原因:** {reason}\n\n"
+                    "如有疑问，请联系服务器管理员。",
+                    ephemeral=True
+                )
+
+        # 4. Check if the user has completed ALL gyms
         all_guild_gyms = await get_guild_gyms(guild_id)
         if not all_guild_gyms:
             return await interaction.followup.send("ℹ️ 本服务器还没有任何道馆，无法判断毕业状态。", ephemeral=True)
@@ -1200,7 +1231,7 @@ class GraduationPanelView(discord.ui.View):
             missing_count = len(required_gym_ids - completed_gym_ids)
             return await interaction.followup.send(f"❌ 你尚未完成所有道馆的挑战，还差 {missing_count} 个。请继续努力！", ephemeral=True)
 
-        # 4. All checks passed, grant the role
+        # 5. All checks passed, grant the role
         try:
             await member.add_roles(role_to_add, reason="道馆全部通关奖励")
             await record_reward_claim(guild_id, user_id, role_to_add_id)
@@ -1259,12 +1290,47 @@ def _create_wrong_answers_embed_fields(wrong_answers: list, show_correct_answer:
     
     return fields_to_add
 
+class QuestionView(discord.ui.View):
+    """A view that handles question display and timeouts."""
+    def __init__(self, session: 'ChallengeSession', interaction: discord.Interaction, **kwargs):
+        super().__init__(**kwargs)
+        self.session = session
+        self.interaction = interaction
+
+    async def on_timeout(self):
+        user_id = str(self.session.user_id)
+        # Only remove the session if it's the one this view was created for.
+        # This prevents a race condition where a new challenge starts before the old view times out.
+        if user_id in active_challenges and active_challenges[user_id] == self.session:
+            del active_challenges[user_id]
+            logging.info(f"CHALLENGE: Session TIMED OUT for user '{user_id}' in gym '{self.session.gym_id}'.")
+        
+        # Disable all buttons on the message
+        for item in self.children:
+            item.disabled = True
+        
+        try:
+            timeout_embed = discord.Embed(
+                title="⌛ 挑战超时",
+                description="本次挑战已超时，请重新开始。",
+                color=discord.Color.orange()
+            )
+            # Edit the original message to show the timeout state
+            await self.interaction.edit_original_response(embed=timeout_embed, view=self)
+        except discord.NotFound:
+            # The message was likely deleted, which is fine.
+            pass
+        except Exception as e:
+            # Log any other errors that might occur.
+            logging.error(f"Error during QuestionView on_timeout: {e}", exc_info=True)
+
 async def display_question(interaction: discord.Interaction, session: ChallengeSession, from_modal: bool = False):
     # This function builds and sends/edits the message for the current question or final result.
  
     # --- Part 1: Build the Embed and View ---
     embed = None
-    view = discord.ui.View(timeout=180)
+    # Use the new QuestionView to handle timeouts gracefully
+    view = QuestionView(session=session, interaction=interaction, timeout=180)
     is_final_result = False
  
     # Check if all questions have been answered
@@ -1431,27 +1497,29 @@ class QuestionAnswerButton(discord.ui.Button):
         # Defer the interaction immediately to prevent it from timing out during long operations.
         await interaction.response.defer()
 
-        session = active_challenges.get(str(interaction.user.id))
-        if not session:
-            await interaction.edit_original_response(content="挑战已超时，请重新开始。", view=None, embed=None)
-            return
-        
-        # Check the button's actual value against the correct answer
-        if self.value != self.correct_answer:
-            session.mistakes_made += 1
-            question_info = session.get_current_question()
-            session.wrong_answers.append((question_info, self.value))
-            logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
-            
-            # --- Ultimate Gym: Fail Fast ---
-            if session.is_ultimate:
-                # By setting the index past the end, we trigger the final result display immediately.
-                session.current_question_index = len(session.questions_for_session)
-                await display_question(interaction, session)
+        user_id = str(interaction.user.id)
+        async with user_challenge_locks[user_id]:
+            session = active_challenges.get(user_id)
+            if not session:
+                await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
                 return
+            
+            # Check the button's actual value against the correct answer
+            if self.value != self.correct_answer:
+                session.mistakes_made += 1
+                question_info = session.get_current_question()
+                session.wrong_answers.append((question_info, self.value))
+                logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
+                
+                # --- Ultimate Gym: Fail Fast ---
+                if session.is_ultimate:
+                    # By setting the index past the end, we trigger the final result display immediately.
+                    session.current_question_index = len(session.questions_for_session)
+                    await display_question(interaction, session)
+                    return
 
-        session.current_question_index += 1
-        await display_question(interaction, session)
+            session.current_question_index += 1
+            await display_question(interaction, session)
 
 class FillInBlankButton(discord.ui.Button):
     def __init__(self):
@@ -1473,41 +1541,43 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
         # Defer the interaction immediately to prevent it from timing out.
         await interaction.response.defer()
 
-        session = active_challenges.get(str(interaction.user.id))
-        if not session:
-            # If the session has timed out, edit the deferred response to inform the user.
-            await interaction.edit_original_response(content="挑战已超时，请重新开始。", view=None, embed=None)
-            return
-
-        user_answer = self.answer_input.value.strip()
-        correct_answer_field = self.question['correct_answer']
-        is_correct = False
-
-        # Check if correct_answer_field is a list or a string
-        if isinstance(correct_answer_field, list):
-            # If it's a list, check if the user's answer is in the list (case-insensitive)
-            if any(user_answer.lower() == str(ans).lower() for ans in correct_answer_field):
-                is_correct = True
-        else:
-            # Maintain compatibility with the old format (string)
-            if user_answer.lower() == str(correct_answer_field).lower():
-                is_correct = True
-        
-        if not is_correct:
-            session.mistakes_made += 1
-            session.wrong_answers.append((self.question, user_answer))
-            logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
-
-            # --- Ultimate Gym: Fail Fast ---
-            if session.is_ultimate:
-                # By setting the index past the end, we trigger the final result display immediately.
-                session.current_question_index = len(session.questions_for_session)
-                await display_question(interaction, session, from_modal=True)
+        user_id = str(interaction.user.id)
+        async with user_challenge_locks[user_id]:
+            session = active_challenges.get(user_id)
+            if not session:
+                # If the session has timed out, edit the deferred response to inform the user.
+                await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
                 return
 
-        session.current_question_index += 1
-        # The interaction is already deferred, now update the original message with the next question.
-        await display_question(interaction, session, from_modal=True)
+            user_answer = self.answer_input.value.strip()
+            correct_answer_field = self.question['correct_answer']
+            is_correct = False
+
+            # Check if correct_answer_field is a list or a string
+            if isinstance(correct_answer_field, list):
+                # If it's a list, check if the user's answer is in the list (case-insensitive)
+                if any(user_answer.lower() == str(ans).lower() for ans in correct_answer_field):
+                    is_correct = True
+            else:
+                # Maintain compatibility with the old format (string)
+                if user_answer.lower() == str(correct_answer_field).lower():
+                    is_correct = True
+            
+            if not is_correct:
+                session.mistakes_made += 1
+                session.wrong_answers.append((self.question, user_answer))
+                logging.info(f"CHALLENGE: User '{interaction.user.id}' answered incorrectly. Mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
+
+                # --- Ultimate Gym: Fail Fast ---
+                if session.is_ultimate:
+                    # By setting the index past the end, we trigger the final result display immediately.
+                    session.current_question_index = len(session.questions_for_session)
+                    await display_question(interaction, session, from_modal=True)
+                    return
+
+            session.current_question_index += 1
+            # The interaction is already deferred, now update the original message with the next question.
+            await display_question(interaction, session, from_modal=True)
 
 class ConfirmClearView(discord.ui.View):
     def __init__(self, guild_id: str, original_interaction: discord.Interaction):
@@ -1770,7 +1840,8 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
     role_to_add_id = panel_config['role_to_add_id']
     role_to_remove_id = panel_config['role_to_remove_id']
     associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config['associated_gyms'] else None
-    blacklist_enabled_for_panel = panel_config['blacklist_enabled']
+    # Safely get the blacklist setting, defaulting to True if the column doesn't exist (e.g., old DB).
+    blacklist_enabled_for_panel = panel_config['blacklist_enabled'] if 'blacklist_enabled' in panel_config.keys() else True
     completion_threshold = panel_config['completion_threshold']
 
     # Get all gyms that currently exist in the server
@@ -2021,7 +2092,7 @@ async def on_message(message: discord.Message):
                 # Reset all progress for the user in the current guild
                 await fully_reset_user_progress(punished_user_id_str, str(guild.id))
                 
-                logging.info(f"AUTO_BLACKLIST_CHANNEL: Successfully processed punishment for user '{punished_user_id_str}' in guild '{guild.id}'.")
+                logging.info(f"AUTO_BLACKLIST_CHANNEL: Successfully processed punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {reason}")
 
             except Exception as e:
                 logging.error(f"AUTO_BLACKLIST_CHANNEL: Failed to process punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {e}")
@@ -2406,13 +2477,19 @@ async def summon_badge_panel(interaction: discord.Interaction, introduction: typ
 @app_commands.describe(
     role_to_grant="用户完成所有道馆后将获得的身份组。",
     introduction="[可选] 自定义面板的介绍文字。",
-    button_label="[可选] 自定义按钮上显示的文字。"
+    button_label="[可选] 自定义按钮上显示的文字。",
+    enable_blacklist="是否对通过此面板领取奖励的用户启用黑名单检查。"
 )
-async def gym_graduation_panel(interaction: discord.Interaction, role_to_grant: discord.Role, introduction: typing.Optional[str] = None, button_label: typing.Optional[str] = "领取毕业奖励"):
+@app_commands.choices(enable_blacklist=[
+    app_commands.Choice(name="是 (默认)", value="yes"),
+    app_commands.Choice(name="否", value="no"),
+])
+async def gym_graduation_panel(interaction: discord.Interaction, role_to_grant: discord.Role, introduction: typing.Optional[str] = None, button_label: typing.Optional[str] = "领取毕业奖励", enable_blacklist: typing.Optional[str] = 'yes'):
     await interaction.response.defer(ephemeral=True, thinking=True)
     
     guild_id = str(interaction.guild.id)
     role_add_id = str(role_to_grant.id)
+    blacklist_enabled = True if enable_blacklist == 'yes' else False
 
     try:
         # Default description if none is provided
@@ -2441,14 +2518,18 @@ async def gym_graduation_panel(interaction: discord.Interaction, role_to_grant: 
         # Save the configuration for this specific panel to the database
         async with aiosqlite.connect(db_path) as conn:
             await conn.execute('''
-                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id)
-                VALUES (?, ?, ?, ?)
-            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id))
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, blacklist_enabled)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, blacklist_enabled))
             await conn.commit()
 
+        confirm_messages = [f"✅ 毕业面板已成功创建于 {interaction.channel.mention}！"]
+        status_text = "启用" if blacklist_enabled else "禁用"
+        confirm_messages.append(f"- **奖励身份组**: {role_to_grant.mention}")
+        confirm_messages.append(f"- **黑名单检查**: {status_text}")
+
         await interaction.followup.send(
-            f"✅ 毕业面板已成功创建于 {interaction.channel.mention}！\n"
-            f"- **奖励身份组**: {role_to_grant.mention}",
+            "\n".join(confirm_messages),
             ephemeral=True
         )
 
