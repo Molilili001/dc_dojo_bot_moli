@@ -839,11 +839,17 @@ class ChallengeSession:
         self.panel_message_id = panel_message_id # The ID of the panel message this challenge originated from
         self.is_ultimate = gym_info.get('is_ultimate', False)
         self.start_time = time.time() # Start timer as soon as session is created
+        self.question_start_time = None # 单题开始时间，将在显示第一题时设置
+        self.question_timeout = 180 # 单题超时时间（秒）
         self.current_question_index = 0
         self.mistakes_made = 0
         self.wrong_answers = [] # To store tuples of (question, user_answer)
         self.allowed_mistakes = self.gym_info.get('allowed_mistakes', 0)
-        self.randomize_options = True # Force randomize for all challenges
+        self.randomize_options = self.gym_info.get('randomize_options', True) # 使用道馆设置，如果未提供则默认为 True
+        
+        # --- 新增属性：超时任务管理 ---
+        self.interaction_message = None # 用于存储问题消息，以便超时后编辑
+        self.timeout_task = None # 用于存储超时任务
         
         # --- Random Question Logic ---
         self.questions_for_session = self.gym_info.get('questions', [])
@@ -860,6 +866,23 @@ class ChallengeSession:
             return self.questions_for_session[self.current_question_index]
         return None
 
+    def is_question_timed_out(self):
+        """检查当前题目是否超时"""
+        if self.question_start_time is None:
+            return False  # 如果计时器未启动，则不会超时
+        return time.time() - self.question_start_time > self.question_timeout
+
+    def reset_question_timer(self):
+        """重置单题计时器"""
+        self.question_start_time = time.time()
+
+    def get_remaining_time(self):
+        """获取当前题目的剩余时间（秒）"""
+        if self.question_start_time is None:
+            return self.question_timeout  # 如果计时器未启动，返回完整时间
+        remaining = self.question_timeout - (time.time() - self.question_start_time)
+        return max(0, int(remaining))
+
 # --- Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
@@ -875,6 +898,59 @@ bot = commands.Bot(
     member_cache_flags=discord.MemberCacheFlags.none()  # Key: Do not cache members.
 )
 bot.start_time = time.time() # Store bot start time
+
+# --- 旧的轮询超时任务已被移除，替换为更高效的独立超时任务 ---
+# 每个问题都有自己的超时任务，在display_question中创建和管理
+# 这样可以实现精确的3分钟超时，并提供主动的UI更新
+
+async def handle_single_question_timeout(session: ChallengeSession):
+    """
+    一个独立的任务，用于处理单个问题的超时。
+    这个函数作为"定时炸弹"，在3分钟后自动触发超时处理。
+    """
+    try:
+        await asyncio.sleep(session.question_timeout) # 等待3分钟
+
+        # 3分钟后，获取用户锁以安全地检查和修改会话状态
+        async with user_challenge_locks[session.user_id]:
+            # 检查会话是否还存在且是同一个问题
+            # 这是为了防止用户刚好在超时瞬间回答了问题，或者开始了新的挑战
+            if session.user_id not in active_challenges or active_challenges[session.user_id] is not session:
+                return
+
+            logging.info(f"TIMEOUT_HANDLER: User '{session.user_id}' in gym '{session.gym_id}' timed out on question {session.current_question_index + 1}.")
+            
+            # 清理会话
+            if session.user_id in active_challenges:
+                del active_challenges[user_id]
+            
+            # 创建超时提示 Embed
+            timeout_embed = discord.Embed(
+                title="⌛ 答题超时",
+                description=f"你在问题 {session.current_question_index + 1} 上花费的时间超过了3分钟，本次挑战失败。",
+                color=discord.Color.red()
+            )
+            
+            # 尝试编辑原始消息，禁用所有组件
+            if session.interaction_message:
+                try:
+                    # 获取当前消息的view并禁用所有组件
+                    view = discord.ui.View.from_message(session.interaction_message)
+                    if view:
+                        for item in view.children:
+                            item.disabled = True
+                        await session.interaction_message.edit(embed=timeout_embed, view=view)
+                    else:
+                        await session.interaction_message.edit(embed=timeout_embed, view=None)
+                except Exception as e:
+                    logging.error(f"Error editing timeout message for user {session.user_id}: {e}")
+                    # 如果无法编辑消息，至少记录日志
+
+    except asyncio.CancelledError:
+        # 任务被取消是正常行为（例如用户回答了问题），直接忽略
+        return
+    except Exception as e:
+        logging.error(f"Error in handle_single_question_timeout for user {session.user_id}: {e}", exc_info=True)
 
 # --- Views ---
 class GymSelect(discord.ui.Select):
@@ -962,7 +1038,7 @@ class GymSelect(discord.ui.Select):
 
 class GymSelectView(discord.ui.View):
     def __init__(self, guild_gyms: list, user_progress: dict, panel_message_id: int):
-        super().__init__(timeout=180)
+        super().__init__()  # 移除timeout，道馆选择不应该有时间限制
         self.add_item(GymSelect(guild_gyms, user_progress, panel_message_id))
 
 class MainView(discord.ui.View):
@@ -1293,44 +1369,20 @@ def _create_wrong_answers_embed_fields(wrong_answers: list, show_correct_answer:
 class QuestionView(discord.ui.View):
     """A view that handles question display and timeouts."""
     def __init__(self, session: 'ChallengeSession', interaction: discord.Interaction, **kwargs):
-        super().__init__(**kwargs)
+        # 明确设置timeout=None，防止视图自身过期，完全交由我们的每题超时逻辑控制
+        super().__init__(timeout=None, **kwargs)
         self.session = session
         self.interaction = interaction
 
-    async def on_timeout(self):
-        user_id = str(self.session.user_id)
-        # Only remove the session if it's the one this view was created for.
-        # This prevents a race condition where a new challenge starts before the old view times out.
-        if user_id in active_challenges and active_challenges[user_id] == self.session:
-            del active_challenges[user_id]
-            logging.info(f"CHALLENGE: Session TIMED OUT for user '{user_id}' in gym '{self.session.gym_id}'.")
-        
-        # Disable all buttons on the message
-        for item in self.children:
-            item.disabled = True
-        
-        try:
-            timeout_embed = discord.Embed(
-                title="⌛ 挑战超时",
-                description="本次挑战已超时，请重新开始。",
-                color=discord.Color.orange()
-            )
-            # Edit the original message to show the timeout state
-            await self.interaction.edit_original_response(embed=timeout_embed, view=self)
-        except discord.NotFound:
-            # The message was likely deleted, which is fine.
-            pass
-        except Exception as e:
-            # Log any other errors that might occur.
-            logging.error(f"Error during QuestionView on_timeout: {e}", exc_info=True)
+    # 移除无用的check_question_timeout方法，因为它在整个代码中从未被调用
 
 async def display_question(interaction: discord.Interaction, session: ChallengeSession, from_modal: bool = False):
     # This function builds and sends/edits the message for the current question or final result.
  
     # --- Part 1: Build the Embed and View ---
     embed = None
-    # Use the new QuestionView to handle timeouts gracefully
-    view = QuestionView(session=session, interaction=interaction, timeout=180)
+    # Use the new QuestionView to handle timeouts gracefully - 移除timeout参数
+    view = QuestionView(session=session, interaction=interaction)
     is_final_result = False
  
     # Check if all questions have been answered
@@ -1437,10 +1489,15 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                     break # Stop if limits are approached
     else:
         # --- Display Next Question ---
+        # 显示新题目时重置计时器
+        session.reset_question_timer()
+        
         question = session.get_current_question()
         q_num = session.current_question_index + 1
         total_q = len(session.questions_for_session)
-        embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=question['text'], color=discord.Color.orange())
+        
+        
+        embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=f"{question['text']}", color=discord.Color.orange())
         
         if question['type'] == 'multiple_choice':
             options = question['options']
@@ -1465,25 +1522,53 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                 view.add_item(QuestionAnswerButton(label=letter, correct_answer=question['correct_answer'], value=option_text))
 
         elif question['type'] == 'true_false':
+            embed.description = question['text']
             view.add_item(QuestionAnswerButton('正确', question['correct_answer']))
             view.add_item(QuestionAnswerButton('错误', question['correct_answer']))
         elif question['type'] == 'fill_in_blank':
+            embed.description = question['text']
             view.add_item(FillInBlankButton())
         view.add_item(CancelChallengeButton())
 
     # --- Part 2: Send or Edit the Message ---
     final_view = None if is_final_result else view
     
+    # --- 新增：在处理新问题前，取消上一个问题的超时任务 ---
+    if session.timeout_task:
+        session.timeout_task.cancel()
+        session.timeout_task = None
+    
     if from_modal:
         # The interaction comes from a modal submission that has been deferred.
         # We must edit the original response to the interaction.
         await interaction.edit_original_response(embed=embed, view=final_view)
+        # 存储消息引用以便超时后编辑
+        try:
+            session.interaction_message = await interaction.original_response()
+        except:
+            session.interaction_message = None
     elif interaction.response.is_done():
         # The interaction has already been responded to (e.g., deferred).
         await interaction.edit_original_response(embed=embed, view=final_view)
+        # 存储消息引用以便超时后编辑
+        try:
+            session.interaction_message = await interaction.original_response()
+        except:
+            session.interaction_message = None
     else:
         # This is a direct response to a component interaction (e.g., a button click).
         await interaction.response.edit_message(embed=embed, view=final_view)
+        # 存储消息引用以便超时后编辑
+        try:
+            session.interaction_message = await interaction.original_response()
+        except:
+            session.interaction_message = None
+    
+    # --- 新增：如果不是最终结果，则为当前问题启动超时任务 ---
+    if not is_final_result:
+        session.timeout_task = bot.loop.create_task(
+            handle_single_question_timeout(session)
+        )
 
 class QuestionAnswerButton(discord.ui.Button):
     # The `value` parameter holds the actual answer content to check.
@@ -1502,6 +1587,28 @@ class QuestionAnswerButton(discord.ui.Button):
             session = active_challenges.get(user_id)
             if not session:
                 await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
+                return
+            
+            # 检查单题是否超时（作为备用检查，主要超时处理由独立任务完成）
+            if session.is_question_timed_out():
+                # 如果超时任务还没有处理，这里作为备用处理
+                if user_id in active_challenges:
+                    del active_challenges[user_id]
+                
+                # 禁用所有按钮
+                for item in self.view.children:
+                    item.disabled = True
+                
+                try:
+                    timeout_embed = discord.Embed(
+                        title="⌛ 答题超时",
+                        description="当前题目已超时（3分钟），挑战失败。",
+                        color=discord.Color.red()
+                    )
+                    await interaction.edit_original_response(embed=timeout_embed, view=self.view)
+                except Exception as e:
+                    logging.error(f"Error during button timeout handling: {e}", exc_info=True)
+                    await interaction.edit_original_response(content="⌛ 答题超时（3分钟），挑战失败。", view=None, embed=None)
                 return
             
             # Check the button's actual value against the correct answer
@@ -1547,6 +1654,20 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
             if not session:
                 # If the session has timed out, edit the deferred response to inform the user.
                 await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
+                return
+
+            # 检查单题是否超时（作为备用检查，主要超时处理由独立任务完成）
+            if session.is_question_timed_out():
+                if user_id in active_challenges:
+                    del active_challenges[user_id]
+                
+                # 创建一个超时提示的embed
+                timeout_embed = discord.Embed(
+                    title="⌛ 答题超时",
+                    description="当前题目已超时（3分钟），挑战失败。",
+                    color=discord.Color.red()
+                )
+                await interaction.edit_original_response(embed=timeout_embed, view=None)
                 return
 
             user_answer = self.answer_input.value.strip()
@@ -2472,7 +2593,7 @@ async def summon_badge_panel(interaction: discord.Interaction, introduction: typ
         logging.error(f"Error in /道馆 徽章墙面板 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
-@gym_management_group.command(name="毕业面板", description="召唤一个用于领取“全部通关”奖励的面板 (馆主、管理员、开发者)。")
+@gym_management_group.command(name="毕业面板", description='召唤一个用于领取"全部通关"奖励的面板 (馆主、管理员、开发者)。')
 @has_gym_management_permission("毕业面板")
 @app_commands.describe(
     role_to_grant="用户完成所有道馆后将获得的身份组。",
@@ -2922,7 +3043,7 @@ async def reset_progress(interaction: discord.Interaction, user: discord.Member,
     # --- Validation ---
     if scope == "specific_gym":
         if not gym_id:
-            await interaction.followup.send("❌ 操作失败：选择“仅特定道馆进度”时，必须提供道馆ID。", ephemeral=True)
+            await interaction.followup.send('❌ 操作失败：选择"仅特定道馆进度"时，必须提供道馆ID。', ephemeral=True)
             return
         # Check if the gym exists
         if not await get_single_gym(guild_id, gym_id):
@@ -3449,3 +3570,4 @@ bot.tree.add_command(gym_management_group)
 # --- Main Execution ---
 if __name__ == "__main__":
     bot.run(config['BOT_TOKEN'])
+
