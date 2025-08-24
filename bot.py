@@ -124,6 +124,15 @@ async def setup_database():
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
                 raise # Re-raise other errors
+        # Safely add new columns for multiple roles
+        try:
+            await conn.execute("ALTER TABLE challenge_panels ADD COLUMN role_to_add_ids TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e): raise
+        try:
+            await conn.execute("ALTER TABLE challenge_panels ADD COLUMN role_to_remove_ids TEXT;")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e): raise
         # Gym master (gym owner) permissions table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gym_masters (
@@ -136,21 +145,21 @@ async def setup_database():
         ''')
         # Server-specific gyms table
         await conn.execute('''
-            CREATE TABLE IF NOT EXISTS gyms (
-                gym_id TEXT,
-                guild_id TEXT,
-                name TEXT,
-                description TEXT,
-                tutorial TEXT, -- Stored as JSON string
-                questions TEXT, -- Stored as JSON string
-                questions_to_ask INTEGER, -- Number of questions to randomly select
-                allowed_mistakes INTEGER, -- Number of allowed mistakes before failing
-                badge_image_url TEXT, -- URL for the badge image
-                badge_description TEXT, -- Custom description for the badge
-                is_enabled BOOLEAN DEFAULT TRUE,
-                PRIMARY KEY (guild_id, gym_id)
-            )
-        ''')
+              CREATE TABLE IF NOT EXISTS gyms (
+                  gym_id TEXT,
+                  guild_id TEXT,
+                  name TEXT,
+                  description TEXT,
+                  tutorial TEXT, -- Stored as JSON string
+                  questions TEXT, -- Stored as JSON string
+                  questions_to_ask INTEGER, -- Number of questions to randomly select
+                  allowed_mistakes INTEGER, -- Number of allowed mistakes before failing
+                  badge_image_url TEXT, -- URL for the badge image
+                  badge_description TEXT, -- Custom description for the badge
+                  is_enabled BOOLEAN DEFAULT TRUE,
+                  PRIMARY KEY (guild_id, gym_id)
+              )
+          ''')
         # Safely add the new column if it doesn't exist
         try:
             await conn.execute("ALTER TABLE gyms ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE;")
@@ -289,35 +298,60 @@ async def setup_database():
         # are defaulted to having the check enabled. This runs on startup.
         await conn.execute("UPDATE challenge_panels SET blacklist_enabled = 1 WHERE blacklist_enabled IS NULL;")
 
+        # --- Data Migration for multiple roles ---
+        # This block will run on startup to migrate old single-role IDs to the new JSON array format.
+        # It's designed to be safe to run multiple times.
+        conn.row_factory = aiosqlite.Row
+        panels_to_migrate = []
+        async with conn.execute("SELECT message_id, role_to_add_id, role_to_remove_id, role_to_add_ids, role_to_remove_ids FROM challenge_panels") as cursor:
+            panels_to_migrate = await cursor.fetchall()
+
+        if panels_to_migrate:
+            for panel in panels_to_migrate:
+                # Migrate role_to_add_id
+                if panel['role_to_add_id'] and not panel['role_to_add_ids']:
+                    new_json = json.dumps([panel['role_to_add_id']])
+                    await conn.execute("UPDATE challenge_panels SET role_to_add_ids = ? WHERE message_id = ?", (new_json, panel['message_id']))
+                    logging.info(f"DB_MIGRATE: Migrated role_to_add_id for panel {panel['message_id']}.")
+
+                # Migrate role_to_remove_id
+                if panel['role_to_remove_id'] and not panel['role_to_remove_ids']:
+                    new_json = json.dumps([panel['role_to_remove_id']])
+                    await conn.execute("UPDATE challenge_panels SET role_to_remove_ids = ? WHERE message_id = ?", (new_json, panel['message_id']))
+                    logging.info(f"DB_MIGRATE: Migrated role_to_remove_id for panel {panel['message_id']}.")
+        
+        # Reset row_factory to default
+        conn.row_factory = None
+
         await conn.commit()
 
 # --- Gym Data Functions ---
 async def get_guild_gyms(guild_id: str) -> list:
-    """Gets all gyms for a specific guild."""
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled, randomize_options FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
-            rows = await cursor.fetchall()
+   """Gets all gyms for a specific guild."""
+   async with aiosqlite.connect(db_path) as conn:
+       conn.row_factory = aiosqlite.Row
+       async with conn.execute("SELECT gym_id, name, description, tutorial, questions, questions_to_ask, allowed_mistakes, badge_image_url, badge_description, is_enabled, randomize_options FROM gyms WHERE guild_id = ?", (guild_id,)) as cursor:
+           rows = await cursor.fetchall()
     
-    gyms_list = []
-    for row in rows:
-        gym_data = {
-            "id": row["gym_id"],
-            "name": row["name"],
-            "description": row["description"],
-            "tutorial": json.loads(row["tutorial"]),
-            "questions": json.loads(row["questions"]),
-            "is_enabled": row["is_enabled"],
-            "badge_image_url": row["badge_image_url"],
-            "badge_description": row["badge_description"],
-            "randomize_options": row["randomize_options"]
-        }
-        if row["questions_to_ask"]:
-            gym_data["questions_to_ask"] = row["questions_to_ask"]
-        if row["allowed_mistakes"] is not None:
-            gym_data["allowed_mistakes"] = row["allowed_mistakes"]
-        gyms_list.append(gym_data)
-    return gyms_list
+   gyms_list = []
+   for row in rows:
+       gym_data = {
+           "id": row["gym_id"],
+           "name": row["name"],
+           "description": row["description"],
+           "tutorial": json.loads(row["tutorial"]),
+           "questions": json.loads(row["questions"]),
+           "is_enabled": row["is_enabled"],
+           "badge_image_url": row["badge_image_url"],
+           "badge_description": row["badge_description"],
+           "randomize_options": row["randomize_options"]
+       }
+       if row["questions_to_ask"]:
+           gym_data["questions_to_ask"] = row["questions_to_ask"]
+       if row["allowed_mistakes"] is not None:
+           gym_data["allowed_mistakes"] = row["allowed_mistakes"]
+       gyms_list.append(gym_data)
+   return gyms_list
 
 async def get_single_gym(guild_id: str, gym_id: str) -> dict:
     """Gets a single gym's data for a guild."""
@@ -355,7 +389,7 @@ async def create_gym(guild_id: str, gym_data: dict, conn: aiosqlite.Connection):
         json.dumps(gym_data['tutorial']), json.dumps(gym_data['questions']),
         gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
         gym_data.get('badge_image_url'), gym_data.get('badge_description'),
-        gym_data.get('randomize_options', False)
+        gym_data.get('randomize_options', True)
     ))
 
 async def update_gym(guild_id: str, gym_id: str, gym_data: dict, conn: aiosqlite.Connection) -> int:
@@ -367,7 +401,7 @@ async def update_gym(guild_id: str, gym_id: str, gym_data: dict, conn: aiosqlite
         gym_data['name'], gym_data['description'], json.dumps(gym_data['tutorial']),
         json.dumps(gym_data['questions']), gym_data.get('questions_to_ask'), gym_data.get('allowed_mistakes'),
         gym_data.get('badge_image_url'), gym_data.get('badge_description'),
-        gym_data.get('randomize_options', False),
+        gym_data.get('randomize_options', True),
         guild_id, gym_id
     ))
     return cursor.rowcount
@@ -448,6 +482,7 @@ async def reset_user_failures_for_gym(user_id: str, guild_id: str, gym_id: str):
                 "DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ? AND gym_id = ?",
                 (user_id, guild_id, gym_id)
             )
+            await conn.commit()
 
 # --- Ultimate Gym Leaderboard Functions ---
 async def get_ultimate_leaderboard(guild_id: str, limit: int = 100) -> list:
@@ -543,18 +578,17 @@ async def fully_reset_user_progress(user_id: str, guild_id: str):
         async with aiosqlite.connect(db_path) as conn:
             # Reset gym completions
             p_cursor = await conn.execute("DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            p_count = p_cursor.rowcount
             # Reset failure records
             f_cursor = await conn.execute("DELETE FROM challenge_failures WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            f_count = f_cursor.rowcount
             # Reset claimed rewards
             r_cursor = await conn.execute("DELETE FROM claimed_role_rewards WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+            r_count = r_cursor.rowcount
             # Reset ultimate leaderboard score
             u_cursor = await conn.execute("DELETE FROM ultimate_gym_leaderboard WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
-            await conn.commit()
-            
-            p_count = p_cursor.rowcount
-            f_count = f_cursor.rowcount
-            r_count = r_cursor.rowcount
             u_count = u_cursor.rowcount
+            await conn.commit()
             
             logging.info(
                 f"PROGRESS_RESET: Fully reset user '{user_id}' in guild '{guild_id}'. "
@@ -839,17 +873,11 @@ class ChallengeSession:
         self.panel_message_id = panel_message_id # The ID of the panel message this challenge originated from
         self.is_ultimate = gym_info.get('is_ultimate', False)
         self.start_time = time.time() # Start timer as soon as session is created
-        self.question_start_time = None # 单题开始时间，将在显示第一题时设置
-        self.question_timeout = 180 # 单题超时时间（秒）
         self.current_question_index = 0
         self.mistakes_made = 0
         self.wrong_answers = [] # To store tuples of (question, user_answer)
         self.allowed_mistakes = self.gym_info.get('allowed_mistakes', 0)
-        self.randomize_options = self.gym_info.get('randomize_options', True) # 使用道馆设置，如果未提供则默认为 True
-        
-        # --- 新增属性：超时任务管理 ---
-        self.interaction_message = None # 用于存储问题消息，以便超时后编辑
-        self.timeout_task = None # 用于存储超时任务
+        self.randomize_options = self.gym_info.get('randomize_options', True)
         
         # --- Random Question Logic ---
         self.questions_for_session = self.gym_info.get('questions', [])
@@ -866,23 +894,6 @@ class ChallengeSession:
             return self.questions_for_session[self.current_question_index]
         return None
 
-    def is_question_timed_out(self):
-        """检查当前题目是否超时"""
-        if self.question_start_time is None:
-            return False  # 如果计时器未启动，则不会超时
-        return time.time() - self.question_start_time > self.question_timeout
-
-    def reset_question_timer(self):
-        """重置单题计时器"""
-        self.question_start_time = time.time()
-
-    def get_remaining_time(self):
-        """获取当前题目的剩余时间（秒）"""
-        if self.question_start_time is None:
-            return self.question_timeout  # 如果计时器未启动，返回完整时间
-        remaining = self.question_timeout - (time.time() - self.question_start_time)
-        return max(0, int(remaining))
-
 # --- Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
@@ -898,59 +909,6 @@ bot = commands.Bot(
     member_cache_flags=discord.MemberCacheFlags.none()  # Key: Do not cache members.
 )
 bot.start_time = time.time() # Store bot start time
-
-# --- 旧的轮询超时任务已被移除，替换为更高效的独立超时任务 ---
-# 每个问题都有自己的超时任务，在display_question中创建和管理
-# 这样可以实现精确的3分钟超时，并提供主动的UI更新
-
-async def handle_single_question_timeout(session: ChallengeSession):
-    """
-    一个独立的任务，用于处理单个问题的超时。
-    这个函数作为"定时炸弹"，在3分钟后自动触发超时处理。
-    """
-    try:
-        await asyncio.sleep(session.question_timeout) # 等待3分钟
-
-        # 3分钟后，获取用户锁以安全地检查和修改会话状态
-        async with user_challenge_locks[session.user_id]:
-            # 检查会话是否还存在且是同一个问题
-            # 这是为了防止用户刚好在超时瞬间回答了问题，或者开始了新的挑战
-            if session.user_id not in active_challenges or active_challenges[session.user_id] is not session:
-                return
-
-            logging.info(f"TIMEOUT_HANDLER: User '{session.user_id}' in gym '{session.gym_id}' timed out on question {session.current_question_index + 1}.")
-            
-            # 清理会话
-            if session.user_id in active_challenges:
-                del active_challenges[user_id]
-            
-            # 创建超时提示 Embed
-            timeout_embed = discord.Embed(
-                title="⌛ 答题超时",
-                description=f"你在问题 {session.current_question_index + 1} 上花费的时间超过了3分钟，本次挑战失败。",
-                color=discord.Color.red()
-            )
-            
-            # 尝试编辑原始消息，禁用所有组件
-            if session.interaction_message:
-                try:
-                    # 获取当前消息的view并禁用所有组件
-                    view = discord.ui.View.from_message(session.interaction_message)
-                    if view:
-                        for item in view.children:
-                            item.disabled = True
-                        await session.interaction_message.edit(embed=timeout_embed, view=view)
-                    else:
-                        await session.interaction_message.edit(embed=timeout_embed, view=None)
-                except Exception as e:
-                    logging.error(f"Error editing timeout message for user {session.user_id}: {e}")
-                    # 如果无法编辑消息，至少记录日志
-
-    except asyncio.CancelledError:
-        # 任务被取消是正常行为（例如用户回答了问题），直接忽略
-        return
-    except Exception as e:
-        logging.error(f"Error in handle_single_question_timeout for user {session.user_id}: {e}", exc_info=True)
 
 # --- Views ---
 class GymSelect(discord.ui.Select):
@@ -1038,7 +996,7 @@ class GymSelect(discord.ui.Select):
 
 class GymSelectView(discord.ui.View):
     def __init__(self, guild_gyms: list, user_progress: dict, panel_message_id: int):
-        super().__init__()  # 移除timeout，道馆选择不应该有时间限制
+        super().__init__(timeout=180)
         self.add_item(GymSelect(guild_gyms, user_progress, panel_message_id))
 
 class MainView(discord.ui.View):
@@ -1255,14 +1213,16 @@ class GraduationPanelView(discord.ui.View):
         # 1. Get the role associated with this specific panel
         async with aiosqlite.connect(db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT role_to_add_id, blacklist_enabled FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+            async with conn.execute("SELECT role_to_add_ids, blacklist_enabled FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
                 panel_config = await cursor.fetchone()
         
-        if not panel_config or not panel_config['role_to_add_id']:
-            logging.error(f"GRADUATION_PANEL: No role_to_add_id configured for panel {panel_message_id} in guild {guild_id}.")
+        role_to_add_ids_json = panel_config['role_to_add_ids'] if panel_config else None
+        if not role_to_add_ids_json:
+            logging.error(f"GRADUATION_PANEL: No role_to_add_ids configured for panel {panel_message_id} in guild {guild_id}.")
             return await interaction.followup.send("❌ 此面板配置错误，请联系管理员。", ephemeral=True)
-        
-        role_to_add_id = panel_config['role_to_add_id']
+
+        # Graduation panel only uses the *first* role in the list
+        role_to_add_id = json.loads(role_to_add_ids_json)[0]
         role_to_add = interaction.guild.get_role(int(role_to_add_id))
 
         if not role_to_add:
@@ -1369,20 +1329,49 @@ def _create_wrong_answers_embed_fields(wrong_answers: list, show_correct_answer:
 class QuestionView(discord.ui.View):
     """A view that handles question display and timeouts."""
     def __init__(self, session: 'ChallengeSession', interaction: discord.Interaction, **kwargs):
-        # 明确设置timeout=None，防止视图自身过期，完全交由我们的每题超时逻辑控制
-        super().__init__(timeout=None, **kwargs)
+        super().__init__(**kwargs)
         self.session = session
         self.interaction = interaction
 
-    # 移除无用的check_question_timeout方法，因为它在整个代码中从未被调用
+    async def on_timeout(self):
+        user_id = str(self.session.user_id)
+        # Only remove the session if it's the one this view was created for.
+        # This prevents a race condition where a new challenge starts before the old view times out.
+        if user_id in active_challenges and active_challenges[user_id] == self.session:
+            # --- CHALLENGE FAILURE on Timeout ---
+            # Only apply failure penalties to standard gyms, consistent with other failure paths.
+            if not self.session.is_ultimate:
+                await increment_user_failure(user_id, str(self.session.guild_id), self.session.gym_id)
+            
+            del active_challenges[user_id]
+            logging.info(f"CHALLENGE: Session TIMED OUT for user '{user_id}' in gym '{self.session.gym_id}'. Failure was recorded.")
+        
+        # Disable all buttons on the message
+        for item in self.children:
+            item.disabled = True
+        
+        try:
+            timeout_embed = discord.Embed(
+                title="⌛ 挑战超时",
+                description="本次挑战已超时，请重新开始。",
+                color=discord.Color.orange()
+            )
+            # Edit the original message to show the timeout state
+            await self.interaction.edit_original_response(embed=timeout_embed, view=self)
+        except discord.NotFound:
+            # The message was likely deleted, which is fine.
+            pass
+        except Exception as e:
+            # Log any other errors that might occur.
+            logging.error(f"Error during QuestionView on_timeout: {e}", exc_info=True)
 
 async def display_question(interaction: discord.Interaction, session: ChallengeSession, from_modal: bool = False):
     # This function builds and sends/edits the message for the current question or final result.
  
     # --- Part 1: Build the Embed and View ---
     embed = None
-    # Use the new QuestionView to handle timeouts gracefully - 移除timeout参数
-    view = QuestionView(session=session, interaction=interaction)
+    # Use the new QuestionView to handle timeouts gracefully
+    view = QuestionView(session=session, interaction=interaction, timeout=180)
     is_final_result = False
  
     # Check if all questions have been answered
@@ -1489,15 +1478,10 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                     break # Stop if limits are approached
     else:
         # --- Display Next Question ---
-        # 显示新题目时重置计时器
-        session.reset_question_timer()
-        
         question = session.get_current_question()
         q_num = session.current_question_index + 1
         total_q = len(session.questions_for_session)
-        
-        
-        embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=f"{question['text']}", color=discord.Color.orange())
+        embed = discord.Embed(title=f"{session.gym_info['name']} 问题 {q_num}/{total_q}", description=question['text'], color=discord.Color.orange())
         
         if question['type'] == 'multiple_choice':
             options = question['options']
@@ -1522,53 +1506,25 @@ async def display_question(interaction: discord.Interaction, session: ChallengeS
                 view.add_item(QuestionAnswerButton(label=letter, correct_answer=question['correct_answer'], value=option_text))
 
         elif question['type'] == 'true_false':
-            embed.description = question['text']
             view.add_item(QuestionAnswerButton('正确', question['correct_answer']))
             view.add_item(QuestionAnswerButton('错误', question['correct_answer']))
         elif question['type'] == 'fill_in_blank':
-            embed.description = question['text']
             view.add_item(FillInBlankButton())
         view.add_item(CancelChallengeButton())
 
     # --- Part 2: Send or Edit the Message ---
     final_view = None if is_final_result else view
     
-    # --- 新增：在处理新问题前，取消上一个问题的超时任务 ---
-    if session.timeout_task:
-        session.timeout_task.cancel()
-        session.timeout_task = None
-    
     if from_modal:
         # The interaction comes from a modal submission that has been deferred.
         # We must edit the original response to the interaction.
         await interaction.edit_original_response(embed=embed, view=final_view)
-        # 存储消息引用以便超时后编辑
-        try:
-            session.interaction_message = await interaction.original_response()
-        except:
-            session.interaction_message = None
     elif interaction.response.is_done():
         # The interaction has already been responded to (e.g., deferred).
         await interaction.edit_original_response(embed=embed, view=final_view)
-        # 存储消息引用以便超时后编辑
-        try:
-            session.interaction_message = await interaction.original_response()
-        except:
-            session.interaction_message = None
     else:
         # This is a direct response to a component interaction (e.g., a button click).
         await interaction.response.edit_message(embed=embed, view=final_view)
-        # 存储消息引用以便超时后编辑
-        try:
-            session.interaction_message = await interaction.original_response()
-        except:
-            session.interaction_message = None
-    
-    # --- 新增：如果不是最终结果，则为当前问题启动超时任务 ---
-    if not is_final_result:
-        session.timeout_task = bot.loop.create_task(
-            handle_single_question_timeout(session)
-        )
 
 class QuestionAnswerButton(discord.ui.Button):
     # The `value` parameter holds the actual answer content to check.
@@ -1587,28 +1543,6 @@ class QuestionAnswerButton(discord.ui.Button):
             session = active_challenges.get(user_id)
             if not session:
                 await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
-                return
-            
-            # 检查单题是否超时（作为备用检查，主要超时处理由独立任务完成）
-            if session.is_question_timed_out():
-                # 如果超时任务还没有处理，这里作为备用处理
-                if user_id in active_challenges:
-                    del active_challenges[user_id]
-                
-                # 禁用所有按钮
-                for item in self.view.children:
-                    item.disabled = True
-                
-                try:
-                    timeout_embed = discord.Embed(
-                        title="⌛ 答题超时",
-                        description="当前题目已超时（3分钟），挑战失败。",
-                        color=discord.Color.red()
-                    )
-                    await interaction.edit_original_response(embed=timeout_embed, view=self.view)
-                except Exception as e:
-                    logging.error(f"Error during button timeout handling: {e}", exc_info=True)
-                    await interaction.edit_original_response(content="⌛ 答题超时（3分钟），挑战失败。", view=None, embed=None)
                 return
             
             # Check the button's actual value against the correct answer
@@ -1654,20 +1588,6 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
             if not session:
                 # If the session has timed out, edit the deferred response to inform the user.
                 await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
-                return
-
-            # 检查单题是否超时（作为备用检查，主要超时处理由独立任务完成）
-            if session.is_question_timed_out():
-                if user_id in active_challenges:
-                    del active_challenges[user_id]
-                
-                # 创建一个超时提示的embed
-                timeout_embed = discord.Embed(
-                    title="⌛ 答题超时",
-                    description="当前题目已超时（3分钟），挑战失败。",
-                    color=discord.Color.red()
-                )
-                await interaction.edit_original_response(embed=timeout_embed, view=None)
                 return
 
             user_answer = self.answer_input.value.strip()
@@ -1951,15 +1871,15 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
     # Get the specific configuration for the panel the user interacted with
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
+        async with conn.execute("SELECT role_to_add_ids, role_to_remove_ids, associated_gyms, blacklist_enabled, completion_threshold FROM challenge_panels WHERE message_id = ?", (panel_message_id,)) as cursor:
             panel_config = await cursor.fetchone()
 
     if not panel_config:
         logging.warning(f"Could not find panel config for message_id {panel_message_id} during role check.")
         return
 
-    role_to_add_id = panel_config['role_to_add_id']
-    role_to_remove_id = panel_config['role_to_remove_id']
+    role_to_add_ids_json = panel_config['role_to_add_ids']
+    role_to_remove_ids_json = panel_config['role_to_remove_ids']
     associated_gyms = json.loads(panel_config['associated_gyms']) if panel_config['associated_gyms'] else None
     # Safely get the blacklist setting, defaulting to True if the column doesn't exist (e.g., old DB).
     blacklist_enabled_for_panel = panel_config['blacklist_enabled'] if 'blacklist_enabled' in panel_config.keys() else True
@@ -2018,31 +1938,42 @@ async def check_and_manage_completion_roles(member: discord.Member, session: Cha
         messages = []
 
         # --- Role to Add ---
-        if role_to_add_id:
-            # First, check if the user has already claimed this specific reward.
-            if await has_claimed_reward(guild_id, user_id, role_to_add_id):
-                logging.info(f"REWARD_BLOCK: User '{user_id}' in guild '{guild_id}' has already claimed role '{role_to_add_id}'. Skipping role assignment.")
-            else:
-                role_to_add = member.guild.get_role(int(role_to_add_id))
+        if role_to_add_ids_json:
+            role_to_add_ids = json.loads(role_to_add_ids_json)
+            added_roles_mentions = []
+            for role_id in role_to_add_ids:
+                # First, check if the user has already claimed this specific reward.
+                if await has_claimed_reward(guild_id, user_id, role_id):
+                    logging.info(f"REWARD_BLOCK: User '{user_id}' in guild '{guild_id}' has already claimed role '{role_id}'. Skipping role assignment.")
+                    continue
+
+                role_to_add = member.guild.get_role(int(role_id))
                 if role_to_add and role_to_add not in member.roles:
                     try:
-                        await member.add_roles(role_to_add)
+                        await member.add_roles(role_to_add, reason=f"Panel {panel_message_id} completion")
                         # IMPORTANT: Record the claim immediately after successfully adding the role.
-                        await record_reward_claim(guild_id, user_id, role_to_add_id)
-                        messages.append(f"✅ **获得了身份组**: {role_to_add.mention}")
-                        logging.info(f"REWARD_GRANT: Granted and recorded role '{role_to_add_id}' for user '{user_id}' in guild '{guild_id}'.")
+                        await record_reward_claim(guild_id, user_id, role_id)
+                        added_roles_mentions.append(role_to_add.mention)
+                        logging.info(f"REWARD_GRANT: Granted and recorded role '{role_id}' for user '{user_id}' in guild '{guild_id}'.")
                     except Exception as e:
-                        logging.error(f"Failed to add role {role_to_add_id} to {member.id} in {member.guild.name}: {e}")
+                        logging.error(f"Failed to add role {role_id} to {member.id} in {member.guild.name}: {e}")
+            if added_roles_mentions:
+                messages.append(f"✅ **获得了身份组**: {' '.join(added_roles_mentions)}")
         
         # --- Role to Remove ---
-        if role_to_remove_id:
-            role_to_remove = member.guild.get_role(int(role_to_remove_id))
-            if role_to_remove and role_to_remove in member.roles:
-                try:
-                    await member.remove_roles(role_to_remove)
-                    messages.append(f"✅ **移除了身份组**: {role_to_remove.mention}")
-                except Exception as e:
-                    logging.error(f"Failed to remove role {role_to_remove_id} from {member.id} in {member.guild.name}: {e}")
+        if role_to_remove_ids_json:
+            role_to_remove_ids = json.loads(role_to_remove_ids_json)
+            removed_roles_mentions = []
+            for role_id in role_to_remove_ids:
+                role_to_remove = member.guild.get_role(int(role_id))
+                if role_to_remove and role_to_remove in member.roles:
+                    try:
+                        await member.remove_roles(role_to_remove, reason=f"Panel {panel_message_id} completion")
+                        removed_roles_mentions.append(role_to_remove.mention)
+                    except Exception as e:
+                        logging.error(f"Failed to remove role {role_id} from {member.id} in {member.guild.name}: {e}")
+            if removed_roles_mentions:
+                messages.append(f"✅ **移除了身份组**: {' '.join(removed_roles_mentions)}")
 
         # --- Send DM Notification ---
         if messages:
@@ -2406,8 +2337,8 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
     introduction="[可选] 自定义面板的介绍文字。",
     button_label="[可选] 自定义主按钮上显示的文字。",
     enable_blacklist="[普通] 是否对通过此面板完成挑战的用户启用黑名单检查。",
-    role_to_add="[普通] 用户完成所有道馆后将获得的身份组。",
-    role_to_remove="[普通] 用户完成所有道馆后将被移除的身份组。",
+    roles_to_add="[普通] 用户满足条件后将获得的身份组 (多个ID/提及请用逗号隔开)。",
+    roles_to_remove="[普通] 用户满足条件后将被移除的身份组 (多个ID/提及请用逗号隔开)。",
     gym_ids="[普通] 逗号分隔的道馆ID列表，此面板将只包含这些道馆。",
     completion_threshold="[普通] 完成多少个道馆后触发奖励，不填则为全部。",
     prerequisite_gym_ids="[普通] 逗号分隔的前置道馆ID，需全部完成后才能挑战此面板。"
@@ -2417,8 +2348,8 @@ gym_management_group = app_commands.Group(name="道馆", description="管理本�
     introduction='介绍文字',
     button_label='按钮文字',
     enable_blacklist='启用黑名单',
-    role_to_add='奖励身份组',
-    role_to_remove='移除身份组',
+    roles_to_add='奖励身份组',
+    roles_to_remove='移除身份组',
     gym_ids='关联道馆',
     completion_threshold='通关数量',
     prerequisite_gym_ids='前置道馆'
@@ -2439,8 +2370,8 @@ async def gym_summon(
     introduction: typing.Optional[str] = None,
     button_label: typing.Optional[str] = None,
     enable_blacklist: typing.Optional[str] = 'yes',
-    role_to_add: typing.Optional[discord.Role] = None,
-    role_to_remove: typing.Optional[discord.Role] = None,
+    roles_to_add: typing.Optional[str] = None,
+    roles_to_remove: typing.Optional[str] = None,
     gym_ids: typing.Optional[str] = None,
     completion_threshold: typing.Optional[app_commands.Range[int, 1]] = None,
     prerequisite_gym_ids: typing.Optional[str] = None
@@ -2485,10 +2416,26 @@ async def gym_summon(
 
     # --- Standard Gym Panel Logic ---
     if panel_type == "standard":
-        role_add_id = str(role_to_add.id) if role_to_add else None
-        role_remove_id = str(role_to_remove.id) if role_to_remove else None
         blacklist_enabled = True if enable_blacklist == 'yes' else False
         
+        # --- Role String Parsing and Validation ---
+        add_role_ids = []
+        if roles_to_add:
+            try:
+                add_role_ids = await parse_role_mentions_or_ids(interaction.guild, roles_to_add)
+            except ValueError as e:
+                return await interaction.followup.send(f"❌ “奖励身份组”格式错误: {e}", ephemeral=True)
+
+        remove_role_ids = []
+        if roles_to_remove:
+            try:
+                remove_role_ids = await parse_role_mentions_or_ids(interaction.guild, roles_to_remove)
+            except ValueError as e:
+                return await interaction.followup.send(f"❌ “移除身份组”格式错误: {e}", ephemeral=True)
+
+        role_add_ids_json = json.dumps(add_role_ids) if add_role_ids else None
+        role_remove_ids_json = json.dumps(remove_role_ids) if remove_role_ids else None
+
         associated_gyms_list = [gid.strip() for gid in gym_ids.split(',')] if gym_ids else None
         associated_gyms_json = json.dumps(associated_gyms_list) if associated_gyms_list else None
 
@@ -2537,16 +2484,20 @@ async def gym_summon(
             
             async with aiosqlite.connect(db_path) as conn:
                 await conn.execute('''
-                    INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, role_to_remove_id, associated_gyms, blacklist_enabled, completion_threshold, prerequisite_gyms, is_ultimate_gym)
+                    INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_ids, role_to_remove_ids, associated_gyms, blacklist_enabled, completion_threshold, prerequisite_gyms, is_ultimate_gym)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
-                ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, role_remove_id, associated_gyms_json, blacklist_enabled, completion_threshold, prerequisite_gyms_json))
+                ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_ids_json, role_remove_ids_json, associated_gyms_json, blacklist_enabled, completion_threshold, prerequisite_gyms_json))
                 await conn.commit()
 
             confirm_messages = [f"✅ 普通道馆面板已成功创建于 {interaction.channel.mention}！"]
             status_text = "启用" if blacklist_enabled else "禁用"
             confirm_messages.append(f"- **黑名单检查**: {status_text}")
-            if role_to_add: confirm_messages.append(f"- **奖励身份组**: {role_to_add.mention}")
-            if role_to_remove: confirm_messages.append(f"- **移除身份组**: {role_to_remove.mention}")
+            if add_role_ids:
+                mentions = ' '.join(f'<@&{rid}>' for rid in add_role_ids)
+                confirm_messages.append(f"- **奖励身份组**: {mentions}")
+            if remove_role_ids:
+                mentions = ' '.join(f'<@&{rid}>' for rid in remove_role_ids)
+                confirm_messages.append(f"- **移除身份组**: {mentions}")
             if associated_gyms_list: confirm_messages.append(f"- **关联道馆**: `{', '.join(associated_gyms_list)}`")
             if completion_threshold: confirm_messages.append(f"- **通关数量**: {completion_threshold} 个")
             if prerequisite_gyms_list: confirm_messages.append(f"- **前置道馆**: `{', '.join(prerequisite_gyms_list)}`")
@@ -2593,7 +2544,7 @@ async def summon_badge_panel(interaction: discord.Interaction, introduction: typ
         logging.error(f"Error in /道馆 徽章墙面板 command: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
-@gym_management_group.command(name="毕业面板", description='召唤一个用于领取"全部通关"奖励的面板 (馆主、管理员、开发者)。')
+@gym_management_group.command(name="毕业面板", description="召唤一个用于领取“全部通关”奖励的面板 (馆主、管理员、开发者)。")
 @has_gym_management_permission("毕业面板")
 @app_commands.describe(
     role_to_grant="用户完成所有道馆后将获得的身份组。",
@@ -2637,11 +2588,12 @@ async def gym_graduation_panel(interaction: discord.Interaction, role_to_grant: 
         panel_message = await interaction.channel.send(embed=embed, view=view)
         
         # Save the configuration for this specific panel to the database
+        role_add_ids_json = json.dumps([role_add_id]) # Store as a JSON list with one element
         async with aiosqlite.connect(db_path) as conn:
             await conn.execute('''
-                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_id, blacklist_enabled)
+                INSERT INTO challenge_panels (message_id, guild_id, channel_id, role_to_add_ids, blacklist_enabled)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_id, blacklist_enabled))
+            ''', (str(panel_message.id), guild_id, str(interaction.channel.id), role_add_ids_json, blacklist_enabled))
             await conn.commit()
 
         confirm_messages = [f"✅ 毕业面板已成功创建于 {interaction.channel.mention}！"]
@@ -2859,6 +2811,7 @@ async def gym_delete(interaction: discord.Interaction, gym_id: str):
             await log_gym_action(guild_id, gym_id, str(interaction.user.id), 'delete', conn)
             await conn.execute("DELETE FROM user_progress WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id))
             await conn.execute("DELETE FROM challenge_failures WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) # Also clear failure records
+            await conn.execute("DELETE FROM gym_audit_log WHERE guild_id = ? AND gym_id = ?", (guild_id, gym_id)) # Also clear audit logs
             await delete_gym(guild_id, gym_id, conn)
 
             # --- Clean up associated_gyms and prerequisite_gyms in challenge_panels ---
@@ -2951,6 +2904,182 @@ async def gym_list(interaction: discord.Interaction):
     embed.description = "\n".join(description_lines)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
+@gym_management_group.command(name="列表面板", description="列出本服务器所有的挑战面板及其ID (馆主、管理员、开发者)。")
+@has_gym_management_permission("列表面板")
+async def gym_list_panels(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild_id = str(interaction.guild.id)
+
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM challenge_panels WHERE guild_id = ?", (guild_id,)) as cursor:
+            panels = await cursor.fetchall()
+
+    if not panels:
+        return await interaction.followup.send("本服务器还没有创建任何挑战面板。", ephemeral=True)
+
+    embed = discord.Embed(title=f"「{interaction.guild.name}」的挑战面板列表", color=discord.Color.blue())
+    
+    description_lines = []
+    for panel in panels:
+        channel = interaction.guild.get_channel(int(panel['channel_id']))
+        channel_mention = channel.mention if channel else f"未知频道 ({panel['channel_id']})"
+        panel_type = "究极" if panel['is_ultimate_gym'] else "普通"
+        message_id = panel['message_id']
+        
+        # Create a direct link to the message
+        message_link = f"https://discord.com/channels/{guild_id}/{panel['channel_id']}/{message_id}"
+
+        description_lines.append(
+            f"**面板ID**: `{message_id}`\n"
+            f"**频道**: {channel_mention}\n"
+            f"**类型**: {panel_type}\n"
+            f"**链接**: [点击跳转]({message_link})\n"
+            "---"
+        )
+    
+    # Handle potential description length limit
+    full_description = "\n".join(description_lines)
+    if len(full_description) > 4096:
+        full_description = full_description[:4090] + "\n..."
+
+    embed.description = full_description
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@gym_management_group.command(name="更新面板", description="更新一个已存在的普通挑战面板的设置 (馆主、管理员、开发者)。")
+@has_gym_management_permission("更新面板")
+@app_commands.describe(
+    message_id="要更新的面板的消息ID。",
+    enable_blacklist="是否启用黑名单检查 (留空则不更改)。",
+    roles_to_add="新的奖励身份组 (多个ID/提及用逗号隔开, 留空不更改, 输入'none'则清空)。",
+    roles_to_remove="新的移除身份组 (多个ID/提及用逗号隔开, 留空不更改, 输入'none'则清空)。",
+    completion_threshold="新的通关数量要求 (输入0则移除此要求，留空不更改)。"
+)
+@app_commands.rename(
+    message_id='面板消息id',
+    enable_blacklist='启用黑名单',
+    roles_to_add='奖励身份组',
+    roles_to_remove='移除身份组',
+    completion_threshold='通关数量'
+)
+@app_commands.choices(enable_blacklist=[
+    app_commands.Choice(name="是", value="yes"),
+    app_commands.Choice(name="否", value="no"),
+])
+async def gym_update_panel(
+    interaction: discord.Interaction,
+    message_id: str,
+    enable_blacklist: typing.Optional[str] = None,
+    roles_to_add: typing.Optional[str] = None,
+    roles_to_remove: typing.Optional[str] = None,
+    completion_threshold: typing.Optional[app_commands.Range[int, 0]] = None
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild_id = str(interaction.guild.id)
+
+    # --- Validation ---
+    if not message_id.isdigit():
+        return await interaction.followup.send("❌ 操作失败：提供的消息ID无效。", ephemeral=True)
+
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM challenge_panels WHERE message_id = ? AND guild_id = ?", (message_id, guild_id)) as cursor:
+            panel = await cursor.fetchone()
+
+    if not panel:
+        return await interaction.followup.send("❌ 操作失败：在本服务器找不到该ID的挑战面板。", ephemeral=True)
+
+    if panel['is_ultimate_gym']:
+        return await interaction.followup.send("❌ 操作失败：此指令不能用于更新“究极道馆”面板。", ephemeral=True)
+
+    # --- Additional Validation for completion_threshold ---
+    if completion_threshold is not None and completion_threshold > 0:
+        associated_gyms_json = panel['associated_gyms']
+        gym_pool_size = 0
+        if associated_gyms_json:
+            # Panel is associated with a specific list of gyms
+            gym_pool_size = len(json.loads(associated_gyms_json))
+        else:
+            # Panel is associated with all gyms in the server
+            all_guild_gyms = await get_guild_gyms(guild_id)
+            gym_pool_size = len(all_guild_gyms)
+        
+        if gym_pool_size == 0:
+                return await interaction.followup.send("❌ 操作失败：服务器内没有任何道馆，无法设置通关数量要求。", ephemeral=True)
+        if completion_threshold > gym_pool_size:
+            return await interaction.followup.send(f"❌ 操作失败：通关数量要求 ({completion_threshold}) 不能大于该面板关联的道馆总数 ({gym_pool_size})。", ephemeral=True)
+
+    # --- Build Update Query ---
+    updates = []
+    params = []
+    confirm_messages = [f"✅ **面板 `{message_id}` 更新成功！**"]
+
+    if enable_blacklist is not None:
+        blacklist_enabled = True if enable_blacklist == 'yes' else False
+        updates.append("blacklist_enabled = ?")
+        params.append(blacklist_enabled)
+        status_text = "启用" if blacklist_enabled else "禁用"
+        confirm_messages.append(f"- **黑名单检查** 更新为: {status_text}")
+
+    if roles_to_add is not None:
+        if roles_to_add.lower() == 'none':
+            updates.append("role_to_add_ids = ?")
+            params.append(None)
+            confirm_messages.append("- **奖励身份组** 已被清空。")
+        else:
+            try:
+                add_role_ids = await parse_role_mentions_or_ids(interaction.guild, roles_to_add)
+                updates.append("role_to_add_ids = ?")
+                params.append(json.dumps(add_role_ids))
+                mentions = ' '.join(f'<@&{rid}>' for rid in add_role_ids)
+                confirm_messages.append(f"- **奖励身份组** 更新为: {mentions}")
+            except ValueError as e:
+                return await interaction.followup.send(f"❌ “奖励身份组”格式错误: {e}", ephemeral=True)
+
+    if roles_to_remove is not None:
+        if roles_to_remove.lower() == 'none':
+            updates.append("role_to_remove_ids = ?")
+            params.append(None)
+            confirm_messages.append("- **移除身份组** 已被清空。")
+        else:
+            try:
+                remove_role_ids = await parse_role_mentions_or_ids(interaction.guild, roles_to_remove)
+                updates.append("role_to_remove_ids = ?")
+                params.append(json.dumps(remove_role_ids))
+                mentions = ' '.join(f'<@&{rid}>' for rid in remove_role_ids)
+                confirm_messages.append(f"- **移除身份组** 更新为: {mentions}")
+            except ValueError as e:
+                return await interaction.followup.send(f"❌ “移除身份组”格式错误: {e}", ephemeral=True)
+
+    if completion_threshold is not None:
+        if completion_threshold == 0:
+            updates.append("completion_threshold = ?")
+            params.append(None) # Set to NULL
+            confirm_messages.append("- **通关数量** 要求已移除。")
+        else:
+            updates.append("completion_threshold = ?")
+            params.append(completion_threshold)
+            confirm_messages.append(f"- **通关数量** 更新为: {completion_threshold} 个")
+
+    if not updates:
+        return await interaction.followup.send("ℹ️ 你没有提供任何要更新的设置。", ephemeral=True)
+
+    # --- Execute Update ---
+    query = f"UPDATE challenge_panels SET {', '.join(updates)} WHERE message_id = ?"
+    params.append(message_id)
+
+    try:
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(query, tuple(params))
+            await conn.commit()
+        
+        logging.info(f"PANEL_UPDATE: User '{interaction.user.id}' updated panel '{message_id}' in guild '{guild_id}'.")
+        await interaction.followup.send("\n".join(confirm_messages), ephemeral=True)
+
+    except Exception as e:
+        logging.error(f"Error in /道馆 更新面板 command: {e}", exc_info=True)
+        await interaction.followup.send("❌ 更新面板时发生数据库错误。", ephemeral=True)
+
 # --- Permission Management Command ---
 @gym_management_group.command(name="设置馆主", description="管理道馆指令权限 (管理员或开发者)。")
 @is_admin_or_owner()
@@ -2973,6 +3102,8 @@ async def gym_list(interaction: discord.Interaction):
         app_commands.Choice(name="更新 (/道馆 更新)", value="更新"),
         app_commands.Choice(name="后门 (/道馆 后门)", value="后门"),
         app_commands.Choice(name="列表 (/道馆 列表)", value="列表"),
+        app_commands.Choice(name="列表面板 (/道馆 列表面板)", value="列表面板"),
+        app_commands.Choice(name="更新面板 (/道馆 更新面板)", value="更新面板"),
         app_commands.Choice(name="重置进度 (/道馆 重置进度)", value="重置进度"),
         app_commands.Choice(name="解除处罚 (/道馆 解除处罚)", value="解除处罚"),
         app_commands.Choice(name="停业 (/道馆 停业)", value="停业"),
@@ -3043,7 +3174,7 @@ async def reset_progress(interaction: discord.Interaction, user: discord.Member,
     # --- Validation ---
     if scope == "specific_gym":
         if not gym_id:
-            await interaction.followup.send('❌ 操作失败：选择"仅特定道馆进度"时，必须提供道馆ID。', ephemeral=True)
+            await interaction.followup.send("❌ 操作失败：选择“仅特定道馆进度”时，必须提供道馆ID。", ephemeral=True)
             return
         # Check if the gym exists
         if not await get_single_gym(guild_id, gym_id):
@@ -3563,6 +3694,36 @@ async def say(
         await interaction.followup.send("❌ 发送消息时发生未知错误。", ephemeral=True)
 
 
+async def parse_role_mentions_or_ids(guild: discord.Guild, role_input_str: str) -> list[str]:
+    """Parses a comma-separated string of role IDs and mentions, validates them, and returns a list of unique role IDs."""
+    if not role_input_str:
+        return []
+    
+    role_ids = set()
+    # Split by comma and process each part
+    parts = [part.strip() for part in role_input_str.split(',')]
+    
+    for part in parts:
+        if not part:
+            continue
+        
+        # Check for mention format <@&ROLE_ID>
+        if part.startswith('<@&') and part.endswith('>'):
+            role_id = part[3:-1]
+        else:
+            role_id = part
+            
+        if not role_id.isdigit():
+            raise ValueError(f"输入 '{part}' 不是一个有效的身份组ID或提及。")
+        
+        # Check if the role exists in the guild
+        if guild.get_role(int(role_id)) is None:
+            raise ValueError(f"ID为 '{role_id}' 的身份组在本服务器不存在。")
+            
+        role_ids.add(role_id)
+        
+    return list(role_ids)
+
 bot.tree.add_command(gym_management_group)
 # The /my_badges command is already registered via the @bot.tree.command decorator,
 # so it does not need to be added to the group.
@@ -3570,4 +3731,3 @@ bot.tree.add_command(gym_management_group)
 # --- Main Execution ---
 if __name__ == "__main__":
     bot.run(config['BOT_TOKEN'])
-
