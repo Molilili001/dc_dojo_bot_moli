@@ -72,6 +72,7 @@ with open(config_path, 'r', encoding='utf-8') as f:
 # Create a defaultdict of asyncio.Locks to prevent race conditions on a per-user basis.
 user_db_locks = defaultdict(asyncio.Lock)
 user_challenge_locks = defaultdict(asyncio.Lock) # Lock for active challenges
+user_punishment_locks = defaultdict(asyncio.Lock) # Lock for punishment operations
 
 # --- Database Management ---
 async def setup_database():
@@ -594,6 +595,123 @@ async def fully_reset_user_progress(user_id: str, guild_id: str):
                 f"PROGRESS_RESET: Fully reset user '{user_id}' in guild '{guild_id}'. "
                 f"Removed {p_count} progress, {f_count} failures, {r_count} rewards, {u_count} leaderboard scores."
             )
+
+async def remove_graduation_reward_roles(member: discord.Member, guild_id: str):
+    """Removes ONLY graduation reward roles (from graduation panels) from a user when they are punished."""
+    user_id = str(member.id)
+    async with user_punishment_locks[user_id]:  # Prevent concurrent punishment operations
+        try:
+            logging.info(f"AUTO_PUNISHMENT: Starting graduation role removal for user '{member.id}' in guild '{guild_id}'.")
+            # Get only graduation panels (panels that require completing ALL gyms)
+            # Graduation panels are characterized by:
+            # 1. Having role_to_add_ids configured
+            # 2. No associated_gyms restriction (NULL or empty)
+            # 3. No completion_threshold (NULL)
+            # 4. Not being ultimate gym panels
+            async with aiosqlite.connect(db_path) as conn:
+                conn.row_factory = aiosqlite.Row
+                async with conn.execute(
+                    """SELECT role_to_add_ids FROM challenge_panels
+                       WHERE guild_id = ?
+                       AND role_to_add_ids IS NOT NULL
+                       AND (associated_gyms IS NULL OR associated_gyms = '' OR associated_gyms = '[]')
+                       AND (completion_threshold IS NULL OR completion_threshold = 0)
+                       AND (is_ultimate_gym IS NULL OR is_ultimate_gym = FALSE)""",
+                    (guild_id,)
+                ) as cursor:
+                    panels = await cursor.fetchall()
+            
+            logging.info(f"AUTO_PUNISHMENT: Found {len(panels)} graduation panels for guild '{guild_id}'.")
+            
+            removed_roles = []
+            removed_role_details = []
+            failed_removals = []
+            
+            for panel in panels:
+                role_to_add_ids_json = panel['role_to_add_ids']
+                if role_to_add_ids_json:
+                    role_ids = json.loads(role_to_add_ids_json)
+                    for role_id in role_ids:
+                        role = member.guild.get_role(int(role_id))
+                        if role and role in member.roles:
+                            try:
+                                await member.remove_roles(role, reason="自动同步处罚 - 移除全通关奖励身份组")
+                                removed_roles.append(role.name)
+                                removed_role_details.append({
+                                    "role_id": role_id,
+                                    "role_name": role.name
+                                })
+                                logging.info(f"AUTO_PUNISHMENT: Successfully removed graduation reward role '{role.name}' ({role_id}) from user '{member.id}' in guild '{guild_id}'.")
+                            except discord.Forbidden:
+                                failed_removals.append({"role_id": role_id, "role_name": role.name, "reason": "权限不足"})
+                                logging.error(f"AUTO_PUNISHMENT: Bot lacks permission to remove role '{role.name}' ({role_id}) from user '{member.id}' in guild '{guild_id}'.")
+                            except Exception as e:
+                                failed_removals.append({"role_id": role_id, "role_name": role.name, "reason": str(e)})
+                                logging.error(f"AUTO_PUNISHMENT: Failed to remove role '{role.name}' ({role_id}) from user '{member.id}' in guild '{guild_id}'. Error: {e}")
+            
+            # 只有在成功移除身份组时才发送JSON记录
+            if removed_roles:
+                logging.info(f"AUTO_PUNISHMENT: SUMMARY - Successfully removed {len(removed_roles)} graduation reward roles from user '{member.id}' in guild '{guild_id}': {', '.join(removed_roles)}")
+                
+                # Send JSON record to the monitoring channel
+                await send_role_removal_record(member, guild_id, removed_role_details)
+            else:
+                logging.info(f"AUTO_PUNISHMENT: SUMMARY - No graduation reward roles found to remove for user '{member.id}' in guild '{guild_id}'. This is normal if user hasn't earned graduation rewards.")
+            
+            # 记录失败的移除操作
+            if failed_removals:
+                logging.warning(f"AUTO_PUNISHMENT: Failed to remove {len(failed_removals)} roles from user '{member.id}' in guild '{guild_id}': {failed_removals}")
+                
+        except Exception as e:
+            logging.error(f"AUTO_PUNISHMENT: Failed to remove graduation reward roles for user '{member.id}' in guild '{guild_id}'. Error: {e}", exc_info=True)
+
+async def send_role_removal_record(member: discord.Member, guild_id: str, removed_role_details: list):
+    """Sends a JSON record of removed roles to the monitoring channel with retry mechanism."""
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            monitor_config = config.get("AUTO_BLACKLIST_MONITOR", {})
+            monitor_channel_id = monitor_config.get("monitor_channel_id")
+            
+            if not monitor_channel_id:
+                logging.warning("AUTO_PUNISHMENT: No monitor_channel_id configured for role removal records.")
+                return
+            
+            # Get the monitoring channel
+            channel = bot.get_channel(int(monitor_channel_id))
+            if not channel:
+                try:
+                    channel = await bot.fetch_channel(int(monitor_channel_id))
+                except (discord.NotFound, discord.Forbidden):
+                    logging.error(f"AUTO_PUNISHMENT: Cannot access monitoring channel {monitor_channel_id} for role removal records.")
+                    return
+            
+            # Create simplified JSON record - most space-efficient format
+            role_ids = [detail["role_id"] for detail in removed_role_details]
+            record = {
+                "去除身份组": ",".join(role_ids),
+                "用户id": str(member.id)
+            }
+            
+            # Send JSON record to the channel (compact format)
+            json_message = json.dumps(record, ensure_ascii=False, separators=(',', ':'))
+            await channel.send(f"```json\n{json_message}\n```")
+            
+            logging.info(f"AUTO_PUNISHMENT: Sent role removal record for user '{member.id}' to monitoring channel '{monitor_channel_id}' (attempt {attempt + 1}).")
+            return  # 成功发送，退出重试循环
+            
+        except discord.HTTPException as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"AUTO_PUNISHMENT: Failed to send role removal record (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay}s. Error: {e}")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # 指数退避
+            else:
+                logging.error(f"AUTO_PUNISHMENT: Failed to send role removal record after {max_retries} attempts. Error: {e}")
+        except Exception as e:
+            logging.error(f"AUTO_PUNISHMENT: Failed to send role removal record for user '{member.id}'. Error: {e}", exc_info=True)
+            break  # 非网络错误，不重试
 
 # --- Role Reward Claim Functions ---
 async def has_claimed_reward(guild_id: str, user_id: str, role_id: str) -> bool:
@@ -1545,6 +1663,9 @@ class QuestionAnswerButton(discord.ui.Button):
                 await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
                 return
             
+            # Stop the current view's timeout before proceeding to the next question.
+            self.view.stop()
+
             # Check the button's actual value against the correct answer
             if self.value != self.correct_answer:
                 session.mistakes_made += 1
@@ -1569,14 +1690,16 @@ class FillInBlankButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         session = active_challenges.get(str(interaction.user.id))
         if session:
-            await interaction.response.send_modal(FillInBlankModal(session.get_current_question()))
+            # Pass the current view to the modal so it can be stopped upon submission.
+            await interaction.response.send_modal(FillInBlankModal(session.get_current_question(), self.view))
 
 class FillInBlankModal(discord.ui.Modal, title="填写答案"):
     answer_input = discord.ui.TextInput(label="你的答案", style=discord.TextStyle.short, required=True)
 
-    def __init__(self, question: dict):
+    def __init__(self, question: dict, original_view: discord.ui.View):
         super().__init__()
         self.question = question
+        self.original_view = original_view
 
     async def on_submit(self, interaction: discord.Interaction):
         # Defer the interaction immediately to prevent it from timing out.
@@ -1589,6 +1712,9 @@ class FillInBlankModal(discord.ui.Modal, title="填写答案"):
                 # If the session has timed out, edit the deferred response to inform the user.
                 await interaction.edit_original_response(content="挑战已超时或已结束，请重新开始。", view=None, embed=None)
                 return
+
+            # Stop the original view's timeout now that the modal has been submitted.
+            self.original_view.stop()
 
             user_answer = self.answer_input.value.strip()
             correct_answer_field = self.question['correct_answer']
@@ -2112,7 +2238,7 @@ async def on_message(message: discord.Message):
     # Check if the message is from the target bot in the target channel
     if not target_bot_id or not monitor_channel_id:
         return
-    if str(message.author.id) != str(target_bot_id) or str(message.channel.id) != str(monitor_channel_id):
+    if int(message.author.id) != int(target_bot_id) or int(message.channel.id) != int(monitor_channel_id):
         return
 
     # --- New: Auto Blacklist via JSON in a specific channel ---
@@ -2133,25 +2259,33 @@ async def on_message(message: discord.Message):
                 except discord.NotFound:
                     logging.warning(f"AUTO_BLACKLIST_CHANNEL: User '{punished_user_id_str}' not found in guild '{guild.name}' ({guild.id}). Skipping.")
                     return # Skip if user is not in this guild
+                except (discord.HTTPException, discord.Forbidden) as e:
+                    logging.error(f"AUTO_BLACKLIST_CHANNEL: Failed to fetch user '{punished_user_id_str}' in guild '{guild.name}' ({guild.id}). Error: {e}")
+                    return # Skip if network error or permission issue
 
             reason = "因答题处罚被自动同步"
             added_by = f"自动同步自 ({message.author.name})"
             
-            try:
-                # Add to blacklist for the current guild
-                await add_to_blacklist(str(guild.id), punished_user_id_str, 'user', reason, added_by)
-                
-                # Reset all progress for the user in the current guild
-                await fully_reset_user_progress(punished_user_id_str, str(guild.id))
-                
-                logging.info(f"AUTO_BLACKLIST_CHANNEL: Successfully processed punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {reason}")
+            # 使用用户级别的锁防止并发处理同一用户
+            async with user_punishment_locks[punished_user_id_str]:
+                try:
+                    # Add to blacklist for the current guild
+                    await add_to_blacklist(str(guild.id), punished_user_id_str, 'user', reason, added_by)
+                    
+                    # Remove all graduation reward roles before resetting progress
+                    await remove_graduation_reward_roles(member, str(guild.id))
+                    
+                    # Reset all progress for the user in the current guild
+                    await fully_reset_user_progress(punished_user_id_str, str(guild.id))
+                    
+                    logging.info(f"AUTO_BLACKLIST_CHANNEL: Successfully processed punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {reason}")
 
-            except Exception as e:
-                logging.error(f"AUTO_BLACKLIST_CHANNEL: Failed to process punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {e}")
+                except Exception as e:
+                    logging.error(f"AUTO_BLACKLIST_CHANNEL: Failed to process punishment for user '{punished_user_id_str}' in guild '{guild.id}'. Reason: {e}")
 
-    except json.JSONDecodeError:
-        # This is expected if the bot posts non-JSON messages, so we can log it at a lower level or ignore it.
-        logging.debug(f"AUTO_CHANNEL_HANDLER: Received a non-JSON message from target bot {message.author.id}. Content: {message.content}")
+    except json.JSONDecodeError as e:
+        # Log JSON parsing errors at warning level to catch potential format issues
+        logging.warning(f"AUTO_CHANNEL_HANDLER: Received invalid JSON from target bot {message.author.id}. Error: {e}. Content: {message.content[:200]}...")
     except Exception as e:
         logging.error(f"AUTO_CHANNEL_HANDLER: An unexpected error occurred while processing message: {e}", exc_info=True)
 
@@ -2159,6 +2293,15 @@ async def on_message(message: discord.Message):
 async def on_ready():
     logging.info(f'Logged in as {bot.user.name}')
     await setup_database()
+    
+    # 加载回顶功能 Cog
+    try:
+        from huiding_cog import HuidingCog
+        await bot.add_cog(HuidingCog(bot))
+        logging.info('✅ 回顶功能 Cog 加载成功')
+    except Exception as e:
+        logging.error(f'❌ 回顶功能 Cog 加载失败: {e}')
+    
     try:
         synced = await bot.tree.sync()
         logging.info(f"Synced {len(synced)} command(s) globally.")
@@ -2187,31 +2330,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 # --- Permission Check Functions ---
 async def is_owner_check(interaction: discord.Interaction) -> bool:
-    return await bot.is_owner(interaction.user)
+    # First, check against the original owner from the bot application.
+    if await bot.is_owner(interaction.user):
+        return True
+    # Then, check against the new developer IDs list in the config.
+    developer_ids = config.get("DEVELOPER_IDS", [])
+    return str(interaction.user.id) in developer_ids
 
-# --- Dev Commands for Syncing ---
-@bot.tree.command(name="茉莉记忆咒", description="[仅限开发者] 强制同步所有指令。")
-@app_commands.check(is_owner_check)
-async def sync(interaction: discord.Interaction):
-    """Manually syncs the command tree."""
-    try:
-        synced = await bot.tree.sync()
-        await interaction.response.send_message(f"✅ 记忆咒施法成功！全局同步了 {len(synced)} 条指令。", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ 施法失败: {e}", ephemeral=True)
-
-@bot.tree.command(name="茉莉失忆咒", description="[仅限开发者] 清除本服务器的指令缓存。")
-@app_commands.check(is_owner_check)
-async def clear_commands(interaction: discord.Interaction):
-    """Clears all commands for the current guild and re-syncs."""
-    if interaction.guild is None:
-        return await interaction.response.send_message("此咒语不能在私聊中施展。", ephemeral=True)
-    try:
-        bot.tree.clear_commands(guild=interaction.guild)
-        await bot.tree.sync(guild=interaction.guild)
-        await interaction.response.send_message("✅ 失忆咒施法成功！已清除本服务器的指令。重启机器人后，它们将重新同步。", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ 施法失败: {e}", ephemeral=True)
 
 # --- Admin & Owner Commands ---
 
@@ -2241,9 +2366,8 @@ async def system_status(interaction: discord.Interaction, action: str = "view_st
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     # --- System Info ---
-    psutil.cpu_percent(interval=None) # Call once to initialize, returns 0.0
-    await asyncio.sleep(1) # Wait a second for a more accurate reading
-    cpu_usage = psutil.cpu_percent()
+    # Get CPU usage over a 1-second interval for an accurate reading.
+    cpu_usage = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory()
     ram_usage_percent = ram.percent
     ram_used_gb = ram.used / (1024**3)
@@ -3358,7 +3482,7 @@ async def summon_leaderboard(interaction: discord.Interaction, title: typing.Opt
         logging.error(f"Error in /道馆 召唤排行榜 command: {e}", exc_info=True)
         await interaction.followup.send("❌ 设置失败: 发生了一个未知错误。", ephemeral=True)
 
-@bot.tree.command(name="道馆黑名单", description="管理作弊黑名单 (馆主、管理员、开发者)。")
+@gym_management_group.command(name="黑名单", description="管理作弊黑名单 (馆主、管理员、开发者)。")
 @has_gym_management_permission("道馆黑名单")
 @app_commands.describe(
     action="要执行的操作",
@@ -3483,7 +3607,7 @@ async def gym_blacklist(
         embed = await view.create_embed()
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="道馆封禁", description="管理挑战封禁名单 (馆主、管理员、开发者)。")
+@gym_management_group.command(name="封禁", description="管理挑战封禁名单 (馆主、管理员、开发者)。")
 @has_gym_management_permission("道馆封禁")
 @app_commands.describe(
    action="要执行的操作",
