@@ -1,0 +1,22 @@
+# Discord Bot 依赖包
+
+# Discord.py
+discord.py>=2.3.0
+
+# 异步数据库
+aiosqlite>=0.19.0
+
+# 异步文件操作
+aiofiles>=23.0.0
+
+# 异步HTTP客户端
+aiohttp>=3.9.0
+
+# 时区处理
+pytz>=2024.1
+
+# 系统监控
+psutil>=5.9.0
+
+# 开发工具（可选）
+python-dotenv>=1.0.0

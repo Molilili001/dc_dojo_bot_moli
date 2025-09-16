@@ -1,0 +1,11 @@
+{
+  "BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+  "DEVELOPER_IDS": [
+    "YOUR_DEVELOPER_ID_HERE"
+  ],
+  "AUTO_BLACKLIST_MONITOR": {
+    "enabled": false,
+    "target_bot_ids": [],
+    "monitor_channel_id": ""
+  }
+}
