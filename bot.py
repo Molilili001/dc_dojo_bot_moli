@@ -276,26 +276,9 @@ class DiscordBot(commands.Bot):
     
     async def _handle_auto_blacklist_monitor(self, message: discord.Message) -> None:
         """处理自动黑名单监控"""
-        monitor_config = self.config.get("AUTO_BLACKLIST_MONITOR", {})
-        if not monitor_config.get("enabled", False):
-            return
-        
-        target_bot_id = monitor_config.get("target_bot_id")
-        monitor_channel_id = monitor_config.get("monitor_channel_id")
-        
-        # 检查消息是否来自目标机器人和频道
-        if not target_bot_id or not monitor_channel_id:
-            return
-        if int(message.author.id) != int(target_bot_id) or int(message.channel.id) != int(monitor_channel_id):
-            return
-        
-        # 处理JSON消息
-        try:
-            # 延迟导入以避免循环导入
-            from cogs.auto_monitor import process_json_punishment
-            await process_json_punishment(self, message)
-        except Exception as e:
-            logger.error(f"处理自动黑名单监控消息失败: {e}")
+        # AutoMonitorCog 会通过 on_message 监听器自动处理
+        # 这里的方法保留是为了向后兼容，但实际处理已经移到 AutoMonitorCog
+        pass
     
     async def on_guild_join(self, guild: discord.Guild) -> None:
         """加入新服务器时触发"""

@@ -4,8 +4,8 @@
     "YOUR_DEVELOPER_ID_HERE"
   ],
   "AUTO_BLACKLIST_MONITOR": {
-    "enabled": false,
-    "target_bot_ids": [],
-    "monitor_channel_id": ""
+    "enabled": true,
+    "target_bot_ids": ["1374372307916554351", "1409882731634098328"],
+    "monitor_channel_id": "1413029834401251398"
   }
 }

@@ -52,14 +52,23 @@ class AutoMonitorCog(BaseCog):
         if not self.monitor_config.get("enabled", False):
             return
         
-        target_bot_id = self.monitor_config.get("target_bot_id")
+        # 获取配置的目标机器人ID列表和监控频道ID
+        target_bot_ids = self.monitor_config.get("target_bot_ids", [])
+        # 向后兼容：如果存在旧的 target_bot_id 配置，将其加入列表
+        old_target_bot_id = self.monitor_config.get("target_bot_id")
+        if old_target_bot_id and old_target_bot_id not in target_bot_ids:
+            target_bot_ids.append(old_target_bot_id)
+        
         monitor_channel_id = self.monitor_config.get("monitor_channel_id")
         
-        if not target_bot_id or not monitor_channel_id:
+        if not target_bot_ids or not monitor_channel_id:
             return
         
-        # 检查是否是目标机器人在目标频道的消息
-        if int(message.author.id) != int(target_bot_id) or int(message.channel.id) != int(monitor_channel_id):
+        # 检查是否是目标机器人之一在目标频道的消息
+        if str(message.author.id) not in [str(bot_id) for bot_id in target_bot_ids]:
+            return
+        
+        if int(message.channel.id) != int(monitor_channel_id):
             return
         
         # 处理JSON消息
@@ -102,7 +111,13 @@ class AutoMonitorCog(BaseCog):
         async with self.user_punishment_locks[user_id]:
             try:
                 reason = "因答题处罚被自动同步"
-                added_by = f"自动同步自 ({self.monitor_config.get('target_bot_id', 'Unknown')})"
+                # 获取配置的机器人ID列表用于显示
+                target_bot_ids = self.monitor_config.get('target_bot_ids', [])
+                if not target_bot_ids:
+                    # 向后兼容
+                    old_bot_id = self.monitor_config.get('target_bot_id', 'Unknown')
+                    target_bot_ids = [old_bot_id]
+                added_by = f"自动同步自 ({', '.join(str(id) for id in target_bot_ids)})"
                 
                 # 添加到黑名单
                 await self.add_to_blacklist(guild_id, user_id, reason, added_by)
@@ -154,12 +169,18 @@ class AutoMonitorCog(BaseCog):
             removed_roles = []
             removed_role_details = []
             failed_removals = []
+            processed_role_ids = set()  # 用于跟踪已处理的身份组，避免重复
             
             for panel in panels:
                 role_to_add_ids_json = panel['role_to_add_ids']
                 if role_to_add_ids_json:
                     role_ids = json.loads(role_to_add_ids_json)
                     for role_id in role_ids:
+                        # 跳过已处理的身份组
+                        if role_id in processed_role_ids:
+                            continue
+                        processed_role_ids.add(role_id)
+                        
                         role = member.guild.get_role(int(role_id))
                         if role and role in member.roles:
                             try:
@@ -216,19 +237,23 @@ class AutoMonitorCog(BaseCog):
                         logger.error(f"AUTO_PUNISHMENT: Cannot access monitoring channel {monitor_channel_id}")
                         return
                 
-                # 创建精简的JSON记录 - 只包含去除的身份组ID和用户ID
-                role_ids = [detail["role_id"] for detail in removed_role_details]
-                record = {
-                    "去除身份组": ",".join(role_ids),
-                    "用户id": str(member.id)
-                }
+                # 为每个移除的身份组发送单独的JSON消息
+                for detail in removed_role_details:
+                    record = {
+                        "去除身份组": detail["role_id"],
+                        "用户id": str(member.id)
+                    }
+                    
+                    # 直接发送JSON消息，不使用代码块格式
+                    json_message = json.dumps(record, ensure_ascii=False, separators=(',', ':'))
+                    await channel.send(json_message)
+                    logger.info(f"AUTO_PUNISHMENT: Sent role removal record for user {member.id}, role {detail['role_id']}")
+                    
+                    # 短暂延迟避免触发速率限制
+                    if len(removed_role_details) > 1:
+                        await asyncio.sleep(0.5)
                 
-                # 发送JSON记录
-                json_message = json.dumps(record, ensure_ascii=False, separators=(',', ':'))
-                await channel.send(f"```json\n{json_message}\n```")
-                
-                logger.info(f"AUTO_PUNISHMENT: Sent role removal record for user {member.id}: removed {len(role_ids)} roles")
-                return  # 成功发送，退出重试循环
+                return  # 成功发送所有记录，退出重试循环
                 
             except discord.HTTPException as e:
                 if attempt < max_retries - 1:
@@ -285,7 +310,12 @@ class AutoMonitorCog(BaseCog):
         # 重新加载配置，以防配置文件在运行时被更新
         self.monitor_config = self.load_monitor_config()
         if self.monitor_config.get("enabled"):
-            logger.info(f"Auto monitoring enabled for bot {self.monitor_config.get('target_bot_id')} in channel {self.monitor_config.get('monitor_channel_id')}")
+            target_bot_ids = self.monitor_config.get("target_bot_ids", [])
+            # 向后兼容
+            old_bot_id = self.monitor_config.get("target_bot_id")
+            if old_bot_id and old_bot_id not in target_bot_ids:
+                target_bot_ids.append(old_bot_id)
+            logger.info(f"Auto monitoring enabled for bots {target_bot_ids} in channel {self.monitor_config.get('monitor_channel_id')}")
         else:
             logger.info("Auto monitoring is disabled")
     
