@@ -8,7 +8,7 @@ import logging
 from typing import Optional, List, Dict
 
 from .base_cog import BaseCog
-from core.database import DatabaseManager
+from core.database import DatabaseManager, get_legacy_db_path
 from core.models import UltimateLeaderboardEntry, LeaderboardPanel
 from core.constants import BEIJING_TZ
 from utils.formatters import FormatUtils
@@ -89,27 +89,53 @@ class LeaderboardCog(BaseCog):
     
     async def get_leaderboard(self, guild_id: str, limit: int = 100) -> List[Dict]:
         """
-        获取究极道馆排行榜
+        获取究极道馆排行榜（支持与旧库数据互通：合并新库与旧库的最佳成绩）
         
         Args:
             guild_id: 服务器ID
             limit: 获取的最大数量
             
         Returns:
-            排行榜数据列表
+            排行榜数据列表（按完成时间升序合并去重）
         """
+        # 读取新库数据
         async with self.db.get_connection() as conn:
             conn.row_factory = self.db.dict_row
             async with conn.execute(
-                """SELECT user_id, completion_time_seconds, timestamp 
-                   FROM ultimate_gym_leaderboard 
-                   WHERE guild_id = ? 
-                   ORDER BY completion_time_seconds ASC 
-                   LIMIT ?""",
-                (guild_id, limit)
+                """SELECT user_id, completion_time_seconds, timestamp
+                   FROM ultimate_gym_leaderboard
+                   WHERE guild_id = ?""",
+                (guild_id,)
             ) as cursor:
-                rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+                new_rows = await cursor.fetchall()
+        merged: Dict[str, Dict] = {str(r['user_id']): dict(r) for r in new_rows}
+
+        # 可选：读取旧库并合并（以更优成绩为准）
+        try:
+            legacy_path = get_legacy_db_path()
+            if legacy_path:
+                legacy_db = DatabaseManager(db_path=legacy_path)
+                async with legacy_db.get_connection() as lconn:
+                    lconn.row_factory = legacy_db.dict_row
+                    async with lconn.execute(
+                        """SELECT user_id, completion_time_seconds, timestamp
+                           FROM ultimate_gym_leaderboard
+                           WHERE guild_id = ?""",
+                        (guild_id,)
+                    ) as cursor:
+                        legacy_rows = await cursor.fetchall()
+                for lr in legacy_rows:
+                    uid = str(lr['user_id'])
+                    # 若新库无记录或旧库更优（更小的时间），以旧库为准
+                    if (uid not in merged) or (lr['completion_time_seconds'] < merged[uid]['completion_time_seconds']):
+                        merged[uid] = dict(lr)
+        except Exception as e:
+            logger.warning(f"读取旧库排行榜失败或未配置，将仅使用新库：{e}")
+
+        # 转换为列表并排序、截取
+        result = list(merged.values())
+        result.sort(key=lambda x: x['completion_time_seconds'])
+        return result[:limit]
     
     async def update_leaderboard(self, guild_id: str, user_id: str, time_seconds: float):
         """
@@ -152,7 +178,7 @@ class LeaderboardCog(BaseCog):
     
     async def get_user_rank(self, guild_id: str, user_id: str) -> Optional[Dict]:
         """
-        获取用户在排行榜上的排名
+        获取用户在排行榜上的排名（新库+旧库合并后的排名）
         
         Args:
             guild_id: 服务器ID
@@ -161,25 +187,24 @@ class LeaderboardCog(BaseCog):
         Returns:
             包含排名和成绩的字典，如果用户不在榜上则返回None
         """
-        query = """
-            SELECT rank, completion_time_seconds
-            FROM (
-                SELECT
-                    user_id,
-                    completion_time_seconds,
-                    ROW_NUMBER() OVER (ORDER BY completion_time_seconds ASC) as rank
-                FROM ultimate_gym_leaderboard
-                WHERE guild_id = ?
-            )
-            WHERE user_id = ?
-        """
-        
-        async with self.db.get_connection() as conn:
-            conn.row_factory = self.db.dict_row
-            async with conn.execute(query, (guild_id, user_id)) as cursor:
-                row = await cursor.fetchone()
-        
-        return dict(row) if row else None
+        # 获取合并后的榜单（使用较大上限避免漏数据）
+        leaderboard = await self.get_leaderboard(guild_id, limit=1000)
+        if not leaderboard:
+            return None
+
+        # 排序已在 get_leaderboard 中完成（按完成时间升序）
+        # 计算目标用户的排名（1-based）
+        rank = None
+        best_time = None
+        for idx, entry in enumerate(leaderboard, start=1):
+            if str(entry['user_id']) == str(user_id):
+                rank = idx
+                best_time = entry['completion_time_seconds']
+                break
+
+        if rank is None:
+            return None
+        return {'rank': rank, 'completion_time_seconds': best_time}
     
     async def create_leaderboard_embed(
         self, 
@@ -318,6 +343,30 @@ class LeaderboardCog(BaseCog):
                     await conn.commit()
             except discord.Forbidden:
                 logger.error(f"Bot lacks permission to edit message {panel['message_id']} in channel {panel['channel_id']}")
+                # Attempt takeover: recreate the panel message authored by this bot and update DB record
+                try:
+                    # Ensure channel is available; if not, try fetching
+                    if not channel:
+                        try:
+                            channel = await self.bot.fetch_channel(int(panel['channel_id']))
+                        except (discord.NotFound, discord.Forbidden):
+                            channel = None
+                    if channel:
+                        from cogs.leaderboard import LeaderboardView
+                        new_message = await channel.send(embed=new_embed, view=LeaderboardView())
+                        # Update DB to point to new message id and channel
+                        async with self.db.get_connection() as conn2:
+                            await conn2.execute(
+                                "UPDATE leaderboard_panels SET message_id = ?, channel_id = ? WHERE message_id = ?",
+                                (str(new_message.id), str(channel.id), panel['message_id'])
+                            )
+                            await conn2.commit()
+                        updated_count += 1
+                        logger.info(f"Recreated leaderboard panel in channel {channel.id} with new message {new_message.id} due to Forbidden edit of old panel {panel['message_id']}")
+                    else:
+                        logger.warning(f"Cannot recreate leaderboard panel because channel {panel['channel_id']} is unavailable")
+                except Exception as recreate_error:
+                    logger.error(f"Failed to recreate leaderboard panel for old message {panel['message_id']}: {recreate_error}", exc_info=True)
             except Exception as e:
                 logger.error(f"Error updating panel {panel['message_id']}: {e}", exc_info=True)
         

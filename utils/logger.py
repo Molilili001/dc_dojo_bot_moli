@@ -5,6 +5,12 @@ from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
 import pytz
+from core.constants import (
+    LOG_DIR as DEFAULT_LOG_DIR,
+    LOG_BACKUP_COUNT as DEFAULT_BACKUP_COUNT,
+    LOG_FORMAT as DEFAULT_LOG_FORMAT,
+    LOG_DATE_FORMAT as DEFAULT_LOG_DATE_FORMAT,
+)
 
 
 class TimezoneFormatter(logging.Formatter):
@@ -41,78 +47,79 @@ class TimezoneFormatter(logging.Formatter):
 
 def setup_logger(
     name: str = "discord_bot",
-    log_dir: str = "logs",
-    log_level: int = logging.INFO,
+    log_dir: Optional[str] = None,
+    log_level: Optional[int] = None,
     use_beijing_tz: bool = True
 ) -> logging.Logger:
     """
-    设置并返回配置好的日志记录器
-    
-    Args:
-        name: 日志记录器名称
-        log_dir: 日志文件目录
-        log_level: 日志级别
-        use_beijing_tz: 是否使用北京时区
-        
-    Returns:
-        配置好的日志记录器
+    初始化全局日志系统，并返回指定名称的日志记录器。
+    关键变更：
+    - 将处理器绑定到 root logger，保证任意模块 logger 都能写入同一套处理器
+    - 默认日志目录统一为 data/logs（来自 core.constants.LOG_DIR）
+    - 单一文件：data/logs/discord_bot.log（按日轮转，保留7天）
     """
-    # 创建日志目录
+    # 统一日志目录为 data/logs
+    log_dir = log_dir or str(DEFAULT_LOG_DIR)
     if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    
-    # 创建或获取日志记录器
-    logger = logging.getLogger(name)
-    
-    # 如果已经配置过，直接返回
-    if logger.hasHandlers():
-        return logger
-    
-    logger.setLevel(log_level)
-    
-    # 设置时区
+        os.makedirs(log_dir, exist_ok=True)
+
+    # 若 root 已配置处理器，则只调整级别并返回命名 logger
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        # 若已初始化但未传入级别，使用 WARNING 降低日志量
+        root_logger.setLevel(log_level or logging.WARNING)
+        return logging.getLogger(name)
+
+    # 设置时区与格式
     tz = pytz.timezone('Asia/Shanghai') if use_beijing_tz else pytz.utc
-    
-    # 创建格式化器
+
+    # 若未指定级别，默认使用 WARNING 降低日志量
+    if log_level is None:
+        log_level = logging.WARNING
+
     formatter = TimezoneFormatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        DEFAULT_LOG_FORMAT,
+        datefmt=DEFAULT_LOG_DATE_FORMAT,
         tz=tz
     )
-    
-    # 文件处理器 - 每日轮转
-    log_path = os.path.join(log_dir, f'{name}.log')
+
+    # 文件处理器：按日轮转
+    log_path = os.path.join(log_dir, f'{name}.log')  # 保持单一文件：discord_bot.log
     file_handler = TimedRotatingFileHandler(
         log_path,
         when='midnight',
         interval=1,
-        backupCount=7,
+        backupCount=DEFAULT_BACKUP_COUNT,
         encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
     file_handler.setLevel(log_level)
-    
+
     # 控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     console_handler.setLevel(log_level)
-    
-    # 添加处理器
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    return logger
+
+    # 绑定到 root，确保所有子 logger 生效
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    # 捕获 warnings 到日志
+    logging.captureWarnings(True)
+
+    return logging.getLogger(name)
 
 
 def get_logger(name: str) -> logging.Logger:
     """
-    获取指定名称的日志记录器
-    
-    Args:
-        name: 日志记录器名称
-        
-    Returns:
-        日志记录器实例
+    获取指定名称的日志记录器。
+    若全局日志尚未初始化，则进行一次惰性初始化。
     """
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        # 使用默认参数初始化（单文件：data/logs/discord_bot.log）
+        setup_logger()
     return logging.getLogger(name)
 
 

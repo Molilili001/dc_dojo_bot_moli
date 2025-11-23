@@ -56,42 +56,47 @@ class DeveloperCog(BaseCog):
     async def download_log(self, interaction: discord.Interaction):
         """下载今日日志文件"""
         await interaction.response.defer(ephemeral=True, thinking=True)
-        
+
         try:
-            # 构建日志文件路径
-            log_filename = f"bot_{datetime.date.today()}.log"
-            log_path = os.path.join(LOG_DIR, log_filename)
-            
-            if os.path.exists(log_path):
+            # 优先返回当前活动日志文件（单一文件：discord_bot.log）
+            log_dir = str(LOG_DIR)
+            active_log = os.path.join(log_dir, "discord_bot.log")
+
+            candidate_path = None
+            note = None
+
+            if os.path.exists(active_log) and os.path.getsize(active_log) > 0:
+                candidate_path = active_log
+                note = "这是今天的最新日志文件"
+            else:
+                # 回退：查找同名轮转日志（例如 discord_bot.log.2025-10-11）
+                if os.path.exists(log_dir):
+                    all_logs = [
+                        os.path.join(log_dir, f)
+                        for f in os.listdir(log_dir)
+                        if f.startswith("discord_bot.log")
+                    ]
+                    if all_logs:
+                        # 取最后修改时间最新的一个
+                        all_logs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                        candidate_path = all_logs[0]
+                        note = f"未找到当前活动日志，提供最近的日志文件: `{os.path.basename(candidate_path)}`"
+
+            if candidate_path:
                 await interaction.followup.send(
-                    "✅ 这是今天的最新日志文件。",
-                    file=discord.File(log_path),
+                    f"✅ {note}。",
+                    file=discord.File(candidate_path),
                     ephemeral=True
                 )
-                logger.info(f"Developer {interaction.user.id} downloaded log file")
+                logger.info(
+                    f"Developer {interaction.user.id} downloaded log file {os.path.basename(candidate_path)}"
+                )
             else:
-                # 尝试查找最近的日志文件
-                if os.path.exists(LOG_DIR):
-                    log_files = [f for f in os.listdir(LOG_DIR) if f.endswith('.log')]
-                    if log_files:
-                        log_files.sort(reverse=True)
-                        latest_log = os.path.join(LOG_DIR, log_files[0])
-                        await interaction.followup.send(
-                            f"⚠️ 今日日志文件不存在，这是最近的日志文件: `{log_files[0]}`",
-                            file=discord.File(latest_log),
-                            ephemeral=True
-                        )
-                    else:
-                        await interaction.followup.send(
-                            "❌ 未找到任何日志文件。",
-                            ephemeral=True
-                        )
-                else:
-                    await interaction.followup.send(
-                        "❌ 日志目录不存在。",
-                        ephemeral=True
-                    )
-                    
+                await interaction.followup.send(
+                    "❌ 未找到任何日志文件。",
+                    ephemeral=True
+                )
+
         except Exception as e:
             logger.error(f"Error during log download: {e}", exc_info=True)
             await interaction.followup.send(
@@ -290,8 +295,26 @@ class DeveloperCog(BaseCog):
                     f"bot重构.cogs.{cog_name.lower()}",
                     f"cogs.{cog_name.lower()}"
                 ]
+
+                # 显式英文Cog名到模块路径映射，确保热重载准确匹配
+                english_to_module = {
+                    "GymManagementCog": "cogs.gym_management",
+                    "GymChallengeCog": "cogs.gym_challenge",
+                    "UserProgressCog": "cogs.user_progress",
+                    "LeaderboardCog": "cogs.leaderboard",
+                    "ModerationCog": "cogs.moderation",
+                    "PanelsCog": "cogs.panels",
+                    "AdminCog": "cogs.admin",
+                    "DeveloperCog": "cogs.developer",
+                    "AutoMonitorCog": "cogs.auto_monitor",
+                    "CrossBotSyncCog": "cogs.cross_bot_sync",
+                    "ForumPostMonitorCog": "cogs.forum_post_monitor",
+                    "TodoListCog": "cogs.todo_list",
+                }
+                if cog_name in english_to_module:
+                    possible_paths.insert(0, english_to_module[cog_name])
                 
-                # 添加一些特殊映射
+                # 添加一些特殊映射（用于显示中文名）
                 special_mappings = {
                     "gym_management": "道馆管理",
                     "gym_challenge": "道馆挑战",
@@ -301,7 +324,9 @@ class DeveloperCog(BaseCog):
                     "panels": "面板管理",
                     "admin": "管理员命令",
                     "developer": "开发者工具",
-                    "auto_monitor": "自动监控"
+                    "auto_monitor": "自动监控",
+                    "forum_post_monitor": "投诉监听",
+                    "todo_list": "事件列表",
                 }
                 
                 loaded = False

@@ -38,7 +38,7 @@ LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_ROTATION = "midnight"
-LOG_BACKUP_COUNT = 7
+LOG_BACKUP_COUNT = 30
 
 # ===== 数据库配置 =====
 DATABASE_TIMEOUT = 10  # 数据库连接超时时间（秒）
@@ -61,6 +61,12 @@ MESSAGE_CONTENT_LIMIT = 2000
 
 # 文件大小限制
 FILE_SIZE_LIMIT = 25 * 1024 * 1024  # 25MB
+
+# ===== 帖子监控扫描配置 =====
+# 定时扫描遗漏的帖子，兜底保障
+FORUM_SCAN_INTERVAL = 15              # 扫描间隔（秒）
+FORUM_SCAN_WINDOW_SECONDS = 30        # 扫描时间窗口（秒）
+FORUM_RECORD_RETENTION_DAYS = 7       # 已处理记录保留天数（天）
 
 # ===== 道馆挑战配置 =====
 # 默认允许错误数

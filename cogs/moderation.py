@@ -53,7 +53,20 @@ class BlacklistPaginatorView(PaginatorView):
                     if member:
                         target_display = f"{member.display_name} (<@{target_id}>)"
                     else:
-                        target_display = f"[已离开的用户] (`{target_id_str}`)"
+                        # 检查added_by中是否包含用户名信息
+                        added_by_info = entry.get('added_by', '')
+                        if '| 用户:' in added_by_info:
+                            # 从added_by字段提取用户名
+                            try:
+                                username = added_by_info.split('| 用户:')[-1].strip()
+                                if username and username != "Unknown":
+                                    target_display = f"{username} (<@{target_id}>)"
+                                else:
+                                    target_display = f"[已离开的用户] (<@{target_id}>)"
+                            except:
+                                target_display = f"[已离开的用户] (<@{target_id}>)"
+                        else:
+                            target_display = f"[已离开的用户] (<@{target_id}>)"
                 elif target_type == 'role':
                     role = guild.get_role(target_id)
                     if role:
@@ -62,10 +75,21 @@ class BlacklistPaginatorView(PaginatorView):
                         target_display = f"[已删除的身份组] (`{target_id_str}`)"
                 
                 reason = entry.get('reason', '无')
-                added_by_id = entry.get('added_by', '未知')
+                added_by_info = entry.get('added_by', '未知')
                 
-                # 格式化操作人
-                operator_str = f"<@{added_by_id}>" if added_by_id.isdigit() else added_by_id
+                # 格式化操作人，移除用户名信息（如果有）
+                if '| 用户:' in added_by_info:
+                    added_by_id = added_by_info.split('| 用户:')[0].strip()
+                else:
+                    added_by_id = added_by_info
+                
+                # 解析操作人信息
+                if '自动同步自' in added_by_id:
+                    operator_str = added_by_id
+                elif added_by_id.isdigit():
+                    operator_str = f"<@{added_by_id}>"
+                else:
+                    operator_str = added_by_id
                 
                 # 解析时间戳
                 try:
@@ -120,7 +144,20 @@ class BanListPaginatorView(PaginatorView):
                     if member:
                         target_display = f"{member.display_name} (<@{target_id}>)"
                     else:
-                        target_display = f"[已离开的用户] (`{target_id_str}`)"
+                        # 检查added_by中是否包含用户名信息
+                        added_by_info = entry.get('added_by', '')
+                        if '| 用户:' in added_by_info:
+                            # 从added_by字段提取用户名
+                            try:
+                                username = added_by_info.split('| 用户:')[-1].strip()
+                                if username and username != "Unknown":
+                                    target_display = f"{username} (<@{target_id}>)"
+                                else:
+                                    target_display = f"[已离开的用户] (<@{target_id}>)"
+                            except:
+                                target_display = f"[已离开的用户] (<@{target_id}>)"
+                        else:
+                            target_display = f"[已离开的用户] (<@{target_id}>)"
                 elif target_type == 'role':
                     role = guild.get_role(target_id)
                     if role:
@@ -129,9 +166,21 @@ class BanListPaginatorView(PaginatorView):
                         target_display = f"[已删除的身份组] (`{target_id_str}`)"
                 
                 reason = entry.get('reason', '无')
-                added_by_id = entry.get('added_by', '未知')
+                added_by_info = entry.get('added_by', '未知')
                 
-                operator_str = f"<@{added_by_id}>" if added_by_id.isdigit() else added_by_id
+                # 格式化操作人，移除用户名信息（如果有）
+                if '| 用户:' in added_by_info:
+                    added_by_id = added_by_info.split('| 用户:')[0].strip()
+                else:
+                    added_by_id = added_by_info
+                
+                # 解析操作人信息
+                if '自动同步自' in added_by_id:
+                    operator_str = added_by_id
+                elif added_by_id.isdigit():
+                    operator_str = f"<@{added_by_id}>"
+                else:
+                    operator_str = added_by_id
                 
                 try:
                     timestamp_dt = datetime.datetime.fromisoformat(entry['timestamp']).astimezone(BEIJING_TZ)

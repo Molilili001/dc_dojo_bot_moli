@@ -84,15 +84,22 @@ class AutoMonitorCog(BaseCog):
             # 检查是否有处罚指令
             punished_user_id = data.get("punish")
             if isinstance(punished_user_id, (str, int)) and str(punished_user_id).isdigit():
-                await self.handle_punishment(message.guild, str(punished_user_id))
+                # 传递实际触发消息的机器人ID
+                await self.handle_punishment(message.guild, str(punished_user_id), str(message.author.id))
                 
         except json.JSONDecodeError as e:
             logger.warning(f"AUTO_MONITOR: Invalid JSON from bot {message.author.id}: {e}")
         except Exception as e:
             logger.error(f"AUTO_MONITOR: Error processing message: {e}", exc_info=True)
     
-    async def handle_punishment(self, guild: discord.Guild, user_id: str):
-        """处理用户处罚"""
+    async def handle_punishment(self, guild: discord.Guild, user_id: str, source_bot_id: str = None):
+        """处理用户处罚
+        
+        Args:
+            guild: Discord服务器对象
+            user_id: 被处罚的用户ID
+            source_bot_id: 触发处罚的机器人ID
+        """
         guild_id = str(guild.id)
         
         # 获取成员对象
@@ -111,16 +118,45 @@ class AutoMonitorCog(BaseCog):
         async with self.user_punishment_locks[user_id]:
             try:
                 reason = "因答题处罚被自动同步"
-                # 获取配置的机器人ID列表用于显示
-                target_bot_ids = self.monitor_config.get('target_bot_ids', [])
-                if not target_bot_ids:
-                    # 向后兼容
-                    old_bot_id = self.monitor_config.get('target_bot_id', 'Unknown')
-                    target_bot_ids = [old_bot_id]
-                added_by = f"自动同步自 ({', '.join(str(id) for id in target_bot_ids)})"
                 
-                # 添加到黑名单
-                await self.add_to_blacklist(guild_id, user_id, reason, added_by)
+                # 获取机器人名称
+                bot_name = None
+                if source_bot_id:
+                    try:
+                        # 首先尝试从服务器成员中获取（如果机器人在服务器中）
+                        bot_member = guild.get_member(int(source_bot_id))
+                        if bot_member:
+                            # 如果是服务器成员，优先使用显示名称
+                            bot_name = bot_member.display_name
+                            logger.info(f"Got bot name from guild member: {bot_name}")
+                        else:
+                            # 如果不在服务器中，尝试从缓存或API获取用户对象
+                            bot_user = self.bot.get_user(int(source_bot_id))
+                            if not bot_user:
+                                bot_user = await self.bot.fetch_user(int(source_bot_id))
+                            if bot_user:
+                                bot_name = bot_user.name
+                                logger.info(f"Got bot name from user object: {bot_name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to get bot name for ID {source_bot_id}: {e}")
+                    
+                    # 如果成功获取bot名称，使用名称；否则使用ID
+                    if bot_name:
+                        # 清理bot名称，移除可能的特殊字符
+                        safe_bot_name = bot_name.replace('|', '-').replace(':', '-')
+                        added_by = f"自动同步自 {safe_bot_name}"
+                    else:
+                        added_by = f"自动同步自 ({source_bot_id})"
+                else:
+                    # 向后兼容：如果没有提供source_bot_id，使用配置的第一个
+                    target_bot_ids = self.monitor_config.get('target_bot_ids', [])
+                    if not target_bot_ids:
+                        old_bot_id = self.monitor_config.get('target_bot_id', 'Unknown')
+                        target_bot_ids = [old_bot_id]
+                    added_by = f"自动同步自 ({target_bot_ids[0]})"
+                
+                # 添加到黑名单，同时记录用户名
+                await self.add_to_blacklist_with_username(guild_id, user_id, member.display_name, reason, added_by)
                 
                 # 移除毕业奖励身份组
                 await self.remove_graduation_roles(member, guild_id)
@@ -138,10 +174,34 @@ class AutoMonitorCog(BaseCog):
         timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
         async with self.db.get_connection() as conn:
             await conn.execute(
-                """INSERT OR REPLACE INTO cheating_blacklist 
+                """INSERT OR REPLACE INTO cheating_blacklist
                    (guild_id, target_id, target_type, reason, added_by, timestamp)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (guild_id, user_id, 'user', reason, added_by, timestamp)
+            )
+            await conn.commit()
+    
+    async def add_to_blacklist_with_username(self, guild_id: str, user_id: str, username: str, reason: str, added_by: str):
+        """添加用户到黑名单，同时记录用户名
+        
+        Args:
+            guild_id: 服务器ID
+            user_id: 用户ID
+            username: 用户显示名称
+            reason: 封禁原因
+            added_by: 操作者信息
+        """
+        timestamp = datetime.datetime.now(BEIJING_TZ).isoformat()
+        # 在added_by中包含用户名信息，这样在查看黑名单时能显示
+        # 对用户名进行安全处理，避免包含特殊字符导致解析问题
+        safe_username = username.replace('|', '-').replace(':', '-') if username else "Unknown"
+        added_by_with_username = f"{added_by} | 用户: {safe_username}"
+        async with self.db.get_connection() as conn:
+            await conn.execute(
+                """INSERT OR REPLACE INTO cheating_blacklist
+                   (guild_id, target_id, target_type, reason, added_by, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (guild_id, user_id, 'user', reason, added_by_with_username, timestamp)
             )
             await conn.commit()
     

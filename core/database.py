@@ -202,7 +202,7 @@ class DatabaseManager:
                 badge_image_url TEXT,
                 badge_description TEXT,
                 is_enabled BOOLEAN DEFAULT TRUE,
-                randomize_options BOOLEAN DEFAULT FALSE,
+                randomize_options BOOLEAN DEFAULT TRUE,
                 PRIMARY KEY (guild_id, gym_id)
             )
         ''')
@@ -371,6 +371,167 @@ class DatabaseManager:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_sync_config ON bot_sync_config (guild_id, sync_enabled)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_punishment_queue_status ON punishment_sync_queue (status, created_at)")
         
+        # --- 论坛发帖监控配置表 ---
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS forum_post_monitor_configs (
+                guild_id TEXT NOT NULL,
+                forum_channel_id TEXT NOT NULL,
+                auto_role_enabled BOOLEAN DEFAULT FALSE,
+                auto_role_id TEXT,
+                notify_enabled BOOLEAN DEFAULT TRUE,
+                notify_message TEXT,
+                mention_role_enabled BOOLEAN DEFAULT FALSE,
+                mention_role_id TEXT,
+                mention_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, forum_channel_id)
+            )
+        ''')
+        # 索引：按公会与频道快速检索
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_forum_monitor_guild_channel ON forum_post_monitor_configs (guild_id, forum_channel_id)")
+        # 索引：按开关快速过滤
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_forum_monitor_guild_enabled ON forum_post_monitor_configs (guild_id, auto_role_enabled, mention_role_enabled, notify_enabled)")
+        
+        # --- 论坛发帖处理记录表（用于遗漏扫描去重） ---
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS forum_posts_processed (
+                thread_id TEXT PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                forum_channel_id TEXT NOT NULL,
+                thread_created_at TEXT NOT NULL,
+                processed_at TEXT NOT NULL,
+                processed_by TEXT NOT NULL, -- 'event' 或 'scan'
+                actions_taken TEXT
+            )
+        ''')
+        # 索引：便于按公会/频道/时间范围查询
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_forum_posts_guild_channel_created ON forum_posts_processed (guild_id, forum_channel_id, thread_created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_forum_posts_processed_at ON forum_posts_processed (processed_at)")
+        
+        # --- ToDo 列表相关表 ---
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS todo_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                list_type TEXT NOT NULL, -- 'person' 或 'channel'
+                user_id TEXT,
+                channel_id TEXT,
+                content TEXT NOT NULL,
+                message_link TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_by TEXT NOT NULL,
+                created_by_name TEXT,
+                created_at TEXT NOT NULL,
+                last_modified_by TEXT,
+                last_modified_by_name TEXT,
+                last_modified_at TEXT,
+                deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                sort_order INTEGER -- 列表内排序序号（从1开始，新增项目追加到末尾）
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_items_person ON todo_items (guild_id, list_type, user_id, sort_order, deleted)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_items_channel ON todo_items (guild_id, list_type, channel_id, sort_order, deleted)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_items_created_at ON todo_items (created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_items_last_modified_at ON todo_items (last_modified_at)")
+        
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS todo_reminders (
+                reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                reminder_type TEXT NOT NULL, -- 'countdown' 或 'daily'
+                countdown_seconds INTEGER,
+                daily_time TEXT,
+                next_run TEXT,
+                created_at TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_reminders_active ON todo_reminders (guild_id, user_id, channel_id, is_active)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_reminders_next_run ON todo_reminders (next_run, is_active)")
+        
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS todo_monitor_channels (
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+        ''')
+        
+        # 事件指令权限表（允许的用户或身份组）
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS todo_permissions (
+                guild_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                target_type TEXT NOT NULL, -- 'user' 或 'role'
+                added_by TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, target_id, target_type)
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_todo_permissions_guild_type ON todo_permissions (guild_id, target_type)")
+
+        # --- ToDo 排序字段迁移（为现有数据补充 sort_order，并确保新建追加到末尾） ---
+        try:
+            # 若旧库无此列，添加之
+            await conn.execute("ALTER TABLE todo_items ADD COLUMN sort_order INTEGER")
+            logger.info("数据库迁移: 已为 todo_items 添加列 sort_order")
+        except Exception:
+            # 已存在则忽略
+            pass
+
+        # 为缺失 sort_order 的记录补齐（按创建时间升序，组内依次编号）
+        try:
+            conn.row_factory = aiosqlite.Row
+
+            # 个人列表分组补齐
+            personal_rows = []
+            async with conn.execute("""
+                SELECT item_id, guild_id, user_id, created_at
+                FROM todo_items
+                WHERE list_type = 'person' AND deleted = 0 AND sort_order IS NULL
+                ORDER BY guild_id ASC, user_id ASC, created_at ASC
+            """) as cursor:
+                personal_rows = await cursor.fetchall()
+
+            if personal_rows:
+                groups = {}
+                for r in personal_rows:
+                    key = (r['guild_id'], r['user_id'])
+                    groups.setdefault(key, []).append(r)
+                for key, rows in groups.items():
+                    updates = [(i, rows[i-1]['item_id']) for i in range(1, len(rows)+1)]
+                    await conn.executemany(
+                        "UPDATE todo_items SET sort_order = ? WHERE item_id = ?",
+                        updates
+                    )
+
+            # 频道列表分组补齐
+            channel_rows = []
+            async with conn.execute("""
+                SELECT item_id, guild_id, channel_id, created_at
+                FROM todo_items
+                WHERE list_type = 'channel' AND deleted = 0 AND sort_order IS NULL
+                ORDER BY guild_id ASC, channel_id ASC, created_at ASC
+            """) as cursor:
+                channel_rows = await cursor.fetchall()
+
+            if channel_rows:
+                groups2 = {}
+                for r in channel_rows:
+                    key = (r['guild_id'], r['channel_id'])
+                    groups2.setdefault(key, []).append(r)
+                for key, rows in groups2.items():
+                    updates = [(i, rows[i-1]['item_id']) for i in range(1, len(rows)+1)]
+                    await conn.executemany(
+                        "UPDATE todo_items SET sort_order = ? WHERE item_id = ?",
+                        updates
+                    )
+        except Exception as e:
+            logger.error(f"排序字段迁移失败: {e}", exc_info=True)
+        
         # --- 数据迁移：兼容旧版本面板数据 ---
         # 确保blacklist_enabled字段有默认值
         await conn.execute("UPDATE challenge_panels SET blacklist_enabled = 1 WHERE blacklist_enabled IS NULL")
@@ -400,8 +561,90 @@ class DatabaseManager:
         # 重置row_factory
         conn.row_factory = None
         
+        # --- 反馈系统相关表 ---
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS feedback_submissions (
+                submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                type TEXT NOT NULL, -- 'anonymous' 或 'named'
+                content TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id TEXT, -- 发送到目标频道的消息ID
+                created_at TEXT NOT NULL
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_submissions_guild_user_date ON feedback_submissions (guild_id, user_id, created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_submissions_guild_date ON feedback_submissions (guild_id, created_at)")
+
+        # （可选）反馈配置表：用于运行时命令覆盖配置并跨重启保留
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS feedback_configs (
+                guild_id TEXT PRIMARY KEY,
+                target_channel_id TEXT,
+                allowed_role_ids TEXT, -- JSON数组
+                panel_texts TEXT,      -- JSON（标题、说明、按钮、提示文案）
+                limits TEXT,           -- JSON（min_total_messages、window_seconds等）
+                runtime_counters TEXT, -- JSON（是否持久化快照、间隔）
+                updated_at TEXT
+            )
+        ''')
+
+        # （可选）消息计数快照表：若开启持久化快照则使用
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS message_counter_snapshots (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                total_messages INTEGER DEFAULT 0,
+                window_bucket TEXT, -- 例如按小时桶 YYYY-MM-DDTHH
+                window_messages INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, window_bucket)
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_snapshots_guild_user ON message_counter_snapshots (guild_id, user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_snapshots_updated ON message_counter_snapshots (updated_at)")
+        # --- 数据修复：统一 randomize_options 为 TRUE（仅影响历史为 NULL 或 0 的记录） ---
+        try:
+            await conn.execute("""
+                UPDATE gyms
+                SET randomize_options = 1
+                WHERE randomize_options IS NULL OR randomize_options = 0
+            """)
+            logger.info("数据迁移: 已将 gyms.randomize_options 从 NULL/0 标准化为 TRUE")
+        except Exception as e:
+            logger.error(f"数据迁移(randomize_options)失败: {e}", exc_info=True)
+
         logger.info("数据库表结构设置完成，数据迁移检查完成")
+
+# ===== Legacy DB config (module-level) =====
+def get_legacy_db_path() -> Optional[Path]:
+    """
+    从配置文件读取可选的“旧库”路径，用于数据互通。
+    配置文件: [core/constants.py.CONFIG_PATH](core/constants.py:30)
+    约定键:
+      - enableLegacySync: bool，开启旧库同步
+      - legacyDatabasePath: str，旧库绝对路径（例如 'F:\\dcbot\\progress.db' 或 VPS 上的绝对路径）
+    返回:
+      - Path 或 None（未启用或未配置时）
+    """
+    try:
+        from core.constants import CONFIG_PATH
+        if CONFIG_PATH.exists():
+            with CONFIG_PATH.open('r', encoding='utf-8') as f:
+                conf = json.load(f)
+            enable = conf.get('enableLegacySync', False)
+            path_str = conf.get('legacyDatabasePath')
+            if enable and path_str:
+                p = Path(path_str)
+                return p
+    except Exception as e:
+        logger.warning(f"读取旧库路径失败（忽略并继续）: {e}")
+    return None
 
 
 # 全局数据库管理器实例
 db_manager = DatabaseManager()
+
+# 明确导出，避免在某些环境下的部分初始化导致的导入混淆
+__all__ = ['DatabaseManager', 'db_manager', 'get_legacy_db_path']

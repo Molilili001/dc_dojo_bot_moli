@@ -14,6 +14,13 @@ from core.models import Gym, UserProgress, ChallengeFailure, Question
 from core.exceptions import ValidationError
 from utils.formatters import format_time, format_timedelta, format_wrong_answers
 from utils.logger import get_logger
+from utils.time_utils import (
+    format_beijing_display,
+    format_beijing_iso,
+    get_beijing_now,
+    parse_beijing_time,
+    remaining_until,
+)
 
 logger = get_logger(__name__)
 
@@ -49,11 +56,26 @@ class ChallengeSession:
         # 随机题目逻辑
         self.questions_for_session = gym_info.get('questions', [])
         num_to_ask = gym_info.get('questions_to_ask')
+        orig_total = len(self.questions_for_session)
         
         if num_to_ask and isinstance(num_to_ask, int) and num_to_ask > 0:
             # 对于究极道馆，抽样已在创建会话前完成
-            if not self.is_ultimate and num_to_ask <= len(self.questions_for_session):
+            if not self.is_ultimate and num_to_ask <= orig_total:
                 self.questions_for_session = random.sample(self.questions_for_session, num_to_ask)
+                try:
+                    logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} sampled={len(self.questions_for_session)}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} no-sample")
+                except Exception:
+                    pass
+        else:
+            try:
+                logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} (ignored or invalid)")
+            except Exception:
+                pass
     
     def get_current_question(self) -> Optional[dict]:
         """
@@ -154,6 +176,16 @@ class GymChallengeCog(BaseCog):
             
             logger.info(f"handle_challenge_start called - User: {user_id}, Guild: {guild_id}, Panel: {panel_message_id}")
             
+            # 检查封禁名单
+            ban_entry = await self._get_challenge_ban_entry(guild_id, interaction.user)
+            if ban_entry:
+                ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
+                if interaction.response.is_done():
+                    await interaction.followup.send(ban_message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(ban_message, ephemeral=True)
+                return
+            
             # 检查并清理任何可能存在的旧会话
             if user_id in self.active_challenges:
                 logger.warning(f"Found existing challenge session for user {user_id}, cleaning up")
@@ -225,6 +257,16 @@ class GymChallengeCog(BaseCog):
         """显示道馆列表供选择"""
         guild_id = str(interaction.guild.id)
         user_id = str(interaction.user.id)
+        
+        # 全局封禁检查：即使面板关闭黑名单功能也不可挑战
+        ban_entry = await self._get_challenge_ban_entry(guild_id, interaction.user)
+        if ban_entry:
+            ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
+            if interaction.response.is_done():
+                await interaction.followup.send(ban_message, ephemeral=True)
+            else:
+                await interaction.response.send_message(ban_message, ephemeral=True)
+            return
         
         # 检查并清理可能存在的旧会话
         if user_id in self.active_challenges:
@@ -315,6 +357,16 @@ class GymChallengeCog(BaseCog):
             logger.info(f"Auto-clearing old challenge session for user {user_id} before starting ultimate challenge")
             del self.active_challenges[user_id]
         
+        # 检查封禁名单
+        ban_entry = await self._get_challenge_ban_entry(guild_id, interaction.user)
+        if ban_entry:
+            ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
+            if interaction.response.is_done():
+                await interaction.followup.send(ban_message, ephemeral=True)
+            else:
+                await interaction.response.send_message(ban_message, ephemeral=True)
+            return
+        
         # 获取所有道馆题目
         all_gyms = await self._get_all_guild_gyms(guild_id)
         enabled_gyms = [gym for gym in all_gyms if gym.get('is_enabled', True)]
@@ -399,6 +451,19 @@ class GymChallengeCog(BaseCog):
                             answer: str, is_correct: bool, from_modal: bool = False):
         """处理用户答案（新版本）"""
         user_id = session.user_id
+        guild_id = session.guild_id
+
+        # 按优先级再次检查封禁状态
+        ban_entry = await self._get_challenge_ban_entry(guild_id, interaction.user)
+        if ban_entry:
+            if user_id in self.active_challenges:
+                del self.active_challenges[user_id]
+            ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
+            try:
+                await interaction.edit_original_response(content=ban_message, embed=None, view=None)
+            except Exception:
+                await interaction.followup.send(ban_message, ephemeral=True)
+            return
         
         # 确保用户锁存在
         if user_id not in self.user_challenge_locks:
@@ -478,6 +543,17 @@ class GymChallengeCog(BaseCog):
                 )
                 return
             
+            # 检查挑战封禁名单
+            ban_entry = await self._get_challenge_ban_entry(guild_id, interaction.user)
+            if ban_entry:
+                ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
+                await interaction.edit_original_response(
+                    content=ban_message,
+                    view=None,
+                    embed=None
+                )
+                return
+            
             # 检查用户是否已完成该道馆
             user_progress = await self._get_user_progress(user_id, guild_id)
             if gym_id in user_progress:
@@ -491,17 +567,25 @@ class GymChallengeCog(BaseCog):
             # 检查冷却时间
             failure_status = await self._get_failure_status(user_id, guild_id, gym_id)
             if failure_status and failure_status['banned_until']:
-                banned_until = datetime.fromisoformat(failure_status['banned_until'])
-                # 确保使用相同的时区进行比较
-                import pytz
-                now = datetime.now(pytz.UTC) if banned_until.tzinfo else datetime.now()
-                if banned_until > now:
-                    remaining = banned_until - now
+                banned_until = parse_beijing_time(failure_status['banned_until'])
+                remaining = remaining_until(banned_until)
+                if remaining:
                     time_str = format_timedelta(remaining)
+                    unlock_at = format_beijing_display(banned_until)
+                    logger.info(
+                        "User %s is still banned from gym %s until %s (remaining %s)",
+                        user_id,
+                        gym_id,
+                        unlock_at,
+                        time_str,
+                    )
                     await interaction.edit_original_response(
-                        content=f"❌ **挑战冷却中**\n\n"
-                                f"由于多次挑战失败，你暂时无法挑战该道馆。\n"
-                                f"请在 **{time_str}** 后再试。",
+                        content=(
+                            "❌ **挑战冷却中**\n\n"
+                            "由于多次挑战失败，你暂时无法挑战该道馆。\n"
+                            f"请在 **{time_str}** 后再试。\n"
+                            f"解封时间（北京时间）：`{unlock_at}`"
+                        ),
                         view=None,
                         embed=None
                     )
@@ -528,11 +612,19 @@ class GymChallengeCog(BaseCog):
         session = self.active_challenges.get(user_id)
         
         if not session:
-            return await interaction.response.edit_message(
-                content="没有正在进行的挑战或已超时。",
-                view=None,
-                embed=None
-            )
+            # 根据响应状态选择编辑方法，兼容已 defer 的组件回调
+            if interaction.response.is_done():
+                return await interaction.edit_original_response(
+                    content="没有正在进行的挑战或已超时。",
+                    view=None,
+                    embed=None
+                )
+            else:
+                return await interaction.response.edit_message(
+                    content="没有正在进行的挑战或已超时。",
+                    view=None,
+                    embed=None
+                )
         
         guild_id = str(session.guild_id)
         
@@ -555,11 +647,19 @@ class GymChallengeCog(BaseCog):
             color=discord.Color.red()
         )
         
-        await interaction.response.edit_message(
-            content=None,
-            embed=embed,
-            view=None
-        )
+        # 根据响应状态选择编辑方法，兼容已 defer 的组件回调
+        if interaction.response.is_done():
+            await interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                view=None
+            )
+        else:
+            await interaction.response.edit_message(
+                content=None,
+                embed=embed,
+                view=None
+            )
     
     # ========== 辅助方法 ==========
     
@@ -619,6 +719,70 @@ class GymChallengeCog(BaseCog):
             }
         return None
     
+    async def _get_challenge_ban_entry(self, guild_id: str, member: discord.Member) -> Optional[dict]:
+        """检查挑战封禁名单"""
+        async with self.db.get_connection() as conn:
+            conn.row_factory = self.db.dict_row
+            # 先检查用户被单独封禁
+            async with conn.execute(
+                """
+                SELECT reason, added_by, timestamp, target_type, target_id
+                FROM challenge_ban_list
+                WHERE guild_id = ? AND target_type = 'user' AND target_id = ?
+                LIMIT 1
+                """,
+                (guild_id, str(member.id))
+            ) as cursor:
+                entry = await cursor.fetchone()
+                if entry:
+                    return dict(entry)
+            
+            # 再检查用户的身份组是否被封禁
+            role_ids = [str(role.id) for role in member.roles if role is not None]
+            if not role_ids:
+                return None
+            
+            placeholders = ','.join('?' for _ in role_ids)
+            query = f"""
+                SELECT reason, added_by, timestamp, target_type, target_id
+                FROM challenge_ban_list
+                WHERE guild_id = ? AND target_type = 'role'
+                AND target_id IN ({placeholders})
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
+            params = [guild_id] + role_ids
+            async with conn.execute(query, params) as cursor:
+                role_entry = await cursor.fetchone()
+                if role_entry:
+                    return dict(role_entry)
+        
+        return None
+    
+    def _format_challenge_ban_message(self, entry: dict, member: discord.Member) -> str:
+        """格式化挑战封禁通知（不显示封禁人）"""
+        reason = entry.get('reason') or "未提供"
+        
+        timestamp = parse_beijing_time(entry.get('timestamp'))
+        timestamp_str = format_beijing_display(timestamp) if timestamp else "未知时间"
+        
+        target_type = entry.get('target_type')
+        target_id = entry.get('target_id')
+        if target_type == 'role':
+            role = member.guild.get_role(int(target_id)) if member.guild else None
+            target_display = role.mention if role else f"身份组 ID `{target_id}`"
+        else:
+            target_display = member.mention
+        
+        return (
+            "🚫 **挑战封禁限制**\n\n"
+            "你目前被禁止挑战本服务器的道馆。\n\n"
+            f"• 封禁对象: {target_display}\n"
+            f"• 封禁原因: {reason}\n"
+            f"• 执行时间: {timestamp_str}\n\n"
+            "如需解除封禁，请联系服务器管理人员。"
+        )
+    
     async def _increment_failure(self, user_id: str, guild_id: str, gym_id: str) -> timedelta:
         """增加失败次数并计算封禁时间"""
         async with self.db.get_connection() as conn:
@@ -637,9 +801,14 @@ class GymChallengeCog(BaseCog):
             
             banned_until = None
             if ban_duration.total_seconds() > 0:
-                # 使用UTC时间保持一致性
-                import pytz
-                banned_until = (datetime.now(pytz.UTC) + ban_duration).isoformat()
+                banned_until_dt = get_beijing_now() + ban_duration
+                banned_until = format_beijing_iso(banned_until_dt)
+                logger.info(
+                    "User %s banned from gym %s until %s (Beijing time)",
+                    user_id,
+                    gym_id,
+                    banned_until,
+                )
             
             # 更新数据库
             await conn.execute('''
@@ -677,9 +846,9 @@ class GymChallengeCog(BaseCog):
         logger.info(f"Gym {gym_id} marked as completed for user {user_id}")
     
     async def _update_ultimate_leaderboard(self, guild_id: str, user_id: str, time_seconds: float):
-        """更新究极道馆排行榜"""
+        """更新究极道馆排行榜（新库），并可选同步到旧库以实现数据互通"""
         async with self.db.get_connection() as conn:
-            # 检查是否有更好的成绩
+            # 检查是否有更好的成绩（新库）
             async with conn.execute(
                 "SELECT completion_time_seconds FROM ultimate_gym_leaderboard "
                 "WHERE guild_id = ? AND user_id = ?",
@@ -688,22 +857,55 @@ class GymChallengeCog(BaseCog):
                 existing = await cursor.fetchone()
             
             if existing and time_seconds >= existing[0]:
-                return  # 新成绩不如旧成绩
-            
-            # 更新或插入成绩
-            import pytz
-            timestamp = datetime.now(pytz.UTC).isoformat()
-            await conn.execute('''
-                INSERT INTO ultimate_gym_leaderboard (guild_id, user_id, completion_time_seconds, timestamp)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(guild_id, user_id) DO UPDATE SET
-                completion_time_seconds = excluded.completion_time_seconds,
-                timestamp = excluded.timestamp
-            ''', (guild_id, user_id, time_seconds, timestamp))
-            
-            await conn.commit()
+                # 新成绩不如旧成绩，仍尝试进行旧库同步（保证旧库至少不更差）
+                pass
+            else:
+                # 更新或插入新库成绩
+                import pytz
+                timestamp = datetime.now(pytz.UTC).isoformat()
+                await conn.execute('''
+                    INSERT INTO ultimate_gym_leaderboard (guild_id, user_id, completion_time_seconds, timestamp)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    completion_time_seconds = excluded.completion_time_seconds,
+                    timestamp = excluded.timestamp
+                ''', (guild_id, user_id, time_seconds, timestamp))
+                await conn.commit()
+                logger.info(f"Updated ultimate leaderboard (new DB) for user {user_id}: {time_seconds:.2f}s")
         
-        logger.info(f"Updated ultimate leaderboard for user {user_id}: {time_seconds:.2f}s")
+        # 可选：同步到旧库（根据配置启用），实现“数据互通”
+        try:
+            # 延迟导入，避免循环依赖/启动阶段问题
+            from core.database import get_legacy_db_path, DatabaseManager
+            from core.constants import BEIJING_TZ
+            legacy_path = get_legacy_db_path()
+            if legacy_path:
+                # 连接旧库
+                legacy_db = DatabaseManager(db_path=legacy_path)
+                async with legacy_db.get_connection() as lconn:
+                    # 查询旧库当前最佳
+                    async with lconn.execute(
+                        "SELECT completion_time_seconds FROM ultimate_gym_leaderboard WHERE guild_id = ? AND user_id = ?",
+                        (guild_id, user_id)
+                    ) as cursor:
+                        lexisting = await cursor.fetchone()
+                    
+                    # 仅在新成绩更好时写入旧库（保持“最佳成绩”语义一致）
+                    if not lexisting or time_seconds < float(lexisting[0]):
+                        l_timestamp = datetime.now(BEIJING_TZ).isoformat()
+                        await lconn.execute("""
+                            INSERT INTO ultimate_gym_leaderboard (guild_id, user_id, completion_time_seconds, timestamp)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                                completion_time_seconds = excluded.completion_time_seconds,
+                                timestamp = excluded.timestamp
+                        """, (guild_id, user_id, time_seconds, l_timestamp))
+                        await lconn.commit()
+                        logger.info(f"Synced ultimate leaderboard to legacy DB for user {user_id}: {time_seconds:.2f}s")
+                    else:
+                        logger.info(f"Legacy DB has better or equal record for user {user_id}; skip legacy update")
+        except Exception as e:
+            logger.warning(f"Legacy leaderboard sync failed or disabled: {e}")
     
     async def _show_tutorial(self, interaction: discord.Interaction, session: ChallengeSession):
         """显示教程"""
@@ -736,17 +938,53 @@ class GymChallengeCog(BaseCog):
         
         view.on_timeout = enhanced_on_timeout
         
-        # 直接编辑原始消息（选择列表消息）
-        # 这样教程会替换选择列表，实现平滑过渡
-        await interaction.edit_original_response(
-            content=None,  # 清空之前的content
-            embed=embed,
-            view=view
-        )
+        # 究极道馆教程使用私密消息，不修改原面板；普通道馆保持原有编辑行为
+        if session.is_ultimate:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                else:
+                    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+                logger.info(f"Sent ultimate challenge tutorial as ephemeral message for user {session.user_id}")
+            except Exception as e:
+                logger.error(f"Failed to send ultimate tutorial ephemeral message: {e}", exc_info=True)
+                # 兜底：若私密消息失败，尝试编辑原始响应以避免交互卡死
+                try:
+                    await interaction.edit_original_response(content=None, embed=embed, view=view)
+                except Exception:
+                    # 最后兜底：尝试followup公开消息（极端情况）
+                    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        else:
+            # 普通道馆：编辑原始消息（选择列表消息）
+            # 这样教程会替换选择列表，实现平滑过渡
+            await interaction.edit_original_response(
+                content=None,  # 清空之前的content
+                embed=embed,
+                view=view
+            )
+            logger.info(f"Edited response with tutorial for user {session.user_id} in gym {session.gym_id}")
     
     async def _display_next_question(self, interaction: discord.Interaction,
                                     session: ChallengeSession, from_modal: bool = False):
         """显示下一个题目"""
+        # 先执行封禁检查，防止进入题目阶段
+        ban_entry = await self._get_challenge_ban_entry(session.guild_id, interaction.user)
+        if ban_entry:
+            if session.user_id in self.active_challenges:
+                del self.active_challenges[session.user_id]
+            ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
+            if interaction.response.is_done():
+                try:
+                    await interaction.edit_original_response(content=ban_message, embed=None, view=None)
+                except Exception:
+                    await interaction.followup.send(ban_message, ephemeral=True)
+            else:
+                try:
+                    await interaction.response.edit_message(content=ban_message, embed=None, view=None)
+                except Exception:
+                    await interaction.response.send_message(ban_message, ephemeral=True)
+            return
+
         question = session.get_current_question()
         if not question:
             logger.error(f"No question found for user {session.user_id} at index {session.current_question_index}")
@@ -768,24 +1006,80 @@ class GymChallengeCog(BaseCog):
         
         # 根据题目类型设置视图
         if question['type'] == 'multiple_choice':
-            options = question['options']
-            # 选项随机化
+            # 数据完整性验证与诊断日志
+            options = question.get('options') or []
+            correct_field = question.get('correct_answer')
+            if not isinstance(options, list) or len(options) < 2:
+                logger.error(f"Invalid MC options for user {session.user_id}: options={options}")
+                try:
+                    await interaction.followup.send(
+                        "❌ 题目数据异常，请联系管理员。",
+                        ephemeral=True
+                    )
+                except Exception:
+                    pass
+                return
+
+            # 将正确答案统一解析为“选项文本”，以兼容 'A'/'B'/索引 等数据格式
+            def _resolve_correct_text(field, opts):
+                try:
+                    if field is None:
+                        return None
+                    # 如果本身就是选项文本，直接返回
+                    if isinstance(field, str) and field in opts:
+                        return field
+                    # 字母索引（A/B/C...）
+                    if isinstance(field, str):
+                        letter = field.strip().upper()
+                        if len(letter) == 1 and 'A' <= letter <= 'Z':
+                            idx = ord(letter) - ord('A')
+                            if 0 <= idx < len(opts):
+                                return opts[idx]
+                    # 数字索引
+                    if isinstance(field, int):
+                        if 0 <= field < len(opts):
+                            return opts[field]
+                    # 列表：尝试解析首项
+                    if isinstance(field, list) and field:
+                        first = field[0]
+                        return _resolve_correct_text(first, opts)
+                except Exception:
+                    pass
+                # 无法解析，返回原始字段字符串化（允许自由文本答案）
+                return str(field) if field is not None else None
+
+            correct_text = _resolve_correct_text(correct_field, options)
+            if correct_text is None:
+                logger.warning(f"MC question missing or unresolvable correct_answer for user {session.user_id} raw={correct_field}")
+            else:
+                # 诊断：若原始字段不是选项文本且解析成功，记录一次信息日志
+                try:
+                    if isinstance(correct_field, (str, int, list)) and not (isinstance(correct_field, str) and correct_field in options):
+                        logger.info(f"Resolved correct_answer '{correct_field}' -> '{correct_text}' for user {session.user_id}")
+                except Exception:
+                    pass
+
+            # 选项随机化（与正确答案文本无关，按钮以选项文本比对）
             if session.randomize_options:
                 shuffled_options = options[:]
                 random.shuffle(shuffled_options)
             else:
                 shuffled_options = options
-            
+            try:
+                logger.warning(f"[mc-render] user={session.user_id} qidx={session.current_question_index} randomize={session.randomize_options} opts={options} shuffled={shuffled_options}")
+            except Exception:
+                pass
+
             # 格式化选项
             formatted_options = []
             for i, option_text in enumerate(shuffled_options):
                 letter = chr(ord('A') + i)
                 formatted_options.append(f"**{letter}:** {option_text}")
-            
+
             embed.description = question['text'] + "\n\n" + "\n".join(formatted_options)
-            
-            # 为视图添加选项按钮
-            view.setup_multiple_choice(shuffled_options, question['correct_answer'])
+
+            # 为视图添加选项按钮（unique custom_id 在视图内部实现）
+            view.setup_multiple_choice(shuffled_options, correct_text)
             
         elif question['type'] == 'true_false':
             view.setup_true_false(question['correct_answer'])
@@ -896,10 +1190,14 @@ class GymChallengeCog(BaseCog):
         guild_id = session.guild_id
         
         ban_duration = timedelta(seconds=0)
+        banned_until_time = None
         
         # 只对普通道馆应用失败惩罚
         if not session.is_ultimate:
             ban_duration = await self._increment_failure(user_id, guild_id, session.gym_id)
+            failure_status = await self._get_failure_status(user_id, guild_id, session.gym_id)
+            if failure_status and failure_status.get('banned_until'):
+                banned_until_time = parse_beijing_time(failure_status['banned_until'])
         
         # 清理会话
         if user_id in self.active_challenges:
@@ -921,6 +1219,8 @@ class GymChallengeCog(BaseCog):
         if ban_duration.total_seconds() > 0:
             time_str = format_timedelta(ban_duration)
             fail_desc += f"\n\n由于累计挑战失败次数过多，你已被禁止挑战该道馆 **{time_str}**。"
+            if banned_until_time:
+                fail_desc += f"\n解封时间（北京时间）：`{format_beijing_display(banned_until_time)}`"
         else:
             if not session.is_ultimate:
                 fail_desc += "\n\n请稍后重试。"
@@ -1058,8 +1358,16 @@ class GymChallengeCog(BaseCog):
     
     async def _trigger_leaderboard_update(self, guild_id: int):
         """触发排行榜更新"""
-        # 这将由排行榜Cog处理
-        pass
+        try:
+            # 尝试调用排行榜Cog的更新方法
+            leaderboard_cog = self.bot.get_cog('LeaderboardCog')
+            if leaderboard_cog:
+                await leaderboard_cog.trigger_leaderboard_update(guild_id)
+                logger.info(f"Triggered leaderboard update for guild {guild_id} via LeaderboardCog")
+            else:
+                logger.warning(f"LeaderboardCog not found when attempting to trigger leaderboard update for guild {guild_id}")
+        except Exception as e:
+            logger.error(f"Error triggering leaderboard update for guild {guild_id}: {e}", exc_info=True)
     
     async def _is_user_blacklisted(self, guild_id: str, member: discord.Member) -> bool:
         """检查用户是否在黑名单中"""

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Optional
 
 import discord
@@ -170,6 +171,30 @@ class BaseCog(commands.Cog):
             description=message,
             color=discord.Color.green()
         )
+
+    def log_action(
+        self,
+        action: str,
+        user_id: str,
+        guild_id: Optional[str] = None,
+        extra: Optional[dict] = None,
+        level: int = logging.INFO
+    ) -> None:
+        """
+        统一的业务操作日志：包含操作类型与用户ID，便于审计与排查。
+        示例：ACTION=CHALLENGE_START user=123 guild=456 panel_id=789
+        """
+        try:
+            parts = [f"ACTION={action}", f"user={user_id}"]
+            if guild_id:
+                parts.append(f"guild={guild_id}")
+            if extra:
+                for k, v in extra.items():
+                    parts.append(f"{k}={v}")
+            self.logger.log(level, " ".join(parts))
+        except Exception as e:
+            # 保证日志失败不会影响业务流程
+            self.logger.error(f"Failed to log action '{action}' for user {user_id}: {e}", exc_info=True)
 
 
 def setup_cog(bot: commands.Bot, cog_class: type) -> None:

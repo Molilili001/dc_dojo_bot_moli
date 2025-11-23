@@ -2,16 +2,26 @@ import discord
 from discord.ext import commands
 import json
 import os
+import asyncio
 
 
 class HuidingCog(commands.Cog):
     """回顶功能 Cog - 检测 '/回顶'、'／回顶' 或 '回顶' 消息并回复首楼链接"""
     
+    # 清理延迟（秒）
+    CLEANUP_DELAY = 300
+    # 无权限删除用户消息时是否静默（False=在频道内提示一次，便于后续切换为静默模式）
+    SILENT_ON_PERMISSION_ERROR = False
+    
     def __init__(self, bot):
         self.bot = bot
         self.server_settings = {}
         self.settings_file = 'huiding_settings.json'
+        # 回顶使用统计（按guild+user记录）
+        self.usage_stats = {}
+        self.stats_file = 'huiding_stats.json'
         self.load_settings()
+        self.load_stats()
     
     def load_settings(self):
         """加载服务器设置"""
@@ -30,6 +40,44 @@ class HuidingCog(commands.Cog):
                 json.dump(self.server_settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f'⚠️ 回顶功能保存设置失败: {e}')
+    
+    def load_stats(self):
+        """加载回顶使用统计"""
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    self.usage_stats = json.load(f)
+        except Exception as e:
+            print(f'⚠️ 回顶统计加载失败: {e}')
+            self.usage_stats = {}
+    
+    def save_stats(self):
+        """保存回顶使用统计"""
+        try:
+            with open(self.stats_file, 'w', encoding='utf-8') as f:
+                json.dump(self.usage_stats, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f'⚠️ 回顶统计保存失败: {e}')
+    
+    def get_usage_count(self, guild_id: int, user_id: int) -> int:
+        """获取用户的回顶次数（按服务器）"""
+        guild_key = str(guild_id)
+        user_key = str(user_id)
+        return self.usage_stats.get(guild_key, {}).get(user_key, 0)
+    
+    def increment_usage_count(self, guild_id: int, user_id: int) -> int:
+        """增加并返回用户的回顶次数（按服务器）"""
+        guild_key = str(guild_id)
+        user_key = str(user_id)
+        if guild_key not in self.usage_stats:
+            self.usage_stats[guild_key] = {}
+        current = self.usage_stats[guild_key].get(user_key, 0) + 1
+        self.usage_stats[guild_key][user_key] = current
+        try:
+            self.save_stats()
+        except Exception as e:
+            print(f'⚠️ 回顶统计写入失败: {e}')
+        return current
     
     def is_huiding_enabled(self, guild_id):
         """检查服务器是否启用了回顶功能"""
@@ -171,11 +219,15 @@ class HuidingCog(commands.Cog):
                         preview = first_message.content[:100] + "..." if len(first_message.content) > 100 else first_message.content
                         embed.add_field(name="📝 首楼内容预览", value=f"```{preview}```", inline=False)
                     
-                    embed.set_footer(text=f"首楼作者: {first_message.author.display_name}", 
-                                   icon_url=first_message.author.display_avatar.url)
+                    # 统计与显示用户使用次数（在页脚小字显示）
+                    usage_count = self.increment_usage_count(message.guild.id, message.author.id)
+                    footer_text = f"首楼作者: {first_message.author.display_name} • 茉莉已经为你提供了{usage_count}次回顶链接"
+                    embed.set_footer(text=footer_text, icon_url=first_message.author.display_avatar.url)
                     
-                    # 发送临时回复消息（5分钟后自动删除）
-                    await message.reply(embed=embed, delete_after=300)
+                    # 发送回复消息（不使用 delete_after，改为统一调度清理）
+                    reply_msg = await message.reply(embed=embed)
+                    # 调度在 CLEANUP_DELAY 秒后同时删除机器人回复与触发消息
+                    self.bot.loop.create_task(self._schedule_cleanup(channel, message, reply_msg))
                     # 给原消息添加反应表示已处理
                     await message.add_reaction('✅')
                     
@@ -232,6 +284,52 @@ class HuidingCog(commands.Cog):
                 await message.add_reaction('❌')
                 
                 print(f'❌ 回顶功能处理指令时发生错误: {e}')
+
+
+    async def _schedule_cleanup(
+        self,
+        channel: discord.TextChannel,
+        trigger_message: discord.Message,
+        reply_message: discord.Message
+    ):
+        """
+        在 CLEANUP_DELAY 秒后同时删除机器人回复与触发回顶的原消息。
+        - 已被删除则忽略
+        - 无权限删除用户消息时，根据 SILENT_ON_PERMISSION_ERROR 决定是否在频道提示
+        """
+        try:
+            await asyncio.sleep(self.CLEANUP_DELAY)
+        except Exception:
+            # 即便 sleep 被取消，也不阻塞后续清理尝试
+            pass
+
+        # 优先删除机器人回复消息（删除自己消息通常不需要额外权限）
+        try:
+            await reply_message.delete()
+        except (discord.NotFound, AttributeError):
+            # 已被删除或对象无效，忽略
+            pass
+        except discord.HTTPException:
+            # 网络/速率限制问题，忽略
+            pass
+
+        # 删除触发回顶的原消息
+        try:
+            await trigger_message.delete()
+        except discord.Forbidden:
+            # 缺少删除他人消息的权限
+            if not self.SILENT_ON_PERMISSION_ERROR:
+                try:
+                    await channel.send("⚠️ 权限不足：无法删除触发回顶的原消息。", delete_after=10)
+                except Exception:
+                    # 无法在频道发提示也忽略（例如无发送消息权限或频道已不可用）
+                    pass
+        except (discord.NotFound, AttributeError):
+            # 已被删除或对象无效，忽略
+            pass
+        except discord.HTTPException:
+            # 网络/速率限制问题，忽略
+            pass
 
 
 async def setup(bot):

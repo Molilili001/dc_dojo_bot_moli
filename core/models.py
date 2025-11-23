@@ -251,3 +251,90 @@ class ClaimedReward:
 
 # 添加别名以兼容旧代码
 BanEntry = ChallengeFailure  # 用于兼容旧代码中的 BanEntry 引用
+
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+from datetime import datetime
+
+@dataclass
+class ForumMonitorConfig:
+    """论坛发帖监控配置数据模型"""
+    guild_id: str
+    forum_channel_id: str
+    auto_role_enabled: bool = False
+    auto_role_id: Optional[str] = None
+    notify_enabled: bool = True
+    notify_message: Optional[str] = None
+    mention_role_enabled: bool = False
+    mention_role_id: Optional[str] = None
+    mention_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式（适配数据库驱动）"""
+        return {
+            'guild_id': self.guild_id,
+            'forum_channel_id': self.forum_channel_id,
+            'auto_role_enabled': 1 if self.auto_role_enabled else 0,
+            'auto_role_id': self.auto_role_id,
+            'notify_enabled': 1 if self.notify_enabled else 0,
+            'notify_message': self.notify_message,
+            'mention_role_enabled': 1 if self.mention_role_enabled else 0,
+            'mention_role_id': self.mention_role_id,
+            'mention_message': self.mention_message,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> 'ForumMonitorConfig':
+        """从数据库行字典构建实例"""
+        def parse_bool(v):
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return False
+            # SQLite BOOLEAN 可能以0/1或'TRUE'/'FALSE'出现
+            if isinstance(v, (int, float)):
+                return v != 0
+            s = str(v).strip().lower()
+            return s in ('1', 'true', 't', 'yes', 'y')
+        def parse_dt(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+
+        return cls(
+            guild_id=str(row.get('guild_id')),
+            forum_channel_id=str(row.get('forum_channel_id')),
+            auto_role_enabled=parse_bool(row.get('auto_role_enabled')),
+            auto_role_id=str(row.get('auto_role_id')) if row.get('auto_role_id') else None,
+            notify_enabled=parse_bool(row.get('notify_enabled')),
+            notify_message=row.get('notify_message') if row.get('notify_message') else None,
+            mention_role_enabled=parse_bool(row.get('mention_role_enabled')),
+            mention_role_id=str(row.get('mention_role_id')) if row.get('mention_role_id') else None,
+            mention_message=row.get('mention_message') if row.get('mention_message') else None,
+            created_at=parse_dt(row.get('created_at')),
+            updated_at=parse_dt(row.get('updated_at')),
+        )
+
+    def to_json(self) -> str:
+        """转换为JSON字符串"""
+        import json
+        return json.dumps({
+            'guild_id': self.guild_id,
+            'forum_channel_id': self.forum_channel_id,
+            'auto_role_enabled': self.auto_role_enabled,
+            'auto_role_id': self.auto_role_id,
+            'notify_enabled': self.notify_enabled,
+            'notify_message': self.notify_message,
+            'mention_role_enabled': self.mention_role_enabled,
+            'mention_role_id': self.mention_role_id,
+            'mention_message': self.mention_message,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }, ensure_ascii=False, indent=4)

@@ -44,6 +44,9 @@ class DiscordBot(commands.Bot):
             "DeveloperCog": "开发者工具",
             "AutoMonitorCog": "自动监控",
             "CrossBotSyncCog": "跨bot联动",
+            "ForumPostMonitorCog": "投诉监听",
+            "TodoListCog": "事件列表",
+            "FeedbackCog": "反馈",
             # 中文名 -> 英文名（反向映射）
             "道馆管理": "GymManagementCog",
             "道馆挑战": "GymChallengeCog",
@@ -54,7 +57,11 @@ class DiscordBot(commands.Bot):
             "管理员命令": "AdminCog",
             "开发者工具": "DeveloperCog",
             "自动监控": "AutoMonitorCog",
-            "跨bot联动": "CrossBotSyncCog"
+            "跨bot联动": "CrossBotSyncCog",
+            "帖子监控": "ForumPostMonitorCog",
+            "投诉监听": "ForumPostMonitorCog",
+            "事件列表": "TodoListCog",
+            "反馈": "FeedbackCog"
         }
         # 设置intents
         intents = discord.Intents.default()
@@ -114,7 +121,10 @@ class DiscordBot(commands.Bot):
             "cogs.admin",             # 管理员命令
             "cogs.developer",         # 开发者工具
             "cogs.auto_monitor",      # 自动监控
+            "cogs.forum_post_monitor",# 帖子监控
             "cogs.cross_bot_sync",    # 跨bot联动
+            "cogs.todo_list",         # 事件列表
+            "cogs.feedback",          # 反馈
         ]
         
         # 尝试加载回顶功能（如果存在）
@@ -185,9 +195,18 @@ class DiscordBot(commands.Bot):
                 elif cog_name == "auto_monitor":
                     print("👁️ 自动监控 Cog 已加载")
                     logger.info("自动监控 Cog 已加载")
+                elif cog_name == "forum_post_monitor":
+                    print("🧾 投诉监听 Cog 已加载")
+                    logger.info("投诉监听 Cog 已加载")
                 elif cog_name == "cross_bot_sync":
                     print("🔄 跨bot联动 Cog 已加载")
                     logger.info("跨bot联动 Cog 已加载")
+                elif cog_name == "todo_list":
+                    print("📝 事件列表 Cog 已加载")
+                    logger.info("事件列表 Cog 已加载")
+                elif cog_name == "feedback":
+                    print("💬 反馈 Cog 已加载")
+                    logger.info("反馈 Cog 已加载")
                 else:
                     print(f"✅ {cog_name} Cog 已加载")
                     logger.info(f"{cog_name} Cog 已加载")

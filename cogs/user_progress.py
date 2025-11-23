@@ -4,14 +4,14 @@ from discord import app_commands
 import json
 from typing import Optional, List
 from datetime import datetime
-import pytz
 
 from cogs.base_cog import BaseCog
 from core.database import DatabaseManager
 from core.models import UserProgress, Gym
-from utils.formatters import format_user_progress, format_badge_wall, format_time
+from utils.formatters import format_user_progress, format_badge_wall, format_time, format_timedelta
 from utils.permissions import has_gym_permission
 from utils.logger import get_logger
+from utils.time_utils import get_beijing_now, parse_beijing_time, remaining_until, format_beijing_display
 
 logger = get_logger(__name__)
 
@@ -354,14 +354,17 @@ class UserProgressCog(BaseCog):
             return None
         
         lines = []
+        now = get_beijing_now()
         for name, count, banned_until in rows:
             status = f"失败 {count} 次"
             if banned_until:
-                banned_dt = datetime.fromisoformat(banned_until)
-                # 确保使用相同的时区进行比较
-                now = datetime.now(pytz.UTC) if banned_dt.tzinfo else datetime.now()
-                if banned_dt > now:
-                    status += " (冷却中)"
+                banned_dt = parse_beijing_time(banned_until)
+                remaining = remaining_until(banned_dt, now)
+                if remaining:
+                    status += f" (冷却中，剩余 {format_timedelta(remaining)})"
+                    status += f"\n   解封时间（北京时间）: `{format_beijing_display(banned_dt)}`"
+                else:
+                    status += " (冷却已解除)"
             lines.append(f"• **{name}**: {status}")
         
         return "\n".join(lines)
