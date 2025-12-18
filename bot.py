@@ -47,6 +47,7 @@ class DiscordBot(commands.Bot):
             "ForumPostMonitorCog": "投诉监听",
             "TodoListCog": "事件列表",
             "FeedbackCog": "反馈",
+            "ThreadCommandCog": "帖子命令",
             # 中文名 -> 英文名（反向映射）
             "道馆管理": "GymManagementCog",
             "道馆挑战": "GymChallengeCog",
@@ -61,7 +62,8 @@ class DiscordBot(commands.Bot):
             "帖子监控": "ForumPostMonitorCog",
             "投诉监听": "ForumPostMonitorCog",
             "事件列表": "TodoListCog",
-            "反馈": "FeedbackCog"
+            "反馈": "FeedbackCog",
+            "帖子命令": "ThreadCommandCog"
         }
         # 设置intents
         intents = discord.Intents.default()
@@ -125,11 +127,12 @@ class DiscordBot(commands.Bot):
             "cogs.cross_bot_sync",    # 跨bot联动
             "cogs.todo_list",         # 事件列表
             "cogs.feedback",          # 反馈
+            "cogs.thread_command",    # 帖子命令（回顶功能升级版）
         ]
         
-        # 尝试加载回顶功能（如果存在）
+        # 可选Cogs（向后兼容）
         self.optional_cogs = [
-            "huiding_cog",                    # 回顶功能（兼容原始Bot）
+            # huiding_cog 已被 thread_command 替代，保留以防需要回滚
         ]
     
     async def setup_hook(self) -> None:
@@ -207,6 +210,10 @@ class DiscordBot(commands.Bot):
                 elif cog_name == "feedback":
                     print("💬 反馈 Cog 已加载")
                     logger.info("反馈 Cog 已加载")
+                elif cog_name == "thread_command":
+                    print("🔝 帖子命令 Cog 已加载")
+                    print('🤖 正在监听自定义触发词（包含回顶功能）...')
+                    logger.info("帖子命令 Cog 已加载")
                 else:
                     print(f"✅ {cog_name} Cog 已加载")
                     logger.info(f"{cog_name} Cog 已加载")
