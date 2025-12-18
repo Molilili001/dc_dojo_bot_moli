@@ -604,6 +604,151 @@ class DatabaseManager:
         ''')
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_snapshots_guild_user ON message_counter_snapshots (guild_id, user_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_snapshots_updated ON message_counter_snapshots (updated_at)")
+        
+        # --- 帖子自定义命令系统相关表 ---
+        # 命令规则表
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_rules (
+                rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                thread_id TEXT,
+                forum_channel_id TEXT,
+                action_type TEXT NOT NULL,
+                reply_content TEXT,
+                reply_embed_json TEXT,
+                delete_trigger_delay INTEGER,
+                delete_reply_delay INTEGER,
+                add_reaction TEXT,
+                user_reply_cooldown INTEGER,
+                user_delete_cooldown INTEGER,
+                thread_reply_cooldown INTEGER,
+                thread_delete_cooldown INTEGER,
+                channel_reply_cooldown INTEGER,
+                channel_delete_cooldown INTEGER,
+                is_enabled BOOLEAN DEFAULT TRUE,
+                priority INTEGER DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_guild_scope ON thread_command_rules (guild_id, scope)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_thread ON thread_command_rules (thread_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_guild_enabled ON thread_command_rules (guild_id, is_enabled)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_lookup ON thread_command_rules (guild_id, scope, is_enabled, priority DESC)")
+        
+        # 触发器表（支持多触发器）
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_triggers (
+                trigger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                trigger_text TEXT NOT NULL,
+                trigger_mode TEXT DEFAULT 'exact',
+                is_enabled BOOLEAN DEFAULT TRUE,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (rule_id) REFERENCES thread_command_rules(rule_id) ON DELETE CASCADE
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tct_rule ON thread_command_triggers (rule_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tct_text_mode ON thread_command_triggers (trigger_text, trigger_mode)")
+        
+        # 权限配置表
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_permissions (
+                guild_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                permission_level TEXT NOT NULL,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, target_id, target_type, permission_level)
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcp_guild_type ON thread_command_permissions (guild_id, target_type)")
+        
+        # 使用统计表
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_stats (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                rule_id INTEGER,
+                trigger_text TEXT,
+                usage_count INTEGER DEFAULT 0,
+                last_used_at TEXT,
+                PRIMARY KEY (guild_id, user_id, rule_id)
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcs_guild_user ON thread_command_stats (guild_id, user_id)")
+        
+        # 全服配置表
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_server_config (
+                guild_id TEXT PRIMARY KEY,
+                is_enabled BOOLEAN DEFAULT TRUE,
+                allow_thread_owner_config BOOLEAN DEFAULT TRUE,
+                allowed_forum_channels TEXT,
+                default_delete_trigger_delay INTEGER,
+                default_delete_reply_delay INTEGER,
+                default_user_reply_cooldown INTEGER DEFAULT 60,
+                default_user_delete_cooldown INTEGER DEFAULT 0,
+                default_thread_reply_cooldown INTEGER DEFAULT 30,
+                default_thread_delete_cooldown INTEGER DEFAULT 0,
+                default_channel_reply_cooldown INTEGER DEFAULT 10,
+                default_channel_delete_cooldown INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        
+        # --- 数据迁移：为 thread_command_server_config 添加 allowed_forum_channels 列 ---
+        try:
+            await conn.execute("ALTER TABLE thread_command_server_config ADD COLUMN allowed_forum_channels TEXT")
+            logger.info("数据库迁移: 已为 thread_command_server_config 添加列 allowed_forum_channels")
+        except Exception:
+            # 已存在则忽略
+            pass
+        
+        # 消息处理日志表
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_message_log (
+                message_id TEXT PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_id TEXT,
+                user_id TEXT NOT NULL,
+                rule_id INTEGER,
+                status TEXT NOT NULL,
+                action_taken TEXT,
+                reply_message_id TEXT,
+                scheduled_delete_at TEXT,
+                deleted_at TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcml_status_time ON thread_command_message_log (status, created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcml_scheduled_delete ON thread_command_message_log (scheduled_delete_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcml_guild_channel ON thread_command_message_log (guild_id, channel_id, created_at)")
+        
+        # 限流状态表
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_command_rate_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                rule_id INTEGER NOT NULL,
+                limit_type TEXT NOT NULL,
+                limit_target TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                last_triggered_at TEXT NOT NULL,
+                trigger_count INTEGER DEFAULT 1,
+                UNIQUE(guild_id, rule_id, limit_type, limit_target, action_type)
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcrl_lookup ON thread_command_rate_limits (guild_id, rule_id, limit_type, limit_target, action_type)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcrl_time ON thread_command_rate_limits (last_triggered_at)")
+        
         # --- 数据修复：统一 randomize_options 为 TRUE（仅影响历史为 NULL 或 0 的记录） ---
         try:
             await conn.execute("""

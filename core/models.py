@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
+import re
 
 
 @dataclass
@@ -338,3 +339,390 @@ class ForumMonitorConfig:
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }, ensure_ascii=False, indent=4)
+
+
+# ==================== 帖子自定义命令系统数据模型 ====================
+
+@dataclass
+class ThreadCommandTrigger:
+    """
+    触发器数据模型
+    
+    一个规则可以有多个触发器，任一触发器匹配即执行规则动作。
+    支持四种匹配模式：exact(精确)、prefix(前缀)、contains(包含)、regex(正则)
+    """
+    trigger_id: Optional[int]
+    rule_id: int                    # 关联的规则ID
+    trigger_text: str               # 触发文本或正则表达式
+    trigger_mode: str = 'exact'     # 'exact', 'prefix', 'contains', 'regex'
+    is_enabled: bool = True
+    created_at: Optional[datetime] = None
+    
+    # 预编译的正则（运行时缓存，不持久化）
+    _compiled_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
+    
+    def compile_regex(self) -> Optional[re.Pattern]:
+        """预编译正则表达式，提升匹配性能"""
+        if self.trigger_mode == 'regex' and self._compiled_regex is None:
+            try:
+                self._compiled_regex = re.compile(self.trigger_text, re.IGNORECASE)
+            except re.error:
+                return None
+        return self._compiled_regex
+    
+    def match(self, content: str) -> bool:
+        """检查内容是否匹配此触发器"""
+        if not self.is_enabled:
+            return False
+        content = content.strip()
+        trigger = self.trigger_text.strip()
+        
+        if self.trigger_mode == 'exact':
+            return content == trigger
+        elif self.trigger_mode == 'prefix':
+            return content.startswith(trigger)
+        elif self.trigger_mode == 'contains':
+            return trigger in content
+        elif self.trigger_mode == 'regex':
+            pattern = self.compile_regex()
+            return bool(pattern.search(content)) if pattern else False
+        return False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式"""
+        return {
+            'trigger_id': self.trigger_id,
+            'rule_id': self.rule_id,
+            'trigger_text': self.trigger_text,
+            'trigger_mode': self.trigger_mode,
+            'is_enabled': self.is_enabled,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+    
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> 'ThreadCommandTrigger':
+        """从数据库行字典构建实例"""
+        def parse_dt(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+        
+        def parse_bool(v):
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return True
+            if isinstance(v, (int, float)):
+                return v != 0
+            s = str(v).strip().lower()
+            return s in ('1', 'true', 't', 'yes', 'y')
+        
+        return cls(
+            trigger_id=row.get('trigger_id'),
+            rule_id=row.get('rule_id'),
+            trigger_text=row.get('trigger_text', ''),
+            trigger_mode=row.get('trigger_mode', 'exact'),
+            is_enabled=parse_bool(row.get('is_enabled', True)),
+            created_at=parse_dt(row.get('created_at')),
+        )
+
+
+@dataclass
+class ThreadCommandRule:
+    """
+    帖子命令规则数据模型
+    
+    规则定义了触发条件和对应的动作。
+    scope='server' 表示全服规则，scope='thread' 表示帖子级规则。
+    """
+    rule_id: Optional[int]
+    guild_id: str
+    scope: str                      # 'server' 或 'thread'
+    thread_id: Optional[str] = None
+    forum_channel_id: Optional[str] = None
+    
+    # 触发器列表（通过 thread_command_triggers 表关联）
+    triggers: List[ThreadCommandTrigger] = field(default_factory=list)
+    
+    # 动作配置
+    action_type: str = 'reply'      # 'reply', 'go_to_top', 'react', 'reply_and_react'
+    reply_content: Optional[str] = None
+    reply_embed_json: Optional[str] = None
+    delete_trigger_delay: Optional[int] = None   # 秒，None=不删除
+    delete_reply_delay: Optional[int] = None     # 秒，None=不删除
+    add_reaction: Optional[str] = None
+    
+    # 分级限流配置（None=使用全服默认）
+    user_reply_cooldown: Optional[int] = None
+    user_delete_cooldown: Optional[int] = None
+    thread_reply_cooldown: Optional[int] = None
+    thread_delete_cooldown: Optional[int] = None
+    channel_reply_cooldown: Optional[int] = None
+    channel_delete_cooldown: Optional[int] = None
+    
+    # 元数据
+    is_enabled: bool = True
+    priority: int = 0               # 数值越大优先级越高
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    
+    def match(self, content: str) -> bool:
+        """检查内容是否匹配任一触发器"""
+        if not self.is_enabled:
+            return False
+        for trigger in self.triggers:
+            if trigger.match(content):
+                return True
+        return False
+    
+    def get_matched_trigger(self, content: str) -> Optional[ThreadCommandTrigger]:
+        """返回第一个匹配的触发器"""
+        if not self.is_enabled:
+            return None
+        for trigger in self.triggers:
+            if trigger.match(content):
+                return trigger
+        return None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式"""
+        return {
+            'rule_id': self.rule_id,
+            'guild_id': self.guild_id,
+            'scope': self.scope,
+            'thread_id': self.thread_id,
+            'forum_channel_id': self.forum_channel_id,
+            'triggers': [t.to_dict() for t in self.triggers],
+            'action_type': self.action_type,
+            'reply_content': self.reply_content,
+            'reply_embed_json': self.reply_embed_json,
+            'delete_trigger_delay': self.delete_trigger_delay,
+            'delete_reply_delay': self.delete_reply_delay,
+            'add_reaction': self.add_reaction,
+            'user_reply_cooldown': self.user_reply_cooldown,
+            'user_delete_cooldown': self.user_delete_cooldown,
+            'thread_reply_cooldown': self.thread_reply_cooldown,
+            'thread_delete_cooldown': self.thread_delete_cooldown,
+            'channel_reply_cooldown': self.channel_reply_cooldown,
+            'channel_delete_cooldown': self.channel_delete_cooldown,
+            'is_enabled': self.is_enabled,
+            'priority': self.priority,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+    
+    @classmethod
+    def from_row(cls, row: Dict[str, Any], triggers: Optional[List[ThreadCommandTrigger]] = None) -> 'ThreadCommandRule':
+        """从数据库行字典构建实例"""
+        def parse_dt(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+        
+        def parse_bool(v):
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return True
+            if isinstance(v, (int, float)):
+                return v != 0
+            s = str(v).strip().lower()
+            return s in ('1', 'true', 't', 'yes', 'y')
+        
+        def parse_int(v):
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return None
+        
+        return cls(
+            rule_id=row.get('rule_id'),
+            guild_id=str(row.get('guild_id', '')),
+            scope=row.get('scope', 'server'),
+            thread_id=str(row.get('thread_id')) if row.get('thread_id') else None,
+            forum_channel_id=str(row.get('forum_channel_id')) if row.get('forum_channel_id') else None,
+            triggers=triggers or [],
+            action_type=row.get('action_type', 'reply'),
+            reply_content=row.get('reply_content'),
+            reply_embed_json=row.get('reply_embed_json'),
+            delete_trigger_delay=parse_int(row.get('delete_trigger_delay')),
+            delete_reply_delay=parse_int(row.get('delete_reply_delay')),
+            add_reaction=row.get('add_reaction'),
+            user_reply_cooldown=parse_int(row.get('user_reply_cooldown')),
+            user_delete_cooldown=parse_int(row.get('user_delete_cooldown')),
+            thread_reply_cooldown=parse_int(row.get('thread_reply_cooldown')),
+            thread_delete_cooldown=parse_int(row.get('thread_delete_cooldown')),
+            channel_reply_cooldown=parse_int(row.get('channel_reply_cooldown')),
+            channel_delete_cooldown=parse_int(row.get('channel_delete_cooldown')),
+            is_enabled=parse_bool(row.get('is_enabled', True)),
+            priority=parse_int(row.get('priority')) or 0,
+            created_by=row.get('created_by'),
+            created_at=parse_dt(row.get('created_at')),
+            updated_at=parse_dt(row.get('updated_at')),
+        )
+
+
+@dataclass
+class ThreadCommandServerConfig:
+    """
+    服务器级别的帖子命令配置
+    
+    包含全服开关、贴主配置权限开关、允许的论坛频道、默认限流配置等。
+    """
+    guild_id: str
+    is_enabled: bool = True
+    allow_thread_owner_config: bool = True
+    allowed_forum_channels: Optional[str] = None  # JSON数组，存储允许的论坛频道ID列表
+    default_delete_trigger_delay: Optional[int] = None
+    default_delete_reply_delay: Optional[int] = None
+    
+    # 默认限流配置
+    default_user_reply_cooldown: int = 60
+    default_user_delete_cooldown: int = 0
+    default_thread_reply_cooldown: int = 30
+    default_thread_delete_cooldown: int = 0
+    default_channel_reply_cooldown: int = 10
+    default_channel_delete_cooldown: int = 0
+    
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    
+    def get_allowed_forum_channels_list(self) -> List[str]:
+        """获取允许的论坛频道ID列表"""
+        if not self.allowed_forum_channels:
+            return []
+        try:
+            return json.loads(self.allowed_forum_channels)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    
+    def set_allowed_forum_channels_list(self, channel_ids: List[str]) -> None:
+        """设置允许的论坛频道ID列表"""
+        self.allowed_forum_channels = json.dumps(channel_ids) if channel_ids else None
+    
+    def is_forum_channel_allowed(self, channel_id: str) -> bool:
+        """检查指定论坛频道是否在允许列表中（空列表表示允许所有）"""
+        allowed = self.get_allowed_forum_channels_list()
+        return len(allowed) == 0 or channel_id in allowed
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式"""
+        return {
+            'guild_id': self.guild_id,
+            'is_enabled': self.is_enabled,
+            'allow_thread_owner_config': self.allow_thread_owner_config,
+            'allowed_forum_channels': self.allowed_forum_channels,
+            'default_delete_trigger_delay': self.default_delete_trigger_delay,
+            'default_delete_reply_delay': self.default_delete_reply_delay,
+            'default_user_reply_cooldown': self.default_user_reply_cooldown,
+            'default_user_delete_cooldown': self.default_user_delete_cooldown,
+            'default_thread_reply_cooldown': self.default_thread_reply_cooldown,
+            'default_thread_delete_cooldown': self.default_thread_delete_cooldown,
+            'default_channel_reply_cooldown': self.default_channel_reply_cooldown,
+            'default_channel_delete_cooldown': self.default_channel_delete_cooldown,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+    
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> 'ThreadCommandServerConfig':
+        """从数据库行字典构建实例"""
+        def parse_dt(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+        
+        def parse_bool(v):
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return True
+            if isinstance(v, (int, float)):
+                return v != 0
+            s = str(v).strip().lower()
+            return s in ('1', 'true', 't', 'yes', 'y')
+        
+        def parse_int(v, default=0):
+            if v is None:
+                return default
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return default
+        
+        return cls(
+            guild_id=str(row.get('guild_id', '')),
+            is_enabled=parse_bool(row.get('is_enabled', True)),
+            allow_thread_owner_config=parse_bool(row.get('allow_thread_owner_config', True)),
+            allowed_forum_channels=row.get('allowed_forum_channels'),
+            default_delete_trigger_delay=parse_int(row.get('default_delete_trigger_delay'), None),
+            default_delete_reply_delay=parse_int(row.get('default_delete_reply_delay'), None),
+            default_user_reply_cooldown=parse_int(row.get('default_user_reply_cooldown'), 60),
+            default_user_delete_cooldown=parse_int(row.get('default_user_delete_cooldown'), 0),
+            default_thread_reply_cooldown=parse_int(row.get('default_thread_reply_cooldown'), 30),
+            default_thread_delete_cooldown=parse_int(row.get('default_thread_delete_cooldown'), 0),
+            default_channel_reply_cooldown=parse_int(row.get('default_channel_reply_cooldown'), 10),
+            default_channel_delete_cooldown=parse_int(row.get('default_channel_delete_cooldown'), 0),
+            created_at=parse_dt(row.get('created_at')),
+            updated_at=parse_dt(row.get('updated_at')),
+        )
+
+
+@dataclass
+class ThreadCommandPermission:
+    """
+    帖子命令权限配置
+    
+    用于授予用户或身份组管理帖子命令的权限。
+    permission_level: 'server_config' 可管理全服规则，'thread_delegate' 仅供贴主使用（预留）
+    """
+    guild_id: str
+    target_id: str                  # 用户ID或身份组ID
+    target_type: str                # 'user' 或 'role'
+    permission_level: str           # 'server_config' 或 'thread_delegate'
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式"""
+        return {
+            'guild_id': self.guild_id,
+            'target_id': self.target_id,
+            'target_type': self.target_type,
+            'permission_level': self.permission_level,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+    
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> 'ThreadCommandPermission':
+        """从数据库行字典构建实例"""
+        def parse_dt(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+        
+        return cls(
+            guild_id=str(row.get('guild_id', '')),
+            target_id=str(row.get('target_id', '')),
+            target_type=row.get('target_type', 'user'),
+            permission_level=row.get('permission_level', 'server_config'),
+            created_by=row.get('created_by'),
+            created_at=parse_dt(row.get('created_at')),
+        )
