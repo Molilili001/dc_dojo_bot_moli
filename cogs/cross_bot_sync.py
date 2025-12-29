@@ -252,40 +252,45 @@ class CrossBotSyncCog(BaseCog):
         """处理单个处罚同步"""
         user_id = sync_data.user_id
         
-        # 获取所有服务器进行同步
-        for guild in self.bot.guilds:
-            guild_id = str(guild.id)
-            
-            # 使用用户级别的锁
-            async with self.user_locks[user_id]:
-                try:
-                    member = guild.get_member(int(user_id))
-                    if not member:
-                        continue
-                    
-                    # 添加到黑名单
-                    if sync_data.punishment_type in ["blacklist", "ban"]:
-                        await self.add_to_sync_blacklist(
-                            guild_id, user_id, 
-                            sync_data.reason, 
-                            f"同步自Bot({sync_data.source_bot_id})"
-                        )
-                    
-                    # 自动移除身份组
-                    if self.sync_config.get("auto_role_removal", True):
-                        await self.auto_remove_roles(member, guild_id, sync_data)
-                    
-                    # 重置用户进度
-                    await self.reset_user_progress(user_id, guild_id)
-                    
-                    self.sync_statistics["total_synced"] += 1
-                    self.sync_statistics["last_sync_time"] = datetime.datetime.now(BEIJING_TZ).isoformat()
-                    
-                    logger.info(f"CROSS_BOT_SYNC: Successfully synced punishment for user {user_id} in guild {guild_id}")
-                    
-                except Exception as e:
-                    self.sync_statistics["failed_syncs"] += 1
-                    logger.error(f"CROSS_BOT_SYNC: Failed to sync punishment for user {user_id}: {e}")
+        try:
+            # 获取所有服务器进行同步
+            for guild in self.bot.guilds:
+                guild_id = str(guild.id)
+                
+                # 使用用户级别的锁
+                async with self.user_locks[user_id]:
+                    try:
+                        member = guild.get_member(int(user_id))
+                        if not member:
+                            continue
+                        
+                        # 添加到黑名单
+                        if sync_data.punishment_type in ["blacklist", "ban"]:
+                            await self.add_to_sync_blacklist(
+                                guild_id, user_id,
+                                sync_data.reason,
+                                f"同步自Bot({sync_data.source_bot_id})"
+                            )
+                        
+                        # 自动移除身份组
+                        if self.sync_config.get("auto_role_removal", True):
+                            await self.auto_remove_roles(member, guild_id, sync_data)
+                        
+                        # 重置用户进度
+                        await self.reset_user_progress(user_id, guild_id)
+                        
+                        self.sync_statistics["total_synced"] += 1
+                        self.sync_statistics["last_sync_time"] = datetime.datetime.now(BEIJING_TZ).isoformat()
+                        
+                        logger.info(f"CROSS_BOT_SYNC: Successfully synced punishment for user {user_id} in guild {guild_id}")
+                        
+                    except Exception as e:
+                        self.sync_statistics["failed_syncs"] += 1
+                        logger.error(f"CROSS_BOT_SYNC: Failed to sync punishment for user {user_id}: {e}")
+        finally:
+            # 处理完成后清理锁对象，防止内存泄露
+            if user_id in self.user_locks:
+                del self.user_locks[user_id]
     
     async def process_role_removal(self, user_id: str, role_ids: Set[str]):
         """处理身份组移除"""

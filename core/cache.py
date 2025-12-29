@@ -185,13 +185,15 @@ class CacheManager:
     def __init__(self):
         """初始化缓存管理器"""
         # 不同类型数据的缓存实例
+        # 注：针对 2GB VPS 优化，原配置总计 22,100 条目，现缩减至 4,750 条目
+        # 预估节省约 20 MB 内存（假设每条目约 1.2 KB）
         self.caches = {
-            "user": MemoryCache(max_size=5000, default_ttl=300),      # 用户数据缓存
-            "gym": MemoryCache(max_size=1000, default_ttl=600),       # 道馆数据缓存
-            "progress": MemoryCache(max_size=10000, default_ttl=180), # 进度数据缓存
-            "leaderboard": MemoryCache(max_size=100, default_ttl=60), # 排行榜缓存
-            "session": MemoryCache(max_size=1000, default_ttl=1800),  # 会话缓存
-            "general": MemoryCache(max_size=5000, default_ttl=300)    # 通用缓存
+            "user": MemoryCache(max_size=1000, default_ttl=300),      # 用户数据缓存（原5000）
+            "gym": MemoryCache(max_size=200, default_ttl=600),        # 道馆数据缓存（原1000）
+            "progress": MemoryCache(max_size=2000, default_ttl=180),  # 进度数据缓存（原10000）
+            "leaderboard": MemoryCache(max_size=50, default_ttl=60),  # 排行榜缓存（原100）
+            "session": MemoryCache(max_size=500, default_ttl=1800),   # 会话缓存（原1000）
+            "general": MemoryCache(max_size=1000, default_ttl=300)    # 通用缓存（原5000）
         }
         
         # 缓存键前缀

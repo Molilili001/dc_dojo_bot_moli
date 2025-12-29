@@ -436,12 +436,18 @@ class ThreadCommandRule:
     帖子命令规则数据模型
     
     规则定义了触发条件和对应的动作。
-    scope='server' 表示全服规则，scope='thread' 表示帖子级规则。
+    scope 取值：
+      - 'server': 全服规则
+      - 'thread': 帖子级规则
+      - 'channel': 频道级规则
+      - 'category': 分类级规则
     """
     rule_id: Optional[int]
     guild_id: str
-    scope: str                      # 'server' 或 'thread'
+    scope: str                      # 'server', 'thread', 'channel', 'category'
     thread_id: Optional[str] = None
+    channel_id: Optional[str] = None      # 频道级规则的目标频道ID
+    category_id: Optional[str] = None     # 分类级规则的目标分类ID
     forum_channel_id: Optional[str] = None
     
     # 触发器列表（通过 thread_command_triggers 表关联）
@@ -495,6 +501,8 @@ class ThreadCommandRule:
             'guild_id': self.guild_id,
             'scope': self.scope,
             'thread_id': self.thread_id,
+            'channel_id': self.channel_id,
+            'category_id': self.category_id,
             'forum_channel_id': self.forum_channel_id,
             'triggers': [t.to_dict() for t in self.triggers],
             'action_type': self.action_type,
@@ -550,6 +558,8 @@ class ThreadCommandRule:
             guild_id=str(row.get('guild_id', '')),
             scope=row.get('scope', 'server'),
             thread_id=str(row.get('thread_id')) if row.get('thread_id') else None,
+            channel_id=str(row.get('channel_id')) if row.get('channel_id') else None,
+            category_id=str(row.get('category_id')) if row.get('category_id') else None,
             forum_channel_id=str(row.get('forum_channel_id')) if row.get('forum_channel_id') else None,
             triggers=triggers or [],
             action_type=row.get('action_type', 'reply'),

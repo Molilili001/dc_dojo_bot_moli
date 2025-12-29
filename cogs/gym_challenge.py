@@ -157,13 +157,23 @@ class GymChallengeCog(BaseCog):
         super().__init__(bot)
         self.active_challenges: Dict[str, ChallengeSession] = {}
         self.user_challenge_locks: Dict[str, asyncio.Lock] = {}
-        self.user_punishment_locks: Dict[str, asyncio.Lock] = {}
     
     async def cog_unload(self):
         """卸载Cog时清理"""
         self.active_challenges.clear()
         self.user_challenge_locks.clear()
-        self.user_punishment_locks.clear()
+    
+    def _cleanup_user_session(self, user_id: str):
+        """
+        清理用户的挑战会话和锁对象
+        
+        仅在挑战真正结束时调用（成功/失败/取消/超时），
+        不在"清理旧会话以开始新挑战"的场景中调用。
+        """
+        if user_id in self.active_challenges:
+            del self.active_challenges[user_id]
+        if user_id in self.user_challenge_locks:
+            del self.user_challenge_locks[user_id]
     
     # ========== 挑战管理方法 ==========
     
@@ -442,9 +452,8 @@ class GymChallengeCog(BaseCog):
     
     async def handle_challenge_timeout(self, user_id: str, session):
         """处理挑战超时"""
-        # 清理会话
-        if user_id in self.active_challenges:
-            del self.active_challenges[user_id]
+        # 清理会话和锁
+        self._cleanup_user_session(user_id)
         logger.info(f"Challenge session timed out for user {user_id}")
     
     async def process_answer(self, interaction: discord.Interaction, session,
@@ -456,8 +465,7 @@ class GymChallengeCog(BaseCog):
         # 按优先级再次检查封禁状态
         ban_entry = await self._get_challenge_ban_entry(guild_id, interaction.user)
         if ban_entry:
-            if user_id in self.active_challenges:
-                del self.active_challenges[user_id]
+            self._cleanup_user_session(user_id)
             ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
             try:
                 await interaction.edit_original_response(content=ban_message, embed=None, view=None)
@@ -637,8 +645,8 @@ class GymChallengeCog(BaseCog):
             fail_desc = "你主动放弃了本次究极道馆挑战。"
             title = "↩️ 挑战已取消"
         
-        # 清理会话
-        del self.active_challenges[user_id]
+        # 清理会话和锁
+        self._cleanup_user_session(user_id)
         logger.info(f"Challenge session cancelled by user {user_id} in gym {session.gym_id}")
         
         embed = discord.Embed(
@@ -922,10 +930,9 @@ class GymChallengeCog(BaseCog):
         
         # 设置超时回调来清理会话
         async def cleanup_on_timeout():
-            """超时时清理会话"""
-            if session.user_id in self.active_challenges:
-                del self.active_challenges[session.user_id]
-                logger.info(f"Tutorial view timed out, cleaned up session for user {session.user_id}")
+            """超时时清理会话和锁"""
+            self._cleanup_user_session(session.user_id)
+            logger.info(f"Tutorial view timed out, cleaned up session for user {session.user_id}")
         
         # 保存原始的on_timeout方法
         original_on_timeout = view.on_timeout
@@ -970,8 +977,7 @@ class GymChallengeCog(BaseCog):
         # 先执行封禁检查，防止进入题目阶段
         ban_entry = await self._get_challenge_ban_entry(session.guild_id, interaction.user)
         if ban_entry:
-            if session.user_id in self.active_challenges:
-                del self.active_challenges[session.user_id]
+            self._cleanup_user_session(session.user_id)
             ban_message = self._format_challenge_ban_message(ban_entry, interaction.user)
             if interaction.response.is_done():
                 try:
@@ -1119,9 +1125,8 @@ class GymChallengeCog(BaseCog):
             completion_time = session.get_completion_time()
             await self._update_ultimate_leaderboard(guild_id, user_id, completion_time)
             
-            # 清理会话
-            if user_id in self.active_challenges:
-                del self.active_challenges[user_id]
+            # 清理会话和锁
+            self._cleanup_user_session(user_id)
             
             logger.info(f"Ultimate challenge success for user {user_id}. Time: {completion_time:.2f}s")
             
@@ -1148,9 +1153,8 @@ class GymChallengeCog(BaseCog):
             await self._reset_failures(user_id, guild_id, session.gym_id)
             await self._set_gym_completed(user_id, guild_id, session.gym_id)
             
-            # 清理会话
-            if user_id in self.active_challenges:
-                del self.active_challenges[user_id]
+            # 清理会话和锁
+            self._cleanup_user_session(user_id)
             
             logger.info(f"Challenge success for user {user_id} in gym {session.gym_id}")
             
@@ -1199,9 +1203,8 @@ class GymChallengeCog(BaseCog):
             if failure_status and failure_status.get('banned_until'):
                 banned_until_time = parse_beijing_time(failure_status['banned_until'])
         
-        # 清理会话
-        if user_id in self.active_challenges:
-            del self.active_challenges[user_id]
+        # 清理会话和锁
+        self._cleanup_user_session(user_id)
         
         logger.info(f"Challenge failed for user {user_id} in gym {session.gym_id}")
         

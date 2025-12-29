@@ -613,6 +613,8 @@ class DatabaseManager:
                 guild_id TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 thread_id TEXT,
+                channel_id TEXT,
+                category_id TEXT,
                 forum_channel_id TEXT,
                 action_type TEXT NOT NULL,
                 reply_content TEXT,
@@ -633,8 +635,28 @@ class DatabaseManager:
                 updated_at TEXT NOT NULL
             )
         ''')
+        
+        # --- 数据迁移：为 thread_command_rules 添加 channel_id 和 category_id 列（支持频道和分类规则） ---
+        # 注意：这必须在创建索引之前运行，以确保旧数据库能正确迁移
+        try:
+            await conn.execute("ALTER TABLE thread_command_rules ADD COLUMN channel_id TEXT")
+            logger.info("数据库迁移: 已为 thread_command_rules 添加列 channel_id")
+        except Exception:
+            # 已存在则忽略
+            pass
+        
+        try:
+            await conn.execute("ALTER TABLE thread_command_rules ADD COLUMN category_id TEXT")
+            logger.info("数据库迁移: 已为 thread_command_rules 添加列 category_id")
+        except Exception:
+            # 已存在则忽略
+            pass
+        
+        # 创建索引（必须在列存在后创建）
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_guild_scope ON thread_command_rules (guild_id, scope)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_thread ON thread_command_rules (thread_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_channel ON thread_command_rules (channel_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_category ON thread_command_rules (category_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_guild_enabled ON thread_command_rules (guild_id, is_enabled)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tcr_lookup ON thread_command_rules (guild_id, scope, is_enabled, priority DESC)")
         
