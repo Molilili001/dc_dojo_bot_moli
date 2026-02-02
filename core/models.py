@@ -362,13 +362,38 @@ class ThreadCommandTrigger:
     _compiled_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
     
     def compile_regex(self) -> Optional[re.Pattern]:
-        """预编译正则表达式，提升匹配性能"""
+        """预编译正则表达式，提升匹配性能
+        
+        如果正则表达式无效，会尝试自动修复常见错误（如量词中的空格）
+        """
         if self.trigger_mode == 'regex' and self._compiled_regex is None:
             try:
                 self._compiled_regex = re.compile(self.trigger_text, re.IGNORECASE)
             except re.error:
-                return None
+                # 尝试自动修复常见的正则错误
+                fixed_pattern = self._try_fix_regex_pattern(self.trigger_text)
+                if fixed_pattern != self.trigger_text:
+                    try:
+                        self._compiled_regex = re.compile(fixed_pattern, re.IGNORECASE)
+                    except re.error:
+                        return None
+                else:
+                    return None
         return self._compiled_regex
+    
+    @staticmethod
+    def _try_fix_regex_pattern(pattern: str) -> str:
+        """尝试修复常见的正则表达式错误
+        
+        常见错误：
+        - {1, 5} -> {1,5}（量词中不应有空格）
+        - {1, } -> {1,}（逗号后不应有空格）
+        """
+        # 修复量词中的空格：{1, 5} -> {1,5}
+        fixed = re.sub(r'\{(\d+)\s*,\s*(\d+)\}', r'{\1,\2}', pattern)
+        # 修复 {n, } -> {n,}
+        fixed = re.sub(r'\{(\d+),\s+\}', r'{\1,}', fixed)
+        return fixed
     
     def match(self, content: str) -> bool:
         """检查内容是否匹配此触发器"""

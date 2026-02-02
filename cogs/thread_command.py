@@ -43,6 +43,91 @@ from views.thread_command_views import (
 logger = get_logger(__name__)
 
 
+# ==================== 正则表达式验证辅助函数 ====================
+
+def validate_regex_pattern(pattern: str) -> tuple[bool, str]:
+    """
+    验证正则表达式模式并返回友好的错误提示
+    
+    Args:
+        pattern: 正则表达式字符串
+        
+    Returns:
+        (is_valid, error_message): 是否有效和错误消息（有效时为空字符串）
+    """
+    import re
+    
+    # 检查常见错误模式并给出具体提示
+    common_errors = []
+    
+    # 检查量词中的空格（如 {1, 5} 应该是 {1,5}）
+    space_in_quantifier = re.search(r'\{(\d+)\s*,\s*(\d+)\}', pattern)
+    if space_in_quantifier:
+        full_match = space_in_quantifier.group(0)
+        if ' ' in full_match:
+            correct = f"{{{space_in_quantifier.group(1)},{space_in_quantifier.group(2)}}}"
+            common_errors.append(f"量词 `{full_match}` 中不能有空格，应改为 `{correct}`")
+    
+    # 检查 {n, } 格式（逗号后有空格）
+    space_after_comma = re.search(r'\{(\d+),\s+\}', pattern)
+    if space_after_comma:
+        full_match = space_after_comma.group(0)
+        correct = f"{{{space_after_comma.group(1)},}}"
+        common_errors.append(f"量词 `{full_match}` 中不能有空格，应改为 `{correct}`")
+    
+    # 如果检测到常见错误，直接返回友好提示
+    if common_errors:
+        return False, "\n".join(common_errors)
+    
+    # 尝试编译正则表达式
+    try:
+        re.compile(pattern)
+        return True, ""
+    except re.error as e:
+        # 将 Python 正则错误转换为中文提示
+        error_msg = str(e)
+        
+        # 常见错误消息翻译
+        translations = {
+            "nothing to repeat": "量词前缺少要重复的内容（如 `*`、`+`、`?` 前需要有字符）",
+            "unbalanced parenthesis": "括号不匹配（检查 `(` 和 `)` 是否成对）",
+            "missing ), unterminated subpattern": "缺少右括号 `)` 或子模式未结束",
+            "unterminated character set": "字符集未结束（缺少 `]`）",
+            "bad character range": "字符范围错误（如 `[z-a]` 应改为 `[a-z]`）",
+            "invalid group reference": "无效的组引用",
+            "bad escape": "无效的转义序列",
+            "unknown extension": "未知的扩展语法",
+        }
+        
+        for en_msg, zh_msg in translations.items():
+            if en_msg in error_msg.lower():
+                return False, f"正则语法错误：{zh_msg}\n原始错误：{error_msg}"
+        
+        return False, f"正则语法错误：{error_msg}"
+
+
+def suggest_regex_fix(pattern: str) -> str:
+    """
+    尝试自动修复常见的正则表达式错误
+    
+    Args:
+        pattern: 原始正则表达式
+        
+    Returns:
+        修复后的正则表达式（如果无法修复则返回原模式）
+    """
+    import re
+    fixed = pattern
+    
+    # 修复量词中的空格：{1, 5} -> {1,5}
+    fixed = re.sub(r'\{(\d+)\s*,\s*(\d+)\}', r'{\1,\2}', fixed)
+    
+    # 修复 {n, } -> {n,}
+    fixed = re.sub(r'\{(\d+),\s+\}', r'{\1,}', fixed)
+    
+    return fixed
+
+
 # ==================== 配置常量 ====================
 
 CACHE_CONFIG = {
@@ -2071,11 +2156,7 @@ class RuleManageView(discord.ui.View):
         self.guild_id = guild_id
         self.rules_data = rules_data
         self.scope = scope
-    
-    async def on_timeout(self):
-        """超时时清理引用"""
-        self.cog = None
-        self.rules_data = None
+        
         # 根据范围设置显示前缀
         self.scope_prefix = SCOPE_DISPLAY.get(scope, scope)
         
@@ -2096,6 +2177,11 @@ class RuleManageView(discord.ui.View):
             )
             self.rule_select.callback = self.on_rule_select
             self.add_item(self.rule_select)
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.rules_data = None
     
     def _get_rule_display_name(self, rule_id: int) -> str:
         """获取规则的显示名称（如：全服1号）"""
@@ -2286,27 +2372,39 @@ class EditRuleModal(discord.ui.Modal, title="编辑规则"):
             self.extra_settings.default = ' '.join(extra_parts)
     
     async def on_submit(self, interaction: discord.Interaction):
-        # 解析触发词
-        trigger_list = [t.strip() for t in self.trigger_text.value.split(',') if t.strip()]
-        if not trigger_list:
-            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
-            return
-        
         # 解析匹配模式（支持中英文）
         mode_input = self.trigger_mode.value.strip()
         new_mode = MATCH_MODE_MAP.get(mode_input) or MATCH_MODE_MAP.get(mode_input.lower())
         if not new_mode:
             new_mode = 'exact'
         
+        # 解析触发词
+        # 正则模式下不按逗号分割，将整个输入作为单个触发器（避免正则中的逗号被误解析）
+        if new_mode == 'regex':
+            trigger_list = [self.trigger_text.value.strip()] if self.trigger_text.value.strip() else []
+        else:
+            trigger_list = [t.strip() for t in self.trigger_text.value.split(',') if t.strip()]
+        
+        if not trigger_list:
+            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
+            return
+        
         # 验证正则表达式
         if new_mode == 'regex':
-            import re
             for t in trigger_list:
-                try:
-                    re.compile(t)
-                except re.error as e:
+                is_valid, error_msg = validate_regex_pattern(t)
+                if not is_valid:
+                    # 尝试提供修复建议
+                    fixed = suggest_regex_fix(t)
+                    fix_hint = ""
+                    if fixed != t:
+                        # 验证修复后的正则是否有效
+                        is_fixed_valid, _ = validate_regex_pattern(fixed)
+                        if is_fixed_valid:
+                            fix_hint = f"\n\n💡 **建议修复**: `{fixed}`"
+                    
                     await interaction.response.send_message(
-                        f"❌ 正则表达式无效: {t}\n错误: {e}",
+                        f"❌ 正则表达式无效: `{t}`\n\n{error_msg}{fix_hint}",
                         ephemeral=True
                     )
                     return
@@ -2552,17 +2650,22 @@ class AddRuleModal(discord.ui.Modal, title="添加规则"):
         self.thread_id = thread_id
     
     async def on_submit(self, interaction: discord.Interaction):
-        # 解析触发词
-        trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
-        if not trigger_list:
-            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
-            return
-        
         # 验证匹配模式（支持中英文）
         mode_input = self.trigger_mode.value.strip()
         mode = MATCH_MODE_MAP.get(mode_input) or MATCH_MODE_MAP.get(mode_input.lower())
         if not mode:
             mode = 'exact'
+        
+        # 解析触发词
+        # 正则模式下不按逗号分割，将整个输入作为单个触发器（避免正则中的逗号被误解析）
+        if mode == 'regex':
+            trigger_list = [self.trigger.value.strip()] if self.trigger.value.strip() else []
+        else:
+            trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
+        
+        if not trigger_list:
+            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
+            return
         
         # 验证动作类型（支持中英文）
         action_input = self.action_type.value.strip()
@@ -2582,13 +2685,20 @@ class AddRuleModal(discord.ui.Modal, title="添加规则"):
         
         # 验证正则表达式
         if mode == 'regex':
-            import re
             for t in trigger_list:
-                try:
-                    re.compile(t)
-                except re.error as e:
+                is_valid, error_msg = validate_regex_pattern(t)
+                if not is_valid:
+                    # 尝试提供修复建议
+                    fixed = suggest_regex_fix(t)
+                    fix_hint = ""
+                    if fixed != t:
+                        # 验证修复后的正则是否有效
+                        is_fixed_valid, _ = validate_regex_pattern(fixed)
+                        if is_fixed_valid:
+                            fix_hint = f"\n\n💡 **建议修复**: `{fixed}`"
+                    
                     await interaction.response.send_message(
-                        f"❌ 正则表达式无效: {t}\n错误: {e}",
+                        f"❌ 正则表达式无效: `{t}`\n\n{error_msg}{fix_hint}",
                         ephemeral=True
                     )
                     return
@@ -2653,12 +2763,6 @@ class PermissionPanelView(discord.ui.View):
     async def on_timeout(self):
         """超时时清理引用"""
         self.cog = None
-        self._setup_permission_select()
-    
-    def _setup_permission_select(self):
-        """动态设置权限选择器"""
-        # 需要在显示时动态加载权限列表
-        pass
     
     @discord.ui.button(label="添加用户权限", style=discord.ButtonStyle.success, row=0)
     async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2762,11 +2866,6 @@ class PermissionDeleteView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
         self.permissions = permissions
-    
-    async def on_timeout(self):
-        """超时时清理引用"""
-        self.cog = None
-        self.permissions = None
         
         # 构建选择器选项
         if permissions:
@@ -2785,6 +2884,11 @@ class PermissionDeleteView(discord.ui.View):
             )
             self.perm_select.callback = self.on_select
             self.add_item(self.perm_select)
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.permissions = None
     
     async def on_select(self, interaction: discord.Interaction):
         """处理权限删除选择"""
@@ -2937,10 +3041,6 @@ class ChannelSelectView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
         self.scope_type = scope_type  # 'channel' 或 'category'
-    
-    async def on_timeout(self):
-        """超时时清理引用"""
-        self.cog = None
         
         # 根据类型创建不同的选择器
         if scope_type == 'channel':
@@ -2968,6 +3068,10 @@ class ChannelSelectView(discord.ui.View):
         
         # 添加手动输入按钮作为备选
         self.add_item(ManualInputButton(cog, guild_id, scope_type))
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
     
     async def on_channel_select(self, interaction: discord.Interaction):
         """处理频道/分类选择"""
@@ -3096,17 +3200,22 @@ class AddChannelCategoryRuleModal(discord.ui.Modal):
         self.scope_type = scope_type
     
     async def on_submit(self, interaction: discord.Interaction):
-        # 解析触发词
-        trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
-        if not trigger_list:
-            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
-            return
-        
         # 验证匹配模式（支持中英文）
         mode_input = self.trigger_mode.value.strip()
         mode = MATCH_MODE_MAP.get(mode_input) or MATCH_MODE_MAP.get(mode_input.lower())
         if not mode:
             mode = 'exact'
+        
+        # 解析触发词
+        # 正则模式下不按逗号分割，将整个输入作为单个触发器（避免正则中的逗号被误解析）
+        if mode == 'regex':
+            trigger_list = [self.trigger.value.strip()] if self.trigger.value.strip() else []
+        else:
+            trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
+        
+        if not trigger_list:
+            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
+            return
         
         # 验证动作类型（支持中英文）
         action_input = self.action_type.value.strip()
@@ -3126,13 +3235,20 @@ class AddChannelCategoryRuleModal(discord.ui.Modal):
         
         # 验证正则表达式
         if mode == 'regex':
-            import re
             for t in trigger_list:
-                try:
-                    re.compile(t)
-                except re.error as e:
+                is_valid, error_msg = validate_regex_pattern(t)
+                if not is_valid:
+                    # 尝试提供修复建议
+                    fixed = suggest_regex_fix(t)
+                    fix_hint = ""
+                    if fixed != t:
+                        # 验证修复后的正则是否有效
+                        is_fixed_valid, _ = validate_regex_pattern(fixed)
+                        if is_fixed_valid:
+                            fix_hint = f"\n\n💡 **建议修复**: `{fixed}`"
+                    
                     await interaction.response.send_message(
-                        f"❌ 正则表达式无效: {t}\n错误: {e}",
+                        f"❌ 正则表达式无效: `{t}`\n\n{error_msg}{fix_hint}",
                         ephemeral=True
                     )
                     return
@@ -3191,11 +3307,6 @@ class ChannelRuleManageView(discord.ui.View):
         self.guild_id = guild_id
         self.rules_data = rules_data
         self.scope_type = scope_type
-    
-    async def on_timeout(self):
-        """超时时清理引用"""
-        self.cog = None
-        self.rules_data = None
         self.scope_prefix = "频道" if scope_type == 'channel' else "分类"
         
         # 添加规则选择器
@@ -3222,6 +3333,11 @@ class ChannelRuleManageView(discord.ui.View):
             )
             self.rule_select.callback = self.on_rule_select
             self.add_item(self.rule_select)
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.rules_data = None
     
     def _get_rule_display_name(self, rule_id: int) -> str:
         """获取规则的显示名称"""

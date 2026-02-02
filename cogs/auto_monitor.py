@@ -61,6 +61,11 @@ class AutoMonitorCog(BaseCog):
         
         monitor_channel_id = self.monitor_config.get("monitor_channel_id")
         
+        # 确保 monitor_channel_id 是字符串
+        if isinstance(monitor_channel_id, list):
+            monitor_channel_id = str(monitor_channel_id[0]) if monitor_channel_id else None
+            self.monitor_config["monitor_channel_id"] = monitor_channel_id
+        
         if not target_bot_ids or not monitor_channel_id:
             return
         
@@ -161,8 +166,16 @@ class AutoMonitorCog(BaseCog):
                 # 移除毕业奖励身份组
                 await self.remove_graduation_roles(member, guild_id)
                 
-                # 重置用户进度
-                await self.reset_user_progress(user_id, guild_id)
+                # 重置用户进度（使用 CrossBotSyncCog 的归档功能）
+                cross_bot_sync_cog = self.bot.get_cog("CrossBotSyncCog")
+                if cross_bot_sync_cog:
+                    # 使用带归档的重置方法
+                    source_info = f"自动同步 - {added_by}"
+                    await cross_bot_sync_cog.reset_user_progress(user_id, guild_id, source_info)
+                else:
+                    # 回退到旧方法（不带归档）
+                    logger.warning("CrossBotSyncCog not found, using legacy reset without archive")
+                    await self.reset_user_progress(user_id, guild_id)
                 
                 logger.info(f"AUTO_PUNISHMENT: Successfully processed punishment for user {user_id} in guild {guild_id}")
                 
@@ -284,6 +297,10 @@ class AutoMonitorCog(BaseCog):
         for attempt in range(max_retries):
             try:
                 monitor_channel_id = self.monitor_config.get("monitor_channel_id")
+                
+                # 确保 monitor_channel_id 是字符串
+                if isinstance(monitor_channel_id, list):
+                    monitor_channel_id = str(monitor_channel_id[0]) if monitor_channel_id else None
                 
                 if not monitor_channel_id:
                     logger.warning("AUTO_PUNISHMENT: No monitor_channel_id configured")

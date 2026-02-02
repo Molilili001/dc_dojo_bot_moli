@@ -271,11 +271,11 @@ async def is_gym_master(interaction: discord.Interaction, permission: str) -> bo
 
 async def has_gym_permission(interaction: discord.Interaction, permission: str) -> bool:
     """
-    检查用户是否有特定道馆的权限
+    检查用户是否有特定道馆管理权限
     
     Args:
         interaction: Discord交互对象
-        gym_id: 道馆ID
+        permission: 权限名称（如 "查询道馆进度", "重置进度" 等）
         
     Returns:
         是否有权限
@@ -288,12 +288,12 @@ async def has_gym_permission(interaction: discord.Interaction, permission: str) 
     if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
         return True
     
-    # 检查是否有道馆管理权限
+    # 检查是否有特定的道馆管理权限
     if interaction.guild:
         return await check_gym_master_permission(
             str(interaction.guild.id),
             interaction.user,
-            'gym_management'
+            permission  # 使用传入的权限参数，而非硬编码
         )
     
     return False

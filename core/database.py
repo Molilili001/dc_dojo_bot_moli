@@ -782,6 +782,26 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"数据迁移(randomize_options)失败: {e}", exc_info=True)
 
+        # --- 进度归档表（用于跨Bot处罚联动时保存被清空前的进度快照） ---
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS progress_archive (
+                archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                guild_id TEXT NOT NULL,
+                archive_reason TEXT NOT NULL,
+                source_info TEXT,
+                completed_gyms TEXT,
+                ultimate_score REAL,
+                failure_records TEXT,
+                claimed_rewards TEXT,
+                archived_at TEXT NOT NULL,
+                original_data_timestamp TEXT
+            )
+        ''')
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_user_guild ON progress_archive (user_id, guild_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_time ON progress_archive (archived_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_reason ON progress_archive (archive_reason)")
+
         logger.info("数据库表结构设置完成，数据迁移检查完成")
 
 # ===== Legacy DB config (module-level) =====

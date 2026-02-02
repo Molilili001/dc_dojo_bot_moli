@@ -999,9 +999,21 @@ class GymChallengeCog(BaseCog):
         logger.info(f"Displaying question {session.current_question_index + 1} for user {session.user_id}")
         
         # 创建Embed
+        # 清理题目文本，防止特殊字符导致显示截断
+        safe_q_text = str(question.get('text', '')).replace('\x00', '').strip()
+        
+        # 长度保护：Description 限制在 2000 字符以内（Discord上限4096，留足空间给其他部分）
+        if len(safe_q_text) > 2000:
+            safe_q_text = safe_q_text[:2000] + "...\n(题目过长已截断)"
+
+        # 格式保护：自动闭合未匹配的代码块
+        # 如果代码块标记 ``` 是奇数个，说明有一个未闭合，补全它
+        if safe_q_text.count("```") % 2 != 0:
+            safe_q_text += "\n```"
+
         embed = discord.Embed(
             title=f"{session.gym_info['name']} - {session.get_progress_info()}",
-            description=question['text'],
+            description=safe_q_text,
             color=discord.Color.orange()
         )
         
@@ -1076,13 +1088,29 @@ class GymChallengeCog(BaseCog):
             except Exception:
                 pass
 
-            # 格式化选项
-            formatted_options = []
+            # 格式化选项并作为独立字段添加
+            # 使用独立字段可以彻底隔离不同选项的渲染上下文
+            # 即使选项A包含未闭合的代码块，也不会吞噬选项B的显示
             for i, option_text in enumerate(shuffled_options):
-                letter = chr(ord('A') + i)
-                formatted_options.append(f"**{letter}:** {option_text}")
+                # 清理选项文本
+                safe_option = str(option_text).replace('\x00', '').strip()
+                
+                # 长度保护：单个字段值不能超过1024字符
+                if len(safe_option) > 1000:
+                    safe_option = safe_option[:1000] + "..."
 
-            embed.description = question['text'] + "\n\n" + "\n".join(formatted_options)
+                # 格式保护：自动闭合选项中未匹配的代码块
+                # 解释用户反馈的"偶发性"：如果某个选项包含未闭合的代码块，
+                # 当它被随机排在前面时，会吞掉后续的Field；排在最后时则看起来正常。
+                if safe_option.count("```") % 2 != 0:
+                    safe_option += "\n```"
+                
+                letter = chr(ord('A') + i)
+                embed.add_field(
+                    name=f"选项 {letter}", 
+                    value=safe_option if safe_option else "‎", # 使用不可见字符占位防止空值报错
+                    inline=False
+                )
 
             # 为视图添加选项按钮（unique custom_id 在视图内部实现）
             view.setup_multiple_choice(shuffled_options, correct_text)
