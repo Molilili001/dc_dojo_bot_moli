@@ -43,14 +43,99 @@ from views.thread_command_views import (
 logger = get_logger(__name__)
 
 
+# ==================== 正则表达式验证辅助函数 ====================
+
+def validate_regex_pattern(pattern: str) -> tuple[bool, str]:
+    """
+    验证正则表达式模式并返回友好的错误提示
+    
+    Args:
+        pattern: 正则表达式字符串
+        
+    Returns:
+        (is_valid, error_message): 是否有效和错误消息（有效时为空字符串）
+    """
+    import re
+    
+    # 检查常见错误模式并给出具体提示
+    common_errors = []
+    
+    # 检查量词中的空格（如 {1, 5} 应该是 {1,5}）
+    space_in_quantifier = re.search(r'\{(\d+)\s*,\s*(\d+)\}', pattern)
+    if space_in_quantifier:
+        full_match = space_in_quantifier.group(0)
+        if ' ' in full_match:
+            correct = f"{{{space_in_quantifier.group(1)},{space_in_quantifier.group(2)}}}"
+            common_errors.append(f"量词 `{full_match}` 中不能有空格，应改为 `{correct}`")
+    
+    # 检查 {n, } 格式（逗号后有空格）
+    space_after_comma = re.search(r'\{(\d+),\s+\}', pattern)
+    if space_after_comma:
+        full_match = space_after_comma.group(0)
+        correct = f"{{{space_after_comma.group(1)},}}"
+        common_errors.append(f"量词 `{full_match}` 中不能有空格，应改为 `{correct}`")
+    
+    # 如果检测到常见错误，直接返回友好提示
+    if common_errors:
+        return False, "\n".join(common_errors)
+    
+    # 尝试编译正则表达式
+    try:
+        re.compile(pattern)
+        return True, ""
+    except re.error as e:
+        # 将 Python 正则错误转换为中文提示
+        error_msg = str(e)
+        
+        # 常见错误消息翻译
+        translations = {
+            "nothing to repeat": "量词前缺少要重复的内容（如 `*`、`+`、`?` 前需要有字符）",
+            "unbalanced parenthesis": "括号不匹配（检查 `(` 和 `)` 是否成对）",
+            "missing ), unterminated subpattern": "缺少右括号 `)` 或子模式未结束",
+            "unterminated character set": "字符集未结束（缺少 `]`）",
+            "bad character range": "字符范围错误（如 `[z-a]` 应改为 `[a-z]`）",
+            "invalid group reference": "无效的组引用",
+            "bad escape": "无效的转义序列",
+            "unknown extension": "未知的扩展语法",
+        }
+        
+        for en_msg, zh_msg in translations.items():
+            if en_msg in error_msg.lower():
+                return False, f"正则语法错误：{zh_msg}\n原始错误：{error_msg}"
+        
+        return False, f"正则语法错误：{error_msg}"
+
+
+def suggest_regex_fix(pattern: str) -> str:
+    """
+    尝试自动修复常见的正则表达式错误
+    
+    Args:
+        pattern: 原始正则表达式
+        
+    Returns:
+        修复后的正则表达式（如果无法修复则返回原模式）
+    """
+    import re
+    fixed = pattern
+    
+    # 修复量词中的空格：{1, 5} -> {1,5}
+    fixed = re.sub(r'\{(\d+)\s*,\s*(\d+)\}', r'{\1,\2}', fixed)
+    
+    # 修复 {n, } -> {n,}
+    fixed = re.sub(r'\{(\d+),\s+\}', r'{\1,}', fixed)
+    
+    return fixed
+
+
 # ==================== 配置常量 ====================
 
 CACHE_CONFIG = {
-    'server_rules_ttl': 3600,       # 全服规则缓存1小时
-    'thread_rules_ttl': 1800,       # 帖子规则缓存30分钟
-    'server_config_ttl': 3600,      # 服务器配置缓存1小时
-    'max_cached_threads': 200,      # 最多缓存200个帖子的规则
-    'max_cached_guilds': 10,        # 最多缓存10个服务器的规则
+    'server_rules_ttl': 600,        # 全服规则缓存10分钟（降低以减少内存）
+    'thread_rules_ttl': 300,        # 帖子规则缓存5分钟（降低以减少内存）
+    'server_config_ttl': 600,       # 服务器配置缓存10分钟
+    'max_cached_threads': 50,       # 最多缓存50个帖子的规则（降低以减少内存）
+    'max_cached_guilds': 5,         # 最多缓存5个服务器的规则
 }
 
 SCAN_CONFIG = {
@@ -97,6 +182,8 @@ DEFAULT_GO_TO_TOP_RULE = {
 SCOPE_DISPLAY = {
     'server': '全服',
     'thread': '帖子',
+    'channel': '频道',
+    'category': '分类',
 }
 
 
@@ -116,6 +203,8 @@ class RuleCacheManager:
         # 缓存存储: {key: (data, expire_time)}
         self._server_rules: Dict[str, Tuple[List[ThreadCommandRule], float]] = {}
         self._thread_rules: Dict[str, Tuple[List[ThreadCommandRule], float]] = {}
+        self._channel_rules: Dict[str, Tuple[List[ThreadCommandRule], float]] = {}
+        self._category_rules: Dict[str, Tuple[List[ThreadCommandRule], float]] = {}
         self._server_config: Dict[str, Tuple[ThreadCommandServerConfig, float]] = {}
         self._permissions: Dict[str, Tuple[List[ThreadCommandPermission], float]] = {}
     
@@ -140,6 +229,28 @@ class RuleCacheManager:
         
         rules = await self._load_thread_rules_from_db(thread_id)
         self._thread_rules[thread_id] = (rules, time.time() + self.thread_rules_ttl)
+        self._enforce_cache_limits()
+        return rules
+    
+    async def get_channel_rules(self, channel_id: str) -> List[ThreadCommandRule]:
+        """获取频道规则，优先读缓存"""
+        cached = self._channel_rules.get(channel_id)
+        if cached and time.time() < cached[1]:
+            return cached[0]
+        
+        rules = await self._load_channel_rules_from_db(channel_id)
+        self._channel_rules[channel_id] = (rules, time.time() + self.thread_rules_ttl)
+        self._enforce_cache_limits()
+        return rules
+    
+    async def get_category_rules(self, category_id: str) -> List[ThreadCommandRule]:
+        """获取分类规则，优先读缓存"""
+        cached = self._category_rules.get(category_id)
+        if cached and time.time() < cached[1]:
+            return cached[0]
+        
+        rules = await self._load_category_rules_from_db(category_id)
+        self._category_rules[category_id] = (rules, time.time() + self.thread_rules_ttl)
         self._enforce_cache_limits()
         return rules
     
@@ -190,10 +301,52 @@ class RuleCacheManager:
     async def _load_thread_rules_from_db(self, thread_id: str) -> List[ThreadCommandRule]:
         """从数据库加载帖子规则"""
         rules_data = await self.db.fetchall(
-            """SELECT * FROM thread_command_rules 
+            """SELECT * FROM thread_command_rules
                WHERE thread_id = ? AND scope = 'thread' AND is_enabled = 1
                ORDER BY priority DESC""",
             (thread_id,)
+        )
+        
+        rules = []
+        for row in rules_data:
+            triggers_data = await self.db.fetchall(
+                "SELECT * FROM thread_command_triggers WHERE rule_id = ? AND is_enabled = 1",
+                (row['rule_id'],)
+            )
+            triggers = [ThreadCommandTrigger.from_row(t) for t in triggers_data]
+            rule = ThreadCommandRule.from_row(row, triggers)
+            rules.append(rule)
+        
+        return rules
+    
+    async def _load_channel_rules_from_db(self, channel_id: str) -> List[ThreadCommandRule]:
+        """从数据库加载频道规则"""
+        rules_data = await self.db.fetchall(
+            """SELECT * FROM thread_command_rules
+               WHERE channel_id = ? AND scope = 'channel' AND is_enabled = 1
+               ORDER BY priority DESC""",
+            (channel_id,)
+        )
+        
+        rules = []
+        for row in rules_data:
+            triggers_data = await self.db.fetchall(
+                "SELECT * FROM thread_command_triggers WHERE rule_id = ? AND is_enabled = 1",
+                (row['rule_id'],)
+            )
+            triggers = [ThreadCommandTrigger.from_row(t) for t in triggers_data]
+            rule = ThreadCommandRule.from_row(row, triggers)
+            rules.append(rule)
+        
+        return rules
+    
+    async def _load_category_rules_from_db(self, category_id: str) -> List[ThreadCommandRule]:
+        """从数据库加载分类规则"""
+        rules_data = await self.db.fetchall(
+            """SELECT * FROM thread_command_rules
+               WHERE category_id = ? AND scope = 'category' AND is_enabled = 1
+               ORDER BY priority DESC""",
+            (category_id,)
         )
         
         rules = []
@@ -238,6 +391,16 @@ class RuleCacheManager:
         rules = await self._load_thread_rules_from_db(thread_id)
         self._thread_rules[thread_id] = (rules, time.time() + self.thread_rules_ttl)
     
+    async def refresh_channel_rules(self, channel_id: str):
+        """刷新频道规则缓存"""
+        rules = await self._load_channel_rules_from_db(channel_id)
+        self._channel_rules[channel_id] = (rules, time.time() + self.thread_rules_ttl)
+    
+    async def refresh_category_rules(self, category_id: str):
+        """刷新分类规则缓存"""
+        rules = await self._load_category_rules_from_db(category_id)
+        self._category_rules[category_id] = (rules, time.time() + self.thread_rules_ttl)
+    
     async def refresh_server_config(self, guild_id: str):
         """刷新服务器配置缓存"""
         config = await self._load_server_config_from_db(guild_id)
@@ -256,6 +419,16 @@ class RuleCacheManager:
         if thread_id in self._thread_rules:
             del self._thread_rules[thread_id]
     
+    def invalidate_channel(self, channel_id: str):
+        """使频道缓存失效"""
+        if channel_id in self._channel_rules:
+            del self._channel_rules[channel_id]
+    
+    def invalidate_category(self, category_id: str):
+        """使分类缓存失效"""
+        if category_id in self._category_rules:
+            del self._category_rules[category_id]
+    
     def invalidate_guild(self, guild_id: str):
         """使服务器相关缓存失效"""
         if guild_id in self._server_rules:
@@ -268,15 +441,37 @@ class RuleCacheManager:
     # ========== 缓存管理 ==========
     
     def _enforce_cache_limits(self):
-        """强制执行缓存容量限制"""
+        """强制执行缓存容量限制 - 更积极的清理策略"""
         # LRU淘汰：按过期时间排序，移除最早过期的
+        # 帖子规则缓存
         if len(self._thread_rules) > self.max_cached_threads:
             sorted_keys = sorted(
                 self._thread_rules.keys(),
                 key=lambda k: self._thread_rules[k][1]
             )
+            # 移除超出限制的所有条目
             for key in sorted_keys[:len(self._thread_rules) - self.max_cached_threads]:
                 del self._thread_rules[key]
+        
+        # 频道规则缓存（使用较小的限制）
+        max_channel_cache = self.max_cached_threads // 2
+        if len(self._channel_rules) > max_channel_cache:
+            sorted_keys = sorted(
+                self._channel_rules.keys(),
+                key=lambda k: self._channel_rules[k][1]
+            )
+            for key in sorted_keys[:len(self._channel_rules) - max_channel_cache]:
+                del self._channel_rules[key]
+        
+        # 分类规则缓存（使用较小的限制，因为分类数量较少）
+        max_categories = 10  # 固定较小值
+        if len(self._category_rules) > max_categories:
+            sorted_keys = sorted(
+                self._category_rules.keys(),
+                key=lambda k: self._category_rules[k][1]
+            )
+            for key in sorted_keys[:len(self._category_rules) - max_categories]:
+                del self._category_rules[key]
         
         if len(self._server_rules) > self.max_cached_guilds:
             sorted_keys = sorted(
@@ -285,25 +480,58 @@ class RuleCacheManager:
             )
             for key in sorted_keys[:len(self._server_rules) - self.max_cached_guilds]:
                 del self._server_rules[key]
+        
+        # 权限缓存也需要限制
+        if len(self._permissions) > self.max_cached_guilds:
+            sorted_keys = sorted(
+                self._permissions.keys(),
+                key=lambda k: self._permissions[k][1]
+            )
+            for key in sorted_keys[:len(self._permissions) - self.max_cached_guilds]:
+                del self._permissions[key]
+        
+        # 服务器配置缓存限制
+        if len(self._server_config) > self.max_cached_guilds:
+            sorted_keys = sorted(
+                self._server_config.keys(),
+                key=lambda k: self._server_config[k][1]
+            )
+            for key in sorted_keys[:len(self._server_config) - self.max_cached_guilds]:
+                del self._server_config[key]
     
     def clear_expired(self):
         """清理过期缓存"""
         now = time.time()
         self._server_rules = {k: v for k, v in self._server_rules.items() if v[1] > now}
         self._thread_rules = {k: v for k, v in self._thread_rules.items() if v[1] > now}
+        self._channel_rules = {k: v for k, v in self._channel_rules.items() if v[1] > now}
+        self._category_rules = {k: v for k, v in self._category_rules.items() if v[1] > now}
         self._server_config = {k: v for k, v in self._server_config.items() if v[1] > now}
         self._permissions = {k: v for k, v in self._permissions.items() if v[1] > now}
+    
+    def get_cache_stats(self) -> dict:
+        """获取缓存统计信息（用于调试）"""
+        return {
+            'server_rules': len(self._server_rules),
+            'thread_rules': len(self._thread_rules),
+            'channel_rules': len(self._channel_rules),
+            'category_rules': len(self._category_rules),
+            'server_config': len(self._server_config),
+            'permissions': len(self._permissions),
+        }
 
 
 # ==================== 限流管理器 ====================
 
 class RateLimitManager:
-    """限流状态管理器"""
+    """限流状态管理器 - 优化内存使用"""
     
     def __init__(self):
         # 内存限流状态: {(guild_id, rule_id, limit_type, target, action): last_triggered_time}
         self._limits: Dict[Tuple[str, int, str, str, str], float] = {}
-        self._max_entries = 2000
+        self._max_entries = 500  # 降低最大条目数以减少内存
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # 每5分钟清理一次
     
     def check_rate_limit(
         self,
@@ -317,6 +545,9 @@ class RateLimitManager:
         """检查是否在限流期内，返回True表示允许执行"""
         if cooldown_seconds <= 0:
             return True
+        
+        # 定期清理
+        self._maybe_cleanup()
         
         key = (guild_id, rule_id, limit_type, target_id, action_type)
         last_triggered = self._limits.get(key, 0)
@@ -342,11 +573,18 @@ class RateLimitManager:
         if len(self._limits) > self._max_entries:
             self._cleanup_old_entries()
     
+    def _maybe_cleanup(self):
+        """定期清理检查"""
+        now = time.time()
+        if now - self._last_cleanup >= self._cleanup_interval:
+            self._cleanup_old_entries()
+            self._last_cleanup = now
+    
     def _cleanup_old_entries(self):
         """清理旧条目"""
         now = time.time()
-        # 保留最近1小时的记录
-        self._limits = {k: v for k, v in self._limits.items() if now - v < 3600}
+        # 只保留最近10分钟的记录（降低以减少内存）
+        self._limits = {k: v for k, v in self._limits.items() if now - v < 600}
 
 
 # ==================== 统计缓冲区 ====================
@@ -437,6 +675,10 @@ class ThreadCommandCog(BaseCog):
         to_delete = [(mid, cid) for mid, cid, delete_at in self._pending_deletes if delete_at <= now]
         self._pending_deletes = [(mid, cid, delete_at) for mid, cid, delete_at in self._pending_deletes if delete_at > now]
         
+        # 限制待删除队列大小
+        if len(self._pending_deletes) > 500:
+            self._pending_deletes = self._pending_deletes[-500:]
+        
         for message_id, channel_id in to_delete:
             try:
                 channel = self.bot.get_channel(channel_id)
@@ -455,10 +697,14 @@ class ThreadCommandCog(BaseCog):
         """定期刷新统计缓冲区"""
         await self.stats_buffer.maybe_flush()
     
-    @tasks.loop(minutes=10)
+    @tasks.loop(minutes=2)
     async def cache_cleanup_task(self):
-        """定期清理过期缓存"""
+        """定期清理过期缓存 - 每2分钟执行一次"""
         self.cache.clear_expired()
+        # 强制执行缓存限制
+        self.cache._enforce_cache_limits()
+        # 清理限流记录
+        self.rate_limiter._cleanup_old_entries()
     
     @tasks.loop(count=1)
     async def init_default_rules_task(self):
@@ -510,7 +756,12 @@ class ThreadCommandCog(BaseCog):
     
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """监听消息事件"""
+        """监听消息事件
+        
+        支持以下频道类型：
+        - 帖子（Thread）- 论坛帖子内的消息
+        - 文字频道（TextChannel）- 普通文字频道的消息
+        """
         # 快速过滤
         if message.author.bot:
             return
@@ -526,7 +777,7 @@ class ThreadCommandCog(BaseCog):
         if config and not config.is_enabled:
             return
         
-        # 检查论坛频道限制（仅对帖子内消息生效）
+        # 论坛频道限制检查（仅对帖子内消息生效）
         if isinstance(message.channel, discord.Thread):
             parent = message.channel.parent
             if parent and isinstance(parent, discord.ForumChannel):
@@ -539,6 +790,15 @@ class ThreadCommandCog(BaseCog):
                     except (json.JSONDecodeError, TypeError):
                         pass
         
+        # 支持的频道类型检查
+        supported_channel = (
+            isinstance(message.channel, discord.Thread) or  # 帖子
+            isinstance(message.channel, discord.TextChannel)  # 普通文字频道
+        )
+        
+        if not supported_channel:
+            return
+        
         # 获取规则并匹配
         await self._process_message(message, config, is_scan=False)
     
@@ -548,28 +808,71 @@ class ThreadCommandCog(BaseCog):
         config: Optional[ThreadCommandServerConfig],
         is_scan: bool = False
     ):
-        """处理消息匹配和动作执行"""
+        """处理消息匹配和动作执行
+        
+        规则优先级（从高到低）：
+        1. 帖子规则 - 仅在帖子内生效
+        2. 频道规则 - 对指定频道及其帖子生效
+        3. 分类规则 - 对分类下所有频道及其帖子生效
+        4. 全服规则 - 对全服生效
+        """
         guild_id = str(message.guild.id)
         content = message.content.strip()
         
-        # 优先检查帖子规则
         matched_rule = None
         
-        # 检查是否在帖子内
-        if isinstance(message.channel, discord.Thread):
-            thread_id = str(message.channel.id)
+        # 确定当前频道和分类ID
+        channel = message.channel
+        channel_id = None
+        category_id = None
+        
+        if isinstance(channel, discord.Thread):
+            # 帖子内消息
+            thread_id = str(channel.id)
+            parent = channel.parent
+            if parent:
+                channel_id = str(parent.id)
+                if parent.category:
+                    category_id = str(parent.category_id)
+            
+            # 1. 检查帖子规则
             thread_rules = await self.cache.get_thread_rules(thread_id)
             for rule in thread_rules:
                 if rule.match(content):
                     matched_rule = rule
+                    self.logger.debug(f"匹配到帖子规则: {rule.rule_id}")
+                    break
+        else:
+            # 普通频道消息
+            channel_id = str(channel.id)
+            if hasattr(channel, 'category_id') and channel.category_id:
+                category_id = str(channel.category_id)
+        
+        # 2. 检查频道规则
+        if not matched_rule and channel_id:
+            channel_rules = await self.cache.get_channel_rules(channel_id)
+            for rule in channel_rules:
+                if rule.match(content):
+                    matched_rule = rule
+                    self.logger.debug(f"匹配到频道规则: {rule.rule_id}")
                     break
         
-        # 如果没有匹配帖子规则，检查全服规则
+        # 3. 检查分类规则
+        if not matched_rule and category_id:
+            category_rules = await self.cache.get_category_rules(category_id)
+            for rule in category_rules:
+                if rule.match(content):
+                    matched_rule = rule
+                    self.logger.debug(f"匹配到分类规则: {rule.rule_id}")
+                    break
+        
+        # 4. 检查全服规则
         if not matched_rule:
             server_rules = await self.cache.get_server_rules(guild_id)
             for rule in server_rules:
                 if rule.match(content):
                     matched_rule = rule
+                    self.logger.debug(f"匹配到全服规则: {rule.rule_id}")
                     break
         
         if not matched_rule:
@@ -595,6 +898,10 @@ class ThreadCommandCog(BaseCog):
         guild_id = str(message.guild.id)
         user_id = str(message.author.id)
         channel_id = str(message.channel.id)
+        
+        # 确定用于限流的目标ID
+        # 对于帖子使用帖子ID，对于普通频道使用频道ID
+        rate_limit_target_id = channel_id  # 统一使用channel_id作为限流目标
         thread_id = str(message.channel.id) if isinstance(message.channel, discord.Thread) else None
         
         # 获取限流配置（规则优先，否则使用全服默认，0表示不限流）
@@ -618,9 +925,9 @@ class ThreadCommandCog(BaseCog):
                 guild_id, rule.rule_id, 'user', user_id, 'reply', user_reply_cd
             ):
                 can_reply = False
-            # 帖子/频道级限流
-            elif thread_id and not self.rate_limiter.check_rate_limit(
-                guild_id, rule.rule_id, 'thread', thread_id, 'reply', thread_reply_cd
+            # 帖子/频道级限流（统一使用 'channel' 类型）
+            elif not self.rate_limiter.check_rate_limit(
+                guild_id, rule.rule_id, 'channel', rate_limit_target_id, 'reply', thread_reply_cd
             ):
                 can_reply = False
         
@@ -640,8 +947,7 @@ class ThreadCommandCog(BaseCog):
                 
                 # 记录限流
                 self.rate_limiter.record_trigger(guild_id, rule.rule_id, 'user', user_id, 'reply')
-                if thread_id:
-                    self.rate_limiter.record_trigger(guild_id, rule.rule_id, 'thread', thread_id, 'reply')
+                self.rate_limiter.record_trigger(guild_id, rule.rule_id, 'channel', rate_limit_target_id, 'reply')
                 
             except Exception as e:
                 self.logger.error(f"发送回复失败: {e}")
@@ -790,10 +1096,12 @@ class ThreadCommandCog(BaseCog):
     
     def _schedule_delete(self, message_id: int, channel_id: int, delete_at: float):
         """调度消息删除"""
-        if len(self._pending_deletes) >= RESOURCE_LIMITS['max_pending_deletes']:
-            # 队列满，移除最早的
+        # 更积极地控制队列大小
+        max_pending = 500  # 降低最大待删除数量
+        if len(self._pending_deletes) >= max_pending:
+            # 队列满，移除最早的一半
             self._pending_deletes.sort(key=lambda x: x[2])
-            self._pending_deletes = self._pending_deletes[100:]
+            self._pending_deletes = self._pending_deletes[max_pending // 2:]
         
         self._pending_deletes.append((message_id, channel_id, delete_at))
     
@@ -875,6 +1183,18 @@ class ThreadCommandCog(BaseCog):
             (guild_id,)
         )
         
+        # 查询频道规则
+        all_channel_rules = await self.db.fetchall(
+            "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'channel'",
+            (guild_id,)
+        )
+        
+        # 查询分类规则
+        all_category_rules = await self.db.fetchall(
+            "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'category'",
+            (guild_id,)
+        )
+        
         is_enabled = config.is_enabled if config else True
         allow_owner = config.allow_thread_owner_config if config else True
         
@@ -909,11 +1229,30 @@ class ThreadCommandCog(BaseCog):
             inline=True
         )
         
+        # 空字段用于对齐
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        
         # 全服规则数（显示总数，包括禁用的）
-        enabled_count = sum(1 for r in all_server_rules if r['is_enabled'])
+        server_enabled = sum(1 for r in all_server_rules if r['is_enabled'])
         embed.add_field(
-            name="📋 全服规则数",
-            value=f"{enabled_count}/{len(all_server_rules)} 启用",
+            name="📋 全服规则",
+            value=f"{server_enabled}/{len(all_server_rules)} 启用",
+            inline=True
+        )
+        
+        # 频道规则数
+        channel_enabled = sum(1 for r in all_channel_rules if r['is_enabled'])
+        embed.add_field(
+            name="📺 频道规则",
+            value=f"{channel_enabled}/{len(all_channel_rules)} 启用",
+            inline=True
+        )
+        
+        # 分类规则数
+        category_enabled = sum(1 for r in all_category_rules if r['is_enabled'])
+        embed.add_field(
+            name="📁 分类规则",
+            value=f"{category_enabled}/{len(all_category_rules)} 启用",
             inline=True
         )
         
@@ -949,13 +1288,20 @@ class ThreadCommandCog(BaseCog):
                 rules_info.append(f"{status} 全服{idx}号: `{trigger_str}` → {action_display}")
             
             embed.add_field(
-                name="规则预览",
+                name="全服规则预览",
                 value='\n'.join(rules_info),
                 inline=False
             )
         
+        # 规则优先级说明
+        embed.add_field(
+            name="📊 规则优先级",
+            value="帖子规则 → 频道规则 → 分类规则 → 全服规则",
+            inline=False
+        )
+        
         # 使用提示
-        embed.set_footer(text="使用 /扫描监听提醒 配置 管理全服设置 | /扫描监听提醒 帖子配置 管理帖子设置")
+        embed.set_footer(text="配置: 全服设置 | 帖子配置: 帖子设置 | 频道配置: 频道/分类设置")
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
@@ -1119,6 +1465,109 @@ class ThreadCommandCog(BaseCog):
         
         # 创建视图
         view = ThreadConfigPanelView(self, guild_id, thread_id, thread_rules)
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+    @scan_cmd.command(name="频道配置", description="频道和分类规则配置面板（管理员）")
+    async def channel_config_panel(self, interaction: discord.Interaction):
+        """频道和分类规则配置面板 - 管理员用
+        
+        支持为以下目标配置规则：
+        - 指定频道（文字频道或论坛频道）
+        - 指定分类（频道分类）
+        """
+        if not await self.check_server_config_permission(interaction):
+            await interaction.response.send_message("❌ 权限不足，需要服务器管理权限或特殊权限", ephemeral=True)
+            return
+        
+        guild_id = str(interaction.guild.id)
+        
+        # 查询频道规则
+        channel_rules_data = await self.db.fetchall(
+            "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'channel'",
+            (guild_id,)
+        )
+        
+        # 查询分类规则
+        category_rules_data = await self.db.fetchall(
+            "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'category'",
+            (guild_id,)
+        )
+        
+        # 构建主面板Embed
+        embed = discord.Embed(
+            title="📺 扫描监听提醒 - 频道与分类配置",
+            description="管理频道级和分类级的扫描监听规则\n\n"
+                       "**规则优先级（从高到低）:**\n"
+                       "1️⃣ 帖子规则 → 2️⃣ 频道规则 → 3️⃣ 分类规则 → 4️⃣ 全服规则",
+            color=0x9b59b6
+        )
+        
+        # 频道规则统计
+        enabled_channel = sum(1 for r in channel_rules_data if r['is_enabled'])
+        embed.add_field(
+            name="📺 频道规则",
+            value=f"{enabled_channel}/{len(channel_rules_data)} 启用",
+            inline=True
+        )
+        
+        # 分类规则统计
+        enabled_category = sum(1 for r in category_rules_data if r['is_enabled'])
+        embed.add_field(
+            name="📁 分类规则",
+            value=f"{enabled_category}/{len(category_rules_data)} 启用",
+            inline=True
+        )
+        
+        # 显示频道规则列表预览
+        if channel_rules_data:
+            channel_info = []
+            for idx, rule_row in enumerate(channel_rules_data[:3], 1):
+                channel = self.bot.get_channel(int(rule_row['channel_id']))
+                channel_name = channel.name if channel else f"ID:{rule_row['channel_id']}"
+                status = "✅" if rule_row['is_enabled'] else "❌"
+                action_display = ACTION_TYPE_DISPLAY.get(rule_row['action_type'], rule_row['action_type'])
+                channel_info.append(f"{status} #{channel_name}: {action_display}")
+            
+            if len(channel_rules_data) > 3:
+                channel_info.append(f"... +{len(channel_rules_data) - 3} 个")
+            
+            embed.add_field(
+                name="频道规则预览",
+                value='\n'.join(channel_info),
+                inline=False
+            )
+        
+        # 显示分类规则列表预览
+        if category_rules_data:
+            category_info = []
+            for idx, rule_row in enumerate(category_rules_data[:3], 1):
+                category = self.bot.get_channel(int(rule_row['category_id']))
+                category_name = category.name if category else f"ID:{rule_row['category_id']}"
+                status = "✅" if rule_row['is_enabled'] else "❌"
+                action_display = ACTION_TYPE_DISPLAY.get(rule_row['action_type'], rule_row['action_type'])
+                category_info.append(f"{status} 📁{category_name}: {action_display}")
+            
+            if len(category_rules_data) > 3:
+                category_info.append(f"... +{len(category_rules_data) - 3} 个")
+            
+            embed.add_field(
+                name="分类规则预览",
+                value='\n'.join(category_info),
+                inline=False
+            )
+        
+        if not channel_rules_data and not category_rules_data:
+            embed.add_field(
+                name="📋 规则列表",
+                value="暂无频道或分类规则，点击下方按钮添加",
+                inline=False
+            )
+        
+        embed.set_footer(text="频道规则对该频道及其帖子生效 | 分类规则对该分类下所有频道生效")
+        
+        # 创建视图
+        view = ChannelConfigPanelView(self, guild_id, channel_rules_data, category_rules_data)
         
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
     
@@ -1326,6 +1775,96 @@ class ThreadCommandCog(BaseCog):
         
         return rule_id
     
+    async def add_channel_rule(
+        self,
+        guild_id: str,
+        channel_id: str,
+        trigger_list: list,
+        trigger_mode: str,
+        action_type: str,
+        reply_content: Optional[str],
+        delete_delay: Optional[int],
+        user_id: str
+    ) -> int:
+        """添加频道规则"""
+        now = datetime.utcnow().isoformat()
+        
+        await self.db.execute(
+            """INSERT INTO thread_command_rules
+               (guild_id, channel_id, scope, action_type, reply_content,
+                delete_trigger_delay, delete_reply_delay, is_enabled, priority,
+                created_by, created_at, updated_at)
+               VALUES (?, ?, 'channel', ?, ?, ?, ?, 1, 0, ?, ?, ?)""",
+            (
+                guild_id, channel_id, action_type, reply_content,
+                delete_delay, delete_delay, user_id, now, now
+            )
+        )
+        
+        rule_row = await self.db.fetchone(
+            "SELECT rule_id FROM thread_command_rules WHERE guild_id = ? ORDER BY rule_id DESC LIMIT 1",
+            (guild_id,)
+        )
+        rule_id = rule_row['rule_id']
+        
+        for t in trigger_list:
+            if len(t) > RESOURCE_LIMITS['max_trigger_length']:
+                t = t[:RESOURCE_LIMITS['max_trigger_length']]
+            await self.db.execute(
+                """INSERT INTO thread_command_triggers
+                   (rule_id, trigger_text, trigger_mode, is_enabled, created_at)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (rule_id, t, trigger_mode, now)
+            )
+        
+        await self.cache.refresh_channel_rules(channel_id)
+        return rule_id
+    
+    async def add_category_rule(
+        self,
+        guild_id: str,
+        category_id: str,
+        trigger_list: list,
+        trigger_mode: str,
+        action_type: str,
+        reply_content: Optional[str],
+        delete_delay: Optional[int],
+        user_id: str
+    ) -> int:
+        """添加分类规则"""
+        now = datetime.utcnow().isoformat()
+        
+        await self.db.execute(
+            """INSERT INTO thread_command_rules
+               (guild_id, category_id, scope, action_type, reply_content,
+                delete_trigger_delay, delete_reply_delay, is_enabled, priority,
+                created_by, created_at, updated_at)
+               VALUES (?, ?, 'category', ?, ?, ?, ?, 1, 0, ?, ?, ?)""",
+            (
+                guild_id, category_id, action_type, reply_content,
+                delete_delay, delete_delay, user_id, now, now
+            )
+        )
+        
+        rule_row = await self.db.fetchone(
+            "SELECT rule_id FROM thread_command_rules WHERE guild_id = ? ORDER BY rule_id DESC LIMIT 1",
+            (guild_id,)
+        )
+        rule_id = rule_row['rule_id']
+        
+        for t in trigger_list:
+            if len(t) > RESOURCE_LIMITS['max_trigger_length']:
+                t = t[:RESOURCE_LIMITS['max_trigger_length']]
+            await self.db.execute(
+                """INSERT INTO thread_command_triggers
+                   (rule_id, trigger_text, trigger_mode, is_enabled, created_at)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (rule_id, t, trigger_mode, now)
+            )
+        
+        await self.cache.refresh_category_rules(category_id)
+        return rule_id
+    
     async def delete_rule(self, rule_id: int, guild_id: str) -> bool:
         """删除规则"""
         rule = await self.db.fetchone(
@@ -1341,8 +1880,13 @@ class ThreadCommandCog(BaseCog):
             (rule_id,)
         )
         
+        # 根据规则范围刷新对应缓存
         if rule['scope'] == 'server':
             await self.cache.refresh_server_rules(guild_id)
+        elif rule['scope'] == 'channel' and rule['channel_id']:
+            await self.cache.refresh_channel_rules(rule['channel_id'])
+        elif rule['scope'] == 'category' and rule['category_id']:
+            await self.cache.refresh_category_rules(rule['category_id'])
         elif rule['thread_id']:
             await self.cache.refresh_thread_rules(rule['thread_id'])
         
@@ -1363,8 +1907,13 @@ class ThreadCommandCog(BaseCog):
             (enabled, datetime.utcnow().isoformat(), rule_id)
         )
         
+        # 根据规则范围刷新对应缓存
         if rule['scope'] == 'server':
             await self.cache.refresh_server_rules(guild_id)
+        elif rule['scope'] == 'channel' and rule['channel_id']:
+            await self.cache.refresh_channel_rules(rule['channel_id'])
+        elif rule['scope'] == 'category' and rule['category_id']:
+            await self.cache.refresh_category_rules(rule['category_id'])
         elif rule['thread_id']:
             await self.cache.refresh_thread_rules(rule['thread_id'])
         
@@ -1377,11 +1926,17 @@ class ServerConfigPanelView(discord.ui.View):
     """服务器配置面板视图"""
     
     def __init__(self, cog: ThreadCommandCog, guild_id: str, config_data: dict, rules: list):
-        super().__init__(timeout=300)
+        super().__init__(timeout=180)  # 降低超时时间到3分钟
         self.cog = cog
         self.guild_id = guild_id
         self.config_data = config_data
-        self.rules = rules
+        self.rules = rules  # 注意：这里只存储引用，不复制数据
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.config_data = None
+        self.rules = None
     
     @discord.ui.button(label="开关全服功能", style=discord.ButtonStyle.primary, row=0)
     async def toggle_feature(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1524,11 +2079,16 @@ class ThreadConfigPanelView(discord.ui.View):
     """帖子配置面板视图"""
     
     def __init__(self, cog: ThreadCommandCog, guild_id: str, thread_id: str, rules: list):
-        super().__init__(timeout=300)
+        super().__init__(timeout=180)  # 降低超时时间到3分钟
         self.cog = cog
         self.guild_id = guild_id
         self.thread_id = thread_id
         self.rules = rules
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.rules = None
     
     @discord.ui.button(label="添加规则", style=discord.ButtonStyle.success, row=0)
     async def add_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1591,12 +2151,14 @@ class RuleManageView(discord.ui.View):
     """规则管理视图"""
     
     def __init__(self, cog: ThreadCommandCog, guild_id: str, rules_data: list, scope: str = 'server'):
-        super().__init__(timeout=300)
+        super().__init__(timeout=180)  # 降低超时时间到3分钟
         self.cog = cog
         self.guild_id = guild_id
         self.rules_data = rules_data
         self.scope = scope
-        self.scope_prefix = "全服" if scope == 'server' else "帖子"
+        
+        # 根据范围设置显示前缀
+        self.scope_prefix = SCOPE_DISPLAY.get(scope, scope)
         
         # 添加规则选择器
         if rules_data:
@@ -1615,6 +2177,11 @@ class RuleManageView(discord.ui.View):
             )
             self.rule_select.callback = self.on_rule_select
             self.add_item(self.rule_select)
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.rules_data = None
     
     def _get_rule_display_name(self, rule_id: int) -> str:
         """获取规则的显示名称（如：全服1号）"""
@@ -1675,12 +2242,16 @@ class RuleActionView(discord.ui.View):
     """规则操作视图"""
     
     def __init__(self, cog: ThreadCommandCog, guild_id: str, rule_id: int, is_enabled: bool, rule_display_name: str = None):
-        super().__init__(timeout=120)
+        super().__init__(timeout=90)  # 降低超时时间到1.5分钟
         self.cog = cog
         self.guild_id = guild_id
         self.rule_id = rule_id
         self.is_enabled = is_enabled
         self.rule_display_name = rule_display_name or f"规则{rule_id}"
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
     
     @discord.ui.button(label="切换启用状态", style=discord.ButtonStyle.primary)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1801,27 +2372,39 @@ class EditRuleModal(discord.ui.Modal, title="编辑规则"):
             self.extra_settings.default = ' '.join(extra_parts)
     
     async def on_submit(self, interaction: discord.Interaction):
-        # 解析触发词
-        trigger_list = [t.strip() for t in self.trigger_text.value.split(',') if t.strip()]
-        if not trigger_list:
-            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
-            return
-        
         # 解析匹配模式（支持中英文）
         mode_input = self.trigger_mode.value.strip()
         new_mode = MATCH_MODE_MAP.get(mode_input) or MATCH_MODE_MAP.get(mode_input.lower())
         if not new_mode:
             new_mode = 'exact'
         
+        # 解析触发词
+        # 正则模式下不按逗号分割，将整个输入作为单个触发器（避免正则中的逗号被误解析）
+        if new_mode == 'regex':
+            trigger_list = [self.trigger_text.value.strip()] if self.trigger_text.value.strip() else []
+        else:
+            trigger_list = [t.strip() for t in self.trigger_text.value.split(',') if t.strip()]
+        
+        if not trigger_list:
+            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
+            return
+        
         # 验证正则表达式
         if new_mode == 'regex':
-            import re
             for t in trigger_list:
-                try:
-                    re.compile(t)
-                except re.error as e:
+                is_valid, error_msg = validate_regex_pattern(t)
+                if not is_valid:
+                    # 尝试提供修复建议
+                    fixed = suggest_regex_fix(t)
+                    fix_hint = ""
+                    if fixed != t:
+                        # 验证修复后的正则是否有效
+                        is_fixed_valid, _ = validate_regex_pattern(fixed)
+                        if is_fixed_valid:
+                            fix_hint = f"\n\n💡 **建议修复**: `{fixed}`"
+                    
                     await interaction.response.send_message(
-                        f"❌ 正则表达式无效: {t}\n错误: {e}",
+                        f"❌ 正则表达式无效: `{t}`\n\n{error_msg}{fix_hint}",
                         ephemeral=True
                     )
                     return
@@ -1902,9 +2485,14 @@ class EditRuleModal(discord.ui.Modal, title="编辑规则"):
                     (self.rule_id, trigger, new_mode, now)
                 )
             
-            # 刷新缓存
-            if self.rule.get('thread_id'):
+            # 刷新缓存 - 根据规则范围刷新对应缓存
+            rule_scope = self.rule.get('scope', 'server')
+            if rule_scope == 'thread' and self.rule.get('thread_id'):
                 await self.cog.cache.refresh_thread_rules(self.rule['thread_id'])
+            elif rule_scope == 'channel' and self.rule.get('channel_id'):
+                await self.cog.cache.refresh_channel_rules(self.rule['channel_id'])
+            elif rule_scope == 'category' and self.rule.get('category_id'):
+                await self.cog.cache.refresh_category_rules(self.rule['category_id'])
             else:
                 await self.cog.cache.refresh_server_rules(self.guild_id)
             
@@ -2062,17 +2650,22 @@ class AddRuleModal(discord.ui.Modal, title="添加规则"):
         self.thread_id = thread_id
     
     async def on_submit(self, interaction: discord.Interaction):
-        # 解析触发词
-        trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
-        if not trigger_list:
-            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
-            return
-        
         # 验证匹配模式（支持中英文）
         mode_input = self.trigger_mode.value.strip()
         mode = MATCH_MODE_MAP.get(mode_input) or MATCH_MODE_MAP.get(mode_input.lower())
         if not mode:
             mode = 'exact'
+        
+        # 解析触发词
+        # 正则模式下不按逗号分割，将整个输入作为单个触发器（避免正则中的逗号被误解析）
+        if mode == 'regex':
+            trigger_list = [self.trigger.value.strip()] if self.trigger.value.strip() else []
+        else:
+            trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
+        
+        if not trigger_list:
+            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
+            return
         
         # 验证动作类型（支持中英文）
         action_input = self.action_type.value.strip()
@@ -2092,13 +2685,20 @@ class AddRuleModal(discord.ui.Modal, title="添加规则"):
         
         # 验证正则表达式
         if mode == 'regex':
-            import re
             for t in trigger_list:
-                try:
-                    re.compile(t)
-                except re.error as e:
+                is_valid, error_msg = validate_regex_pattern(t)
+                if not is_valid:
+                    # 尝试提供修复建议
+                    fixed = suggest_regex_fix(t)
+                    fix_hint = ""
+                    if fixed != t:
+                        # 验证修复后的正则是否有效
+                        is_fixed_valid, _ = validate_regex_pattern(fixed)
+                        if is_fixed_valid:
+                            fix_hint = f"\n\n💡 **建议修复**: `{fixed}`"
+                    
                     await interaction.response.send_message(
-                        f"❌ 正则表达式无效: {t}\n错误: {e}",
+                        f"❌ 正则表达式无效: `{t}`\n\n{error_msg}{fix_hint}",
                         ephemeral=True
                     )
                     return
@@ -2156,15 +2756,13 @@ class PermissionPanelView(discord.ui.View):
     """权限管理面板视图"""
     
     def __init__(self, cog: ThreadCommandCog, guild_id: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=180)  # 降低超时时间到3分钟
         self.cog = cog
         self.guild_id = guild_id
-        self._setup_permission_select()
     
-    def _setup_permission_select(self):
-        """动态设置权限选择器"""
-        # 需要在显示时动态加载权限列表
-        pass
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
     
     @discord.ui.button(label="添加用户权限", style=discord.ButtonStyle.success, row=0)
     async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2264,7 +2862,7 @@ class PermissionDeleteView(discord.ui.View):
     """权限删除选择视图"""
     
     def __init__(self, cog: 'ThreadCommandCog', guild_id: str, permissions: list):
-        super().__init__(timeout=120)
+        super().__init__(timeout=90)  # 降低超时时间到1.5分钟
         self.cog = cog
         self.guild_id = guild_id
         self.permissions = permissions
@@ -2287,6 +2885,11 @@ class PermissionDeleteView(discord.ui.View):
             self.perm_select.callback = self.on_select
             self.add_item(self.perm_select)
     
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.permissions = None
+    
     async def on_select(self, interaction: discord.Interaction):
         """处理权限删除选择"""
         value = self.perm_select.values[0]
@@ -2305,6 +2908,514 @@ class PermissionDeleteView(discord.ui.View):
             f"✅ 已删除{type_name}权限: {target_id}",
             ephemeral=True
         )
+
+
+class ChannelConfigPanelView(discord.ui.View):
+    """频道和分类配置面板视图"""
+    
+    def __init__(self, cog: ThreadCommandCog, guild_id: str, channel_rules: list, category_rules: list):
+        super().__init__(timeout=180)  # 降低超时时间到3分钟
+        self.cog = cog
+        self.guild_id = guild_id
+        self.channel_rules = channel_rules
+        self.category_rules = category_rules
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.channel_rules = None
+        self.category_rules = None
+    
+    @discord.ui.button(label="添加频道规则", style=discord.ButtonStyle.success, row=0)
+    async def add_channel_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """添加频道规则 - 使用原生频道选择器，支持搜索所有频道"""
+        view = ChannelSelectView(self.cog, self.guild_id, [], 'channel')
+        await interaction.response.send_message(
+            "📺 请选择要配置规则的频道：\n"
+            "💡 可直接在下拉框中搜索频道名称",
+            view=view,
+            ephemeral=True
+        )
+    
+    @discord.ui.button(label="添加分类规则", style=discord.ButtonStyle.success, row=0)
+    async def add_category_rule(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """添加分类规则 - 使用原生频道选择器，支持搜索所有分类"""
+        view = ChannelSelectView(self.cog, self.guild_id, [], 'category')
+        await interaction.response.send_message(
+            "📁 请选择要配置规则的分类：\n"
+            "💡 可直接在下拉框中搜索分类名称",
+            view=view,
+            ephemeral=True
+        )
+    
+    @discord.ui.button(label="查看频道规则", style=discord.ButtonStyle.primary, row=1)
+    async def view_channel_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """查看所有频道规则"""
+        rules_data = await self.cog.db.fetchall(
+            "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'channel' ORDER BY channel_id",
+            (self.guild_id,)
+        )
+        
+        if not rules_data:
+            await interaction.response.send_message("📋 暂无频道规则", ephemeral=True)
+            return
+        
+        embed = discord.Embed(title="📺 频道规则列表", color=0x9b59b6)
+        
+        for idx, rule_row in enumerate(rules_data[:10], 1):
+            channel = self.cog.bot.get_channel(int(rule_row['channel_id']))
+            channel_name = f"#{channel.name}" if channel else f"ID:{rule_row['channel_id']}"
+            
+            triggers_data = await self.cog.db.fetchall(
+                "SELECT * FROM thread_command_triggers WHERE rule_id = ?",
+                (rule_row['rule_id'],)
+            )
+            
+            trigger_strs = [f"`{t['trigger_text']}`" for t in triggers_data[:3]]
+            if len(triggers_data) > 3:
+                trigger_strs.append(f"...+{len(triggers_data)-3}")
+            
+            status = "✅" if rule_row['is_enabled'] else "❌"
+            action_display = ACTION_TYPE_DISPLAY.get(rule_row['action_type'], rule_row['action_type'])
+            
+            embed.add_field(
+                name=f"{status} 频道{idx}号 - {channel_name}",
+                value=f"触发: {', '.join(trigger_strs)}\n动作: {action_display}",
+                inline=False
+            )
+        
+        if len(rules_data) > 10:
+            embed.set_footer(text=f"显示前10条，共{len(rules_data)}条规则")
+        
+        view = ChannelRuleManageView(self.cog, self.guild_id, rules_data, 'channel')
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+    @discord.ui.button(label="查看分类规则", style=discord.ButtonStyle.primary, row=1)
+    async def view_category_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """查看所有分类规则"""
+        rules_data = await self.cog.db.fetchall(
+            "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'category' ORDER BY category_id",
+            (self.guild_id,)
+        )
+        
+        if not rules_data:
+            await interaction.response.send_message("📋 暂无分类规则", ephemeral=True)
+            return
+        
+        embed = discord.Embed(title="📁 分类规则列表", color=0x9b59b6)
+        
+        for idx, rule_row in enumerate(rules_data[:10], 1):
+            category = self.cog.bot.get_channel(int(rule_row['category_id']))
+            category_name = f"📁{category.name}" if category else f"ID:{rule_row['category_id']}"
+            
+            triggers_data = await self.cog.db.fetchall(
+                "SELECT * FROM thread_command_triggers WHERE rule_id = ?",
+                (rule_row['rule_id'],)
+            )
+            
+            trigger_strs = [f"`{t['trigger_text']}`" for t in triggers_data[:3]]
+            if len(triggers_data) > 3:
+                trigger_strs.append(f"...+{len(triggers_data)-3}")
+            
+            status = "✅" if rule_row['is_enabled'] else "❌"
+            action_display = ACTION_TYPE_DISPLAY.get(rule_row['action_type'], rule_row['action_type'])
+            
+            embed.add_field(
+                name=f"{status} 分类{idx}号 - {category_name}",
+                value=f"触发: {', '.join(trigger_strs)}\n动作: {action_display}",
+                inline=False
+            )
+        
+        if len(rules_data) > 10:
+            embed.set_footer(text=f"显示前10条，共{len(rules_data)}条规则")
+        
+        view = ChannelRuleManageView(self.cog, self.guild_id, rules_data, 'category')
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class ChannelSelectView(discord.ui.View):
+    """频道选择视图 - 使用 Discord 原生频道选择器"""
+    
+    def __init__(self, cog: ThreadCommandCog, guild_id: str, channels: list, scope_type: str):
+        super().__init__(timeout=60)  # 降低超时时间到1分钟
+        self.cog = cog
+        self.guild_id = guild_id
+        self.scope_type = scope_type  # 'channel' 或 'category'
+        
+        # 根据类型创建不同的选择器
+        if scope_type == 'channel':
+            # 使用原生频道选择器，支持文字频道和论坛频道
+            self.channel_select = discord.ui.ChannelSelect(
+                placeholder="选择频道（支持搜索）...",
+                channel_types=[
+                    discord.ChannelType.text,
+                    discord.ChannelType.forum,
+                ],
+                min_values=1,
+                max_values=1
+            )
+        else:
+            # 分类选择器
+            self.channel_select = discord.ui.ChannelSelect(
+                placeholder="选择分类（支持搜索）...",
+                channel_types=[discord.ChannelType.category],
+                min_values=1,
+                max_values=1
+            )
+        
+        self.channel_select.callback = self.on_channel_select
+        self.add_item(self.channel_select)
+        
+        # 添加手动输入按钮作为备选
+        self.add_item(ManualInputButton(cog, guild_id, scope_type))
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+    
+    async def on_channel_select(self, interaction: discord.Interaction):
+        """处理频道/分类选择"""
+        selected_channel = self.channel_select.values[0]
+        target_id = str(selected_channel.id)
+        
+        # 打开添加规则Modal
+        modal = AddChannelCategoryRuleModal(
+            self.cog,
+            self.guild_id,
+            target_id,
+            self.scope_type
+        )
+        await interaction.response.send_modal(modal)
+
+
+class ManualInputButton(discord.ui.Button):
+    """手动输入频道ID按钮"""
+    
+    def __init__(self, cog: ThreadCommandCog, guild_id: str, scope_type: str):
+        label = "手动输入频道ID" if scope_type == 'channel' else "手动输入分类ID"
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=1)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.scope_type = scope_type
+    
+    async def callback(self, interaction: discord.Interaction):
+        modal = ManualChannelInputModal(self.cog, self.guild_id, self.scope_type)
+        await interaction.response.send_modal(modal)
+
+
+class ManualChannelInputModal(discord.ui.Modal):
+    """手动输入频道/分类ID的Modal"""
+    
+    channel_id = discord.ui.TextInput(
+        label="频道或分类ID",
+        placeholder="1234567890123456789",
+        max_length=30
+    )
+    
+    def __init__(self, cog: ThreadCommandCog, guild_id: str, scope_type: str):
+        title = "输入频道ID" if scope_type == 'channel' else "输入分类ID"
+        super().__init__(title=title)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.scope_type = scope_type
+        self.channel_id.label = "频道ID" if scope_type == 'channel' else "分类ID"
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        target_id = self.channel_id.value.strip()
+        
+        if not target_id.isdigit():
+            await interaction.response.send_message("❌ 无效的ID格式", ephemeral=True)
+            return
+        
+        # 验证频道/分类是否存在
+        channel = self.cog.bot.get_channel(int(target_id))
+        if not channel:
+            await interaction.response.send_message("❌ 找不到该频道或分类", ephemeral=True)
+            return
+        
+        # 验证类型是否匹配
+        if self.scope_type == 'channel':
+            if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                await interaction.response.send_message("❌ 请输入文字频道或论坛频道的ID", ephemeral=True)
+                return
+        else:
+            if not isinstance(channel, discord.CategoryChannel):
+                await interaction.response.send_message("❌ 请输入频道分类的ID", ephemeral=True)
+                return
+        
+        # 打开添加规则Modal
+        modal = AddChannelCategoryRuleModal(
+            self.cog,
+            self.guild_id,
+            target_id,
+            self.scope_type
+        )
+        await interaction.response.send_modal(modal)
+
+
+class AddChannelCategoryRuleModal(discord.ui.Modal):
+    """添加频道/分类规则的Modal"""
+    
+    trigger = discord.ui.TextInput(
+        label="触发词（多个用逗号分隔）",
+        placeholder="你好, hello, 回顶",
+        max_length=200
+    )
+    
+    trigger_mode = discord.ui.TextInput(
+        label="匹配模式（精确/前缀/包含/正则）",
+        placeholder="精确=完全一致 | 前缀=以此开头 | 包含=包含此文字 | 正则=正则表达式",
+        default="精确",
+        max_length=20
+    )
+    
+    action_type = discord.ui.TextInput(
+        label="动作类型（回复/回顶/反应/回复并反应）",
+        placeholder="回复=发送消息 | 回顶=顶帖效果 | 反应=添加表情",
+        default="回复",
+        max_length=20
+    )
+    
+    reply_content = discord.ui.TextInput(
+        label="回复内容（纯文本或JSON格式embed）",
+        style=discord.TextStyle.paragraph,
+        placeholder='普通文本 或 {"title":"标题","description":"描述","color":65280}',
+        required=False,
+        max_length=2000
+    )
+    
+    delete_delay = discord.ui.TextInput(
+        label="删除延迟秒数（可选，0或留空不删除）",
+        placeholder="300",
+        required=False,
+        max_length=10
+    )
+    
+    def __init__(self, cog: ThreadCommandCog, guild_id: str, target_id: str, scope_type: str):
+        title = "添加频道规则" if scope_type == 'channel' else "添加分类规则"
+        super().__init__(title=title)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.target_id = target_id
+        self.scope_type = scope_type
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        # 验证匹配模式（支持中英文）
+        mode_input = self.trigger_mode.value.strip()
+        mode = MATCH_MODE_MAP.get(mode_input) or MATCH_MODE_MAP.get(mode_input.lower())
+        if not mode:
+            mode = 'exact'
+        
+        # 解析触发词
+        # 正则模式下不按逗号分割，将整个输入作为单个触发器（避免正则中的逗号被误解析）
+        if mode == 'regex':
+            trigger_list = [self.trigger.value.strip()] if self.trigger.value.strip() else []
+        else:
+            trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
+        
+        if not trigger_list:
+            await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
+            return
+        
+        # 验证动作类型（支持中英文）
+        action_input = self.action_type.value.strip()
+        action = ACTION_TYPE_MAP.get(action_input) or ACTION_TYPE_MAP.get(action_input.lower())
+        if not action:
+            action = 'reply'
+        
+        # 解析删除延迟
+        delete_delay = None
+        if self.delete_delay.value.strip():
+            try:
+                delay = int(self.delete_delay.value.strip())
+                if delay > 0:
+                    delete_delay = delay
+            except:
+                pass
+        
+        # 验证正则表达式
+        if mode == 'regex':
+            for t in trigger_list:
+                is_valid, error_msg = validate_regex_pattern(t)
+                if not is_valid:
+                    # 尝试提供修复建议
+                    fixed = suggest_regex_fix(t)
+                    fix_hint = ""
+                    if fixed != t:
+                        # 验证修复后的正则是否有效
+                        is_fixed_valid, _ = validate_regex_pattern(fixed)
+                        if is_fixed_valid:
+                            fix_hint = f"\n\n💡 **建议修复**: `{fixed}`"
+                    
+                    await interaction.response.send_message(
+                        f"❌ 正则表达式无效: `{t}`\n\n{error_msg}{fix_hint}",
+                        ephemeral=True
+                    )
+                    return
+        
+        # 获取回复内容
+        reply_content = self.reply_content.value.strip() if self.reply_content.value else None
+        
+        # 创建规则
+        if self.scope_type == 'channel':
+            rule_id = await self.cog.add_channel_rule(
+                self.guild_id,
+                self.target_id,
+                trigger_list,
+                mode,
+                action,
+                reply_content,
+                delete_delay,
+                str(interaction.user.id)
+            )
+            scope_prefix = "频道"
+            channel = self.cog.bot.get_channel(int(self.target_id))
+            target_name = f"#{channel.name}" if channel else f"ID:{self.target_id}"
+        else:
+            rule_id = await self.cog.add_category_rule(
+                self.guild_id,
+                self.target_id,
+                trigger_list,
+                mode,
+                action,
+                reply_content,
+                delete_delay,
+                str(interaction.user.id)
+            )
+            scope_prefix = "分类"
+            category = self.cog.bot.get_channel(int(self.target_id))
+            target_name = f"📁{category.name}" if category else f"ID:{self.target_id}"
+        
+        mode_display = MATCH_MODE_DISPLAY.get(mode, mode)
+        action_display = ACTION_TYPE_DISPLAY.get(action, action)
+        
+        await interaction.response.send_message(
+            f"✅ 已为 {target_name} 创建{scope_prefix}规则 #{rule_id}\n"
+            f"触发词: {', '.join(trigger_list)}\n"
+            f"模式: {mode_display}\n"
+            f"动作: {action_display}",
+            ephemeral=True
+        )
+
+
+class ChannelRuleManageView(discord.ui.View):
+    """频道/分类规则管理视图"""
+    
+    def __init__(self, cog: ThreadCommandCog, guild_id: str, rules_data: list, scope_type: str):
+        super().__init__(timeout=180)  # 降低超时时间到3分钟
+        self.cog = cog
+        self.guild_id = guild_id
+        self.rules_data = rules_data
+        self.scope_type = scope_type
+        self.scope_prefix = "频道" if scope_type == 'channel' else "分类"
+        
+        # 添加规则选择器
+        if rules_data:
+            options = []
+            for idx, r in enumerate(rules_data[:25], 1):
+                if scope_type == 'channel':
+                    channel = cog.bot.get_channel(int(r['channel_id']))
+                    target_name = f"#{channel.name}" if channel else f"ID:{r['channel_id']}"
+                else:
+                    category = cog.bot.get_channel(int(r['category_id']))
+                    target_name = f"📁{category.name}" if category else f"ID:{r['category_id']}"
+                
+                action_display = ACTION_TYPE_DISPLAY.get(r['action_type'], r['action_type'])
+                options.append(discord.SelectOption(
+                    label=f"{self.scope_prefix}{idx}号 - {target_name}"[:100],
+                    value=str(r['rule_id']),
+                    description=f"{action_display} - {'启用' if r['is_enabled'] else '禁用'}"[:100]
+                ))
+            
+            self.rule_select = discord.ui.Select(
+                placeholder="选择要操作的规则...",
+                options=options
+            )
+            self.rule_select.callback = self.on_rule_select
+            self.add_item(self.rule_select)
+    
+    async def on_timeout(self):
+        """超时时清理引用"""
+        self.cog = None
+        self.rules_data = None
+    
+    def _get_rule_display_name(self, rule_id: int) -> str:
+        """获取规则的显示名称"""
+        for idx, r in enumerate(self.rules_data, 1):
+            if r['rule_id'] == rule_id:
+                if self.scope_type == 'channel':
+                    channel_id = r.get('channel_id')
+                    if channel_id:
+                        channel = self.cog.bot.get_channel(int(channel_id))
+                        target_name = f"#{channel.name}" if channel else f"ID:{channel_id}"
+                    else:
+                        target_name = "未知频道"
+                else:
+                    category_id = r.get('category_id')
+                    if category_id:
+                        category = self.cog.bot.get_channel(int(category_id))
+                        target_name = f"📁{category.name}" if category else f"ID:{category_id}"
+                    else:
+                        target_name = "未知分类"
+                return f"{self.scope_prefix}{idx}号 ({target_name})"
+        return f"规则{rule_id}"
+    
+    async def on_rule_select(self, interaction: discord.Interaction):
+        rule_id = int(self.rule_select.values[0])
+        
+        # 找到规则信息
+        rule = None
+        for r in self.rules_data:
+            if r['rule_id'] == rule_id:
+                rule = r
+                break
+        
+        if not rule:
+            await interaction.response.send_message("❌ 规则不存在", ephemeral=True)
+            return
+        
+        rule_display_name = self._get_rule_display_name(rule_id)
+        
+        # 获取触发器信息
+        triggers = await self.cog.db.fetchall(
+            "SELECT * FROM thread_command_triggers WHERE rule_id = ?",
+            (rule_id,)
+        )
+        
+        # 显示规则详情
+        embed = discord.Embed(
+            title=f"📝 {rule_display_name} 详情",
+            color=0x9b59b6
+        )
+        
+        action_display = ACTION_TYPE_DISPLAY.get(rule['action_type'], rule['action_type'])
+        scope_display = SCOPE_DISPLAY.get(rule['scope'], rule['scope'])
+        
+        embed.add_field(name="状态", value="✅ 启用" if rule['is_enabled'] else "❌ 禁用", inline=True)
+        embed.add_field(name="动作", value=action_display, inline=True)
+        embed.add_field(name="范围", value=scope_display, inline=True)
+        
+        # 显示目标
+        if self.scope_type == 'channel':
+            channel = self.cog.bot.get_channel(int(rule['channel_id']))
+            target_info = channel.mention if channel else f"ID: {rule['channel_id']}"
+            embed.add_field(name="目标频道", value=target_info, inline=True)
+        else:
+            category = self.cog.bot.get_channel(int(rule['category_id']))
+            target_info = f"📁 {category.name}" if category else f"ID: {rule['category_id']}"
+            embed.add_field(name="目标分类", value=target_info, inline=True)
+        
+        trigger_info = '\n'.join([
+            f"• `{t['trigger_text']}` ({MATCH_MODE_DISPLAY.get(t['trigger_mode'], t['trigger_mode'])})"
+            for t in triggers
+        ])
+        embed.add_field(name="触发器", value=trigger_info or "无", inline=False)
+        
+        if rule['reply_content']:
+            embed.add_field(name="回复内容", value=rule['reply_content'][:200], inline=False)
+        
+        view = RuleActionView(self.cog, self.guild_id, rule_id, rule['is_enabled'], rule_display_name)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

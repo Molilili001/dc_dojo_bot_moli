@@ -252,6 +252,163 @@ class UserProgressCog(BaseCog):
                 ephemeral=True
             )
     
+    # ========== 查询他人进度命令 ==========
+    
+    @app_commands.command(name="查询道馆进度", description="查询指定用户的道馆挑战进度（需要权限）")
+    @app_commands.describe(
+        user="要查询的目标用户"
+    )
+    async def query_user_progress(self, interaction: discord.Interaction, user: discord.Member):
+        """查询他人道馆进度"""
+        # 权限检查
+        if not await has_gym_permission(interaction, "查询道馆进度"):
+            return await interaction.response.send_message(
+                "❌ 你没有执行此指令所需的权限。",
+                ephemeral=True
+            )
+        
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self._query_and_display_progress(interaction, user)
+    
+    async def _query_and_display_progress(self, interaction: discord.Interaction, user: discord.Member):
+        """查询并展示用户道馆进度（内部方法）"""
+        user_id = str(user.id)
+        guild_id = str(interaction.guild.id)
+        
+        try:
+            # 获取用户进度
+            user_progress = await self._get_user_progress(user_id, guild_id)
+            
+            # 获取所有道馆
+            all_gyms = await self._get_all_gyms(guild_id)
+            
+            # 检查是否有归档记录
+            archive_info = await self._get_archive_info(user_id, guild_id)
+            
+            # 区分已完成和未完成
+            completed_gym_ids = set(user_progress.keys())
+            completed_gyms = []
+            incomplete_gyms = []
+            
+            for gym in all_gyms:
+                if gym['id'] in completed_gym_ids:
+                    completed_gyms.append(gym)
+                else:
+                    incomplete_gyms.append(gym)
+            
+            # 创建Embed
+            embed = discord.Embed(
+                title="📊 用户道馆挑战进度",
+                description=f"目标用户: {user.mention}",
+                color=discord.Color.orange() if archive_info else discord.Color.blue()
+            )
+            
+            # 如果有归档记录，显示警示标记
+            if archive_info:
+                embed.add_field(
+                    name="⚠️ 处罚记录警示",
+                    value=archive_info['warning_text'],
+                    inline=False
+                )
+            
+            # 添加头像
+            embed.set_thumbnail(url=user.display_avatar.url)
+            
+            # 已通过道馆
+            if completed_gyms:
+                completed_text = "\n".join([f"• {g['name']}" for g in completed_gyms[:15]])
+                if len(completed_gyms) > 15:
+                    completed_text += f"\n... 还有 {len(completed_gyms) - 15} 个"
+                embed.add_field(
+                    name=f"✅ 已通过道馆 ({len(completed_gyms)}个)",
+                    value=completed_text,
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="✅ 已通过道馆 (0个)",
+                    value="*暂无*",
+                    inline=False
+                )
+            
+            # 未通过道馆
+            if incomplete_gyms:
+                incomplete_text = "\n".join([f"• {g['name']}" for g in incomplete_gyms[:15]])
+                if len(incomplete_gyms) > 15:
+                    incomplete_text += f"\n... 还有 {len(incomplete_gyms) - 15} 个"
+                embed.add_field(
+                    name=f"❌ 未通过道馆 ({len(incomplete_gyms)}个)",
+                    value=incomplete_text,
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="❌ 未通过道馆 (0个)",
+                    value="*全部通过！*",
+                    inline=False
+                )
+            
+            # 挑战冷却状态
+            cooldown_info = await self._get_failure_summary(user_id, guild_id)
+            if cooldown_info:
+                embed.add_field(
+                    name="⏳ 挑战冷却状态",
+                    value=cooldown_info,
+                    inline=False
+                )
+            
+            # 究极道馆成绩
+            ultimate_score = await self._get_ultimate_score(user_id, guild_id)
+            if ultimate_score:
+                embed.add_field(
+                    name="🏆 究极道馆成绩",
+                    value=ultimate_score,
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="🏆 究极道馆成绩",
+                    value="*暂无记录*",
+                    inline=False
+                )
+            
+            # 如果有归档记录，显示历史数据
+            if archive_info and archive_info['archives']:
+                history_text = await self._format_archive_history(
+                    interaction.guild, archive_info['archives']
+                )
+                embed.add_field(
+                    name="📜 被清空前的历史记录",
+                    value=history_text,
+                    inline=False
+                )
+            
+            # 添加总体进度
+            total = len(all_gyms)
+            completed = len(completed_gyms)
+            if total > 0:
+                percentage = (completed / total) * 100
+                progress_bar = self._create_progress_bar(percentage)
+                embed.set_footer(text=f"总体进度: {completed}/{total} ({percentage:.1f}%) {progress_bar}")
+            else:
+                embed.set_footer(text="服务器暂无道馆")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"User {interaction.user.id} queried progress for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in _query_and_display_progress: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ 查询进度时发生错误。",
+                ephemeral=True
+            )
+    
+    def _create_progress_bar(self, percentage: float, length: int = 10) -> str:
+        """创建进度条"""
+        filled = int(length * percentage / 100)
+        empty = length - filled
+        return "█" * filled + "░" * empty
+    
     # ========== 辅助方法 ==========
     
     async def show_badge_wall(self, interaction: discord.Interaction):
@@ -472,8 +629,185 @@ class UserProgressCog(BaseCog):
                 (user_id, guild_id, gym_id)
             )
             await conn.commit()
+    
+    async def _get_archive_info(self, user_id: str, guild_id: str) -> Optional[dict]:
+        """获取用户的归档信息"""
+        async with self.db.get_connection() as conn:
+            conn.row_factory = self.db.dict_row
+            async with conn.execute('''
+                SELECT archive_id, archive_reason, source_info,
+                       completed_gyms, ultimate_score, failure_records, archived_at
+                FROM progress_archive
+                WHERE user_id = ? AND guild_id = ?
+                ORDER BY archived_at DESC
+                LIMIT 5
+            ''', (user_id, guild_id)) as cursor:
+                archives = await cursor.fetchall()
+        
+        if not archives:
+            return None
+        
+        # 生成警示文本
+        latest = archives[0]
+        reason_map = {
+            'cross_bot_punishment': '跨Bot联动处罚',
+            'admin_reset': '管理员手动重置',
+            'manual': '手动归档'
+        }
+        reason_text = reason_map.get(latest['archive_reason'], latest['archive_reason'])
+        
+        # 格式化归档时间
+        try:
+            archived_dt = parse_beijing_time(latest['archived_at'])
+            time_str = format_beijing_display(archived_dt)
+        except Exception:
+            time_str = latest['archived_at'][:19] if latest['archived_at'] else "未知时间"
+        
+        warning_text = (
+            f"⚠️ **此用户曾因 [{reason_text}] 被清空道馆记录**\n"
+            f"最近一次归档时间: {time_str}\n"
+        )
+        if latest['source_info']:
+            warning_text += f"来源: {latest['source_info']}\n"
+        
+        warning_text += f"\n共有 **{len(archives)}** 条归档记录"
+        
+        return {
+            'warning_text': warning_text,
+            'archives': [dict(a) if hasattr(a, 'keys') else a for a in archives]
+        }
+    
+    async def _format_archive_history(self, guild: discord.Guild, archives: List[dict]) -> str:
+        """格式化归档历史记录"""
+        lines = []
+        for i, archive in enumerate(archives[:3], 1):  # 最多显示3条
+            completed_gyms_data = json.loads(archive['completed_gyms'] or '[]')
+            ultimate_score = archive['ultimate_score']
+            archived_at = archive['archived_at']
+            
+            # 获取道馆名称
+            gym_names = []
+            if completed_gyms_data:
+                # 检查数据格式：旧格式是ID列表，新格式是字典列表[{'id':..., 'name':...}]
+                if isinstance(completed_gyms_data[0], str):
+                    # 旧格式：只有ID，需要查询当前数据库（如果道馆被删，名字就查不到了）
+                    gym_ids = completed_gyms_data
+                    async with self.db.get_connection() as conn:
+                        placeholders = ','.join('?' for _ in gym_ids)
+                        async with conn.execute(
+                            f"SELECT gym_id, name FROM gyms WHERE guild_id = ? AND gym_id IN ({placeholders})",
+                            [str(guild.id)] + gym_ids
+                        ) as cursor:
+                            rows = await cursor.fetchall()
+                            gym_names = [row[1] for row in rows]
+                elif isinstance(completed_gyms_data[0], dict):
+                    # 新格式：包含名字快照，直接使用（即使道馆已删也能显示名字）
+                    gym_names = [item.get('name', '未知道馆') for item in completed_gyms_data]
+            
+            # 格式化时间
+            try:
+                dt = parse_beijing_time(archived_at)
+                time_str = format_beijing_display(dt)
+            except Exception:
+                time_str = archived_at[:19] if archived_at else "未知时间"
+            
+            line = f"**[{i}] {time_str}**\n"
+            if gym_names:
+                gyms_str = ", ".join(gym_names)
+                line += f"  • 已通过: {gyms_str}\n"
+            else:
+                line += "  • 已通过: 无\n"
+            
+            if ultimate_score:
+                minutes, seconds = divmod(int(ultimate_score), 60)
+                line += f"  • 究极成绩: {minutes}分{seconds}秒\n"
+            
+            lines.append(line)
+        
+        return "\n".join(lines) if lines else "*无历史记录*"
+
+
+# 模块级别的 context menu 命令（右键命令不能定义在类内部）
+@app_commands.context_menu(name="查询道馆进度")
+async def query_progress_context_menu(interaction: discord.Interaction, user: discord.Member):
+    """右键用户查询道馆进度"""
+    # 权限检查
+    if not await has_gym_permission(interaction, "查询道馆进度"):
+        return await interaction.response.send_message(
+            "❌ 你没有执行此指令所需的权限。",
+            ephemeral=True
+        )
+    
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    # 获取 UserProgressCog 实例来调用内部方法
+    cog = interaction.client.get_cog('UserProgressCog')
+    if cog:
+        await cog._query_and_display_progress(interaction, user)
+    else:
+        await interaction.followup.send(
+            "❌ 进度系统暂时不可用。",
+            ephemeral=True
+        )
+
+
+@app_commands.context_menu(name="查询发送者进度")
+async def query_message_author_progress(interaction: discord.Interaction, message: discord.Message):
+    """右键消息查询发送者的道馆进度"""
+    # 权限检查
+    if not await has_gym_permission(interaction, "查询道馆进度"):
+        return await interaction.response.send_message(
+            "❌ 你没有执行此指令所需的权限。",
+            ephemeral=True
+        )
+    
+    # 获取消息发送者
+    author = message.author
+    
+    # 检查是否为机器人
+    if author.bot:
+        return await interaction.response.send_message(
+            "❌ 无法查询机器人的道馆进度。",
+            ephemeral=True
+        )
+    
+    # 先defer，因为后续的fetch_member可能需要时间
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    # 检查是否为服务器成员
+    if not isinstance(author, discord.Member):
+        # 尝试从缓存获取成员对象
+        member = interaction.guild.get_member(author.id)
+        if not member:
+            # 缓存中没有，尝试从API获取
+            try:
+                member = await interaction.guild.fetch_member(author.id)
+            except discord.NotFound:
+                return await interaction.followup.send(
+                    "❌ 该用户不在此服务器中，无法查询其进度。",
+                    ephemeral=True
+                )
+            except discord.HTTPException:
+                return await interaction.followup.send(
+                    "❌ 获取用户信息时发生错误，请稍后重试。",
+                    ephemeral=True
+                )
+        author = member
+    
+    # 获取 UserProgressCog 实例来调用内部方法
+    cog = interaction.client.get_cog('UserProgressCog')
+    if cog:
+        await cog._query_and_display_progress(interaction, author)
+    else:
+        await interaction.followup.send(
+            "❌ 进度系统暂时不可用。",
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
     """设置函数，用于添加Cog到bot"""
     await bot.add_cog(UserProgressCog(bot))
+    # 添加右键命令到命令树
+    bot.tree.add_command(query_progress_context_menu)
+    bot.tree.add_command(query_message_author_progress)

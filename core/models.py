@@ -362,13 +362,38 @@ class ThreadCommandTrigger:
     _compiled_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
     
     def compile_regex(self) -> Optional[re.Pattern]:
-        """预编译正则表达式，提升匹配性能"""
+        """预编译正则表达式，提升匹配性能
+        
+        如果正则表达式无效，会尝试自动修复常见错误（如量词中的空格）
+        """
         if self.trigger_mode == 'regex' and self._compiled_regex is None:
             try:
                 self._compiled_regex = re.compile(self.trigger_text, re.IGNORECASE)
             except re.error:
-                return None
+                # 尝试自动修复常见的正则错误
+                fixed_pattern = self._try_fix_regex_pattern(self.trigger_text)
+                if fixed_pattern != self.trigger_text:
+                    try:
+                        self._compiled_regex = re.compile(fixed_pattern, re.IGNORECASE)
+                    except re.error:
+                        return None
+                else:
+                    return None
         return self._compiled_regex
+    
+    @staticmethod
+    def _try_fix_regex_pattern(pattern: str) -> str:
+        """尝试修复常见的正则表达式错误
+        
+        常见错误：
+        - {1, 5} -> {1,5}（量词中不应有空格）
+        - {1, } -> {1,}（逗号后不应有空格）
+        """
+        # 修复量词中的空格：{1, 5} -> {1,5}
+        fixed = re.sub(r'\{(\d+)\s*,\s*(\d+)\}', r'{\1,\2}', pattern)
+        # 修复 {n, } -> {n,}
+        fixed = re.sub(r'\{(\d+),\s+\}', r'{\1,}', fixed)
+        return fixed
     
     def match(self, content: str) -> bool:
         """检查内容是否匹配此触发器"""
@@ -436,12 +461,18 @@ class ThreadCommandRule:
     帖子命令规则数据模型
     
     规则定义了触发条件和对应的动作。
-    scope='server' 表示全服规则，scope='thread' 表示帖子级规则。
+    scope 取值：
+      - 'server': 全服规则
+      - 'thread': 帖子级规则
+      - 'channel': 频道级规则
+      - 'category': 分类级规则
     """
     rule_id: Optional[int]
     guild_id: str
-    scope: str                      # 'server' 或 'thread'
+    scope: str                      # 'server', 'thread', 'channel', 'category'
     thread_id: Optional[str] = None
+    channel_id: Optional[str] = None      # 频道级规则的目标频道ID
+    category_id: Optional[str] = None     # 分类级规则的目标分类ID
     forum_channel_id: Optional[str] = None
     
     # 触发器列表（通过 thread_command_triggers 表关联）
@@ -495,6 +526,8 @@ class ThreadCommandRule:
             'guild_id': self.guild_id,
             'scope': self.scope,
             'thread_id': self.thread_id,
+            'channel_id': self.channel_id,
+            'category_id': self.category_id,
             'forum_channel_id': self.forum_channel_id,
             'triggers': [t.to_dict() for t in self.triggers],
             'action_type': self.action_type,
@@ -550,6 +583,8 @@ class ThreadCommandRule:
             guild_id=str(row.get('guild_id', '')),
             scope=row.get('scope', 'server'),
             thread_id=str(row.get('thread_id')) if row.get('thread_id') else None,
+            channel_id=str(row.get('channel_id')) if row.get('channel_id') else None,
+            category_id=str(row.get('category_id')) if row.get('category_id') else None,
             forum_channel_id=str(row.get('forum_channel_id')) if row.get('forum_channel_id') else None,
             triggers=triggers or [],
             action_type=row.get('action_type', 'reply'),

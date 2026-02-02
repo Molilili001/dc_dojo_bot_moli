@@ -10,6 +10,7 @@ import aiosqlite
 
 from cogs.base_cog import BaseCog
 from core.database import DatabaseManager
+from core.cache import cache_manager
 from core.models import Gym, ChallengePanel
 from core.exceptions import GymNotFoundError, ValidationError
 from utils.validators import validate_gym_json, validate_gym_id, validate_role_input, validate_panel_config
@@ -137,6 +138,9 @@ class GymManagementCog(BaseCog):
                 await self._log_gym_action(conn, guild_id, gym.gym_id, str(interaction.user.id), 'create')
                 
                 await conn.commit()
+
+            # 清除可能存在的幽灵缓存
+            await cache_manager.delete(f"{guild_id}:{gym.gym_id}", "gym")
             
             logger.info(f"User {interaction.user.id} created gym '{gym.gym_id}' in guild {guild_id}")
             await interaction.followup.send(
@@ -252,6 +256,9 @@ class GymManagementCog(BaseCog):
                 await self._log_gym_action(conn, guild_id, gym_id, str(interaction.user.id), 'update')
                 
                 await conn.commit()
+
+            # 清除缓存，确保更新立即生效
+            await cache_manager.delete(f"{guild_id}:{gym_id}", "gym")
             
             logger.info(f"User {interaction.user.id} updated gym '{gym_id}' in guild {guild_id}")
             await interaction.followup.send(
@@ -310,6 +317,9 @@ class GymManagementCog(BaseCog):
                 await self._log_gym_action(conn, guild_id, gym_id, str(interaction.user.id), 'delete')
                 
                 await conn.commit()
+
+            # 清除缓存，防止幽灵数据
+            await cache_manager.delete(f"{guild_id}:{gym_id}", "gym")
             
             logger.info(f"User {interaction.user.id} deleted gym '{gym_id}' from guild {guild_id}")
             await interaction.followup.send(
@@ -518,6 +528,9 @@ class GymManagementCog(BaseCog):
                 await conn.commit()
                 
                 if cursor.rowcount > 0:
+                    # 清除缓存，确保状态变更立即生效
+                    await cache_manager.delete(f"{guild_id}:{gym_id}", "gym")
+
                     status_text = "开启" if is_enabled else "停业"
                     await interaction.followup.send(
                         f"✅ 道馆 `{gym_id}` 已{status_text}。",

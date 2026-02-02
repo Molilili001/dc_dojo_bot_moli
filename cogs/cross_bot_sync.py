@@ -114,20 +114,31 @@ class CrossBotSyncCog(BaseCog):
         
         # 检查配置
         if not self.sync_config.get("enabled", False):
+            logger.debug(f"CROSS_BOT_SYNC: Sync disabled, ignoring message from {message.author.id}")
             return
         
         target_bot_ids = self.sync_config.get("target_bot_ids", [])
         monitor_channel_id = self.sync_config.get("monitor_channel_id")
         
+        # 确保 monitor_channel_id 是字符串
+        if isinstance(monitor_channel_id, list):
+            monitor_channel_id = str(monitor_channel_id[0]) if monitor_channel_id else None
+            self.sync_config["monitor_channel_id"] = monitor_channel_id
+        
         if not target_bot_ids or not monitor_channel_id:
+            logger.debug(f"CROSS_BOT_SYNC: No target_bot_ids or monitor_channel_id configured")
             return
         
         # 检查是否是目标机器人在目标频道的消息
         if str(message.author.id) not in [str(bid) for bid in target_bot_ids]:
+            logger.debug(f"CROSS_BOT_SYNC: Author {message.author.id} not in target bots {target_bot_ids}")
             return
         
         if int(message.channel.id) != int(monitor_channel_id):
+            logger.debug(f"CROSS_BOT_SYNC: Channel {message.channel.id} != monitor channel {monitor_channel_id}")
             return
+        
+        logger.info(f"CROSS_BOT_SYNC: Detected message from monitored bot {message.author.id} in channel {message.channel.id}")
         
         # 标记为已处理
         self.processed_messages.add(message.id)
@@ -252,40 +263,46 @@ class CrossBotSyncCog(BaseCog):
         """处理单个处罚同步"""
         user_id = sync_data.user_id
         
-        # 获取所有服务器进行同步
-        for guild in self.bot.guilds:
-            guild_id = str(guild.id)
-            
-            # 使用用户级别的锁
-            async with self.user_locks[user_id]:
-                try:
-                    member = guild.get_member(int(user_id))
-                    if not member:
-                        continue
-                    
-                    # 添加到黑名单
-                    if sync_data.punishment_type in ["blacklist", "ban"]:
-                        await self.add_to_sync_blacklist(
-                            guild_id, user_id, 
-                            sync_data.reason, 
-                            f"同步自Bot({sync_data.source_bot_id})"
-                        )
-                    
-                    # 自动移除身份组
-                    if self.sync_config.get("auto_role_removal", True):
-                        await self.auto_remove_roles(member, guild_id, sync_data)
-                    
-                    # 重置用户进度
-                    await self.reset_user_progress(user_id, guild_id)
-                    
-                    self.sync_statistics["total_synced"] += 1
-                    self.sync_statistics["last_sync_time"] = datetime.datetime.now(BEIJING_TZ).isoformat()
-                    
-                    logger.info(f"CROSS_BOT_SYNC: Successfully synced punishment for user {user_id} in guild {guild_id}")
-                    
-                except Exception as e:
-                    self.sync_statistics["failed_syncs"] += 1
-                    logger.error(f"CROSS_BOT_SYNC: Failed to sync punishment for user {user_id}: {e}")
+        try:
+            # 获取所有服务器进行同步
+            for guild in self.bot.guilds:
+                guild_id = str(guild.id)
+                
+                # 使用用户级别的锁
+                async with self.user_locks[user_id]:
+                    try:
+                        member = guild.get_member(int(user_id))
+                        if not member:
+                            continue
+                        
+                        # 添加到黑名单
+                        if sync_data.punishment_type in ["blacklist", "ban"]:
+                            await self.add_to_sync_blacklist(
+                                guild_id, user_id,
+                                sync_data.reason,
+                                f"同步自Bot({sync_data.source_bot_id})"
+                            )
+                        
+                        # 自动移除身份组
+                        if self.sync_config.get("auto_role_removal", True):
+                            await self.auto_remove_roles(member, guild_id, sync_data)
+                        
+                        # 重置用户进度（带归档）
+                        source_info = f"同步自Bot({sync_data.source_bot_id}) - {sync_data.reason}"
+                        await self.reset_user_progress(user_id, guild_id, source_info)
+                        
+                        self.sync_statistics["total_synced"] += 1
+                        self.sync_statistics["last_sync_time"] = datetime.datetime.now(BEIJING_TZ).isoformat()
+                        
+                        logger.info(f"CROSS_BOT_SYNC: Successfully synced punishment for user {user_id} in guild {guild_id}")
+                        
+                    except Exception as e:
+                        self.sync_statistics["failed_syncs"] += 1
+                        logger.error(f"CROSS_BOT_SYNC: Failed to sync punishment for user {user_id}: {e}")
+        finally:
+            # 处理完成后清理锁对象，防止内存泄露
+            if user_id in self.user_locks:
+                del self.user_locks[user_id]
     
     async def process_role_removal(self, user_id: str, role_ids: Set[str]):
         """处理身份组移除"""
@@ -431,9 +448,86 @@ class CrossBotSyncCog(BaseCog):
         # 目前返回空列表，可根据需要添加逻辑
         return []
     
-    async def reset_user_progress(self, user_id: str, guild_id: str):
-        """重置用户的所有进度"""
+    async def _save_sync_config_to_db(self, guild_id: str, config: dict):
+        """保存同步配置到数据库"""
         async with self.db.get_connection() as conn:
+            # 确保 monitor_channel_id 是字符串或 None
+            monitor_channel_id = config.get("monitor_channel_id")
+            if isinstance(monitor_channel_id, list):
+                # 如果是列表，取第一个元素
+                monitor_channel_id = str(monitor_channel_id[0]) if monitor_channel_id else None
+            elif monitor_channel_id is not None:
+                monitor_channel_id = str(monitor_channel_id)
+            
+            enabled = 1 if config.get("enabled", False) else 0
+            
+            # 使用 UPSERT 语法
+            await conn.execute('''
+                INSERT INTO bot_sync_config (guild_id, bot_id, sync_enabled, sync_modes, custom_settings, last_sync)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, bot_id) DO UPDATE SET
+                    sync_enabled = excluded.sync_enabled,
+                    sync_modes = excluded.sync_modes,
+                    custom_settings = excluded.custom_settings
+            ''', (
+                guild_id,
+                "global",  # 使用 "global" 作为全局配置的 bot_id
+                enabled,
+                json.dumps(["punishment", "role_removal"]),
+                json.dumps({
+                    "target_bot_ids": config.get("target_bot_ids", []),
+                    "monitor_channel_id": monitor_channel_id
+                }),
+                datetime.datetime.now(BEIJING_TZ).isoformat()
+            ))
+            await conn.commit()
+        
+        logger.info(f"Saved sync config for guild {guild_id}: enabled={enabled}, "
+                   f"bots={len(config.get('target_bot_ids', []))}, channel={monitor_channel_id}")
+    
+    async def _load_sync_config_from_db(self, guild_id: str) -> Optional[dict]:
+        """从数据库加载同步配置"""
+        async with self.db.get_connection() as conn:
+            conn.row_factory = self.db.dict_row
+            async with conn.execute(
+                "SELECT * FROM bot_sync_config WHERE guild_id = ? AND bot_id = ?",
+                (guild_id, "global")
+            ) as cursor:
+                row = await cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        try:
+            custom_settings = json.loads(row['custom_settings'] or '{}')
+            return {
+                "enabled": bool(row['sync_enabled']),
+                "target_bot_ids": custom_settings.get("target_bot_ids", []),
+                "monitor_channel_id": custom_settings.get("monitor_channel_id"),
+                "sync_modes": json.loads(row['sync_modes'] or '["punishment", "role_removal"]')
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to parse sync config from DB: {e}")
+            return None
+    
+    async def reset_user_progress(self, user_id: str, guild_id: str, source_info: str = None):
+        """
+        重置用户的所有进度（带归档功能）
+        
+        Args:
+            user_id: 用户ID
+            guild_id: 服务器ID
+            source_info: 来源说明（如"同步自Bot(123456789)"）
+        """
+        async with self.db.get_connection() as conn:
+            # 步骤1：收集当前进度快照
+            snapshot = await self._collect_progress_snapshot(conn, user_id, guild_id)
+            
+            # 步骤2：如果有数据，写入归档表
+            if snapshot['has_data']:
+                await self._archive_progress(conn, user_id, guild_id, snapshot, source_info)
+            
+            # 步骤3：删除原始数据（保持原有逻辑）
             # 重置道馆进度
             await conn.execute(
                 "DELETE FROM user_progress WHERE user_id = ? AND guild_id = ?",
@@ -459,7 +553,95 @@ class CrossBotSyncCog(BaseCog):
             )
             
             await conn.commit()
-            logger.info(f"CROSS_BOT_SYNC: Reset all progress for user {user_id} in guild {guild_id}")
+            logger.info(f"CROSS_BOT_SYNC: Reset all progress for user {user_id} in guild {guild_id} "
+                       f"(archived: {snapshot['has_data']})")
+    
+    async def _collect_progress_snapshot(self, conn, user_id: str, guild_id: str) -> dict:
+        """收集用户当前进度的快照"""
+        snapshot = {
+            'has_data': False,
+            'completed_gyms': [],
+            'ultimate_score': None,
+            'failure_records': {},
+            'claimed_rewards': []
+        }
+        
+        # 获取已完成道馆（包含名称快照）
+        async with conn.execute(
+            """
+            SELECT p.gym_id, g.name
+            FROM user_progress p
+            LEFT JOIN gyms g ON p.gym_id = g.gym_id AND p.guild_id = g.guild_id
+            WHERE p.user_id = ? AND p.guild_id = ?
+            """,
+            (user_id, guild_id)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            # 存储结构化数据以保留已删除道馆的名称
+            snapshot['completed_gyms'] = [{'id': row[0], 'name': row[1] or '未知道馆'} for row in rows]
+            if rows:
+                snapshot['has_data'] = True
+        
+        # 获取究极道馆成绩
+        async with conn.execute(
+            "SELECT completion_time_seconds FROM ultimate_gym_leaderboard WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                snapshot['ultimate_score'] = row[0]
+                snapshot['has_data'] = True
+        
+        # 获取失败记录
+        async with conn.execute(
+            "SELECT gym_id, failure_count, banned_until FROM challenge_failures WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                snapshot['failure_records'][row[0]] = {
+                    'failure_count': row[1],
+                    'banned_until': row[2]
+                }
+                snapshot['has_data'] = True
+        
+        # 获取已领取奖励
+        async with conn.execute(
+            "SELECT role_id FROM claimed_role_rewards WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            snapshot['claimed_rewards'] = [row[0] for row in rows]
+            if rows:
+                snapshot['has_data'] = True
+        
+        return snapshot
+    
+    async def _archive_progress(self, conn, user_id: str, guild_id: str,
+                                snapshot: dict, source_info: str):
+        """将进度快照写入归档表"""
+        archived_at = datetime.datetime.now(BEIJING_TZ).isoformat()
+        
+        await conn.execute('''
+            INSERT INTO progress_archive
+            (user_id, guild_id, archive_reason, source_info,
+             completed_gyms, ultimate_score, failure_records, claimed_rewards, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id,
+            guild_id,
+            'cross_bot_punishment',
+            source_info,
+            json.dumps(snapshot['completed_gyms']),
+            snapshot['ultimate_score'],
+            json.dumps(snapshot['failure_records']),
+            json.dumps(snapshot['claimed_rewards']),
+            archived_at
+        ))
+        
+        logger.info(f"CROSS_BOT_SYNC: Archived progress for user {user_id}: "
+                   f"{len(snapshot['completed_gyms'])} gyms, "
+                   f"ultimate={snapshot['ultimate_score']}")
     
     async def send_role_removal_notification(self, member: discord.Member, removed_roles: List[discord.Role], 
                                             sync_data: PunishmentSyncData):
@@ -568,33 +750,43 @@ class CrossBotSyncCog(BaseCog):
     @app_commands.command(name="联动同步", description="管理跨bot联动同步功能")
     @app_commands.describe(
         action="要执行的操作",
-        target="目标用户",
-        reason="操作原因"
+        target="目标用户（强制同步时使用）",
+        reason="操作原因（强制同步时使用）",
+        bot_id="要添加/移除的Bot ID",
+        channel="监控频道（设置频道时使用）"
     )
     @app_commands.choices(action=[
         app_commands.Choice(name="查看状态", value="status"),
         app_commands.Choice(name="强制同步用户", value="force_sync"),
         app_commands.Choice(name="清理队列", value="clear_queue"),
-        app_commands.Choice(name="重载配置", value="reload_config")
+        app_commands.Choice(name="重载配置", value="reload_config"),
+        app_commands.Choice(name="添加监听Bot", value="add_bot"),
+        app_commands.Choice(name="移除监听Bot", value="remove_bot"),
+        app_commands.Choice(name="设置监控频道", value="set_channel"),
+        app_commands.Choice(name="启用/禁用联动", value="toggle")
     ])
     async def sync_management(
         self,
         interaction: discord.Interaction,
         action: str,
         target: Optional[discord.Member] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        bot_id: Optional[str] = None,
+        channel: Optional[discord.TextChannel] = None
     ):
         """管理跨bot联动同步功能"""
+        # 立即 defer 以避免交互超时
+        await interaction.response.defer(ephemeral=True)
+        
         # 权限检查
         if not await is_gym_master(interaction, "联动同步"):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ 你没有权限使用此命令。",
                 ephemeral=True
             )
             return
         
         if action == "status":
-            await interaction.response.defer(ephemeral=True)
             
             embed = discord.Embed(
                 title="🔄 跨Bot联动同步状态",
@@ -639,13 +831,11 @@ class CrossBotSyncCog(BaseCog):
         
         elif action == "force_sync":
             if not target:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ 请指定要同步的用户。",
                     ephemeral=True
                 )
                 return
-            
-            await interaction.response.defer(ephemeral=True)
             
             # 创建强制同步数据
             sync_data = PunishmentSyncData(
@@ -663,8 +853,6 @@ class CrossBotSyncCog(BaseCog):
             )
         
         elif action == "clear_queue":
-            await interaction.response.defer(ephemeral=True)
-            
             punishment_count = len(self.punishment_queue)
             role_count = len(self.role_removal_queue)
             
@@ -679,8 +867,6 @@ class CrossBotSyncCog(BaseCog):
             )
         
         elif action == "reload_config":
-            await interaction.response.defer(ephemeral=True)
-            
             self.sync_config = self.load_sync_config()
             
             await interaction.followup.send(
@@ -688,10 +874,146 @@ class CrossBotSyncCog(BaseCog):
                 f"启用状态: {'✅ 已启用' if self.sync_config.get('enabled') else '❌ 已禁用'}",
                 ephemeral=True
             )
+        
+        elif action == "add_bot":
+            if not bot_id:
+                await interaction.followup.send(
+                    "❌ 请提供要添加的Bot ID。",
+                    ephemeral=True
+                )
+                return
+            
+            # 验证Bot ID格式
+            if not bot_id.isdigit():
+                await interaction.followup.send(
+                    "❌ Bot ID 格式无效，必须是纯数字。",
+                    ephemeral=True
+                )
+                return
+            
+            # 添加到配置
+            target_bot_ids = self.sync_config.get("target_bot_ids", [])
+            if bot_id in [str(bid) for bid in target_bot_ids]:
+                await interaction.followup.send(
+                    f"ℹ️ Bot `{bot_id}` 已在监听列表中。",
+                    ephemeral=True
+                )
+                return
+            
+            target_bot_ids.append(bot_id)
+            new_config = {
+                "target_bot_ids": target_bot_ids,
+                "monitor_channel_id": self.sync_config.get("monitor_channel_id"),
+                "enabled": self.sync_config.get("enabled", False)
+            }
+            await self._save_sync_config_to_db(str(interaction.guild.id), new_config)
+            # 完整更新内存配置
+            self.sync_config.update(new_config)
+            
+            await interaction.followup.send(
+                f"✅ 已添加 Bot `{bot_id}` 到监听列表。\n"
+                f"当前监听Bot数量: {len(target_bot_ids)}",
+                ephemeral=True
+            )
+            logger.info(f"Admin {interaction.user.id} added bot {bot_id} to sync monitor")
+        
+        elif action == "remove_bot":
+            if not bot_id:
+                await interaction.followup.send(
+                    "❌ 请提供要移除的Bot ID。",
+                    ephemeral=True
+                )
+                return
+            
+            target_bot_ids = self.sync_config.get("target_bot_ids", [])
+            target_bot_ids = [str(bid) for bid in target_bot_ids]
+            
+            if bot_id not in target_bot_ids:
+                await interaction.followup.send(
+                    f"ℹ️ Bot `{bot_id}` 不在监听列表中。",
+                    ephemeral=True
+                )
+                return
+            
+            target_bot_ids.remove(bot_id)
+            new_config = {
+                "target_bot_ids": target_bot_ids,
+                "monitor_channel_id": self.sync_config.get("monitor_channel_id"),
+                "enabled": self.sync_config.get("enabled", False)
+            }
+            await self._save_sync_config_to_db(str(interaction.guild.id), new_config)
+            # 完整更新内存配置
+            self.sync_config.update(new_config)
+            
+            await interaction.followup.send(
+                f"✅ 已从监听列表移除 Bot `{bot_id}`。\n"
+                f"剩余监听Bot数量: {len(target_bot_ids)}",
+                ephemeral=True
+            )
+            logger.info(f"Admin {interaction.user.id} removed bot {bot_id} from sync monitor")
+        
+        elif action == "set_channel":
+            if not channel:
+                await interaction.followup.send(
+                    "❌ 请选择监控频道。",
+                    ephemeral=True
+                )
+                return
+            
+            new_config = {
+                "target_bot_ids": self.sync_config.get("target_bot_ids", []),
+                "monitor_channel_id": str(channel.id),
+                "enabled": self.sync_config.get("enabled", False)
+            }
+            await self._save_sync_config_to_db(str(interaction.guild.id), new_config)
+            # 完整更新内存配置
+            self.sync_config.update(new_config)
+            
+            await interaction.followup.send(
+                f"✅ 已设置监控频道为 {channel.mention}。",
+                ephemeral=True
+            )
+            logger.info(f"Admin {interaction.user.id} set sync monitor channel to {channel.id}")
+        
+        elif action == "toggle":
+            current_enabled = self.sync_config.get("enabled", False)
+            new_enabled = not current_enabled
+            
+            new_config = {
+                "target_bot_ids": self.sync_config.get("target_bot_ids", []),
+                "monitor_channel_id": self.sync_config.get("monitor_channel_id"),
+                "enabled": new_enabled
+            }
+            await self._save_sync_config_to_db(str(interaction.guild.id), new_config)
+            # 完整更新内存配置
+            self.sync_config.update(new_config)
+            
+            status = "✅ 已启用" if new_enabled else "❌ 已禁用"
+            await interaction.followup.send(
+                f"{status} 跨Bot联动同步功能。",
+                ephemeral=True
+            )
+            logger.info(f"Admin {interaction.user.id} toggled sync to {new_enabled}")
     
     async def cog_load(self):
         """Cog加载时的初始化"""
         logger.info("CrossBotSyncCog loaded")
+        
+        # 尝试从数据库加载配置（优先级高于 config.json）
+        # 由于这是多服务器bot，我们需要在每次收到消息时根据guild_id加载对应配置
+        # 但这里我们可以预加载第一个服务器的配置作为默认
+        if self.bot.guilds:
+            first_guild_id = str(self.bot.guilds[0].id)
+            db_config = await self._load_sync_config_from_db(first_guild_id)
+            if db_config:
+                # 合并数据库配置（保留 config.json 中的默认值）
+                self.sync_config.update({
+                    "enabled": db_config.get("enabled", self.sync_config.get("enabled", False)),
+                    "target_bot_ids": db_config.get("target_bot_ids") or self.sync_config.get("target_bot_ids", []),
+                    "monitor_channel_id": db_config.get("monitor_channel_id") or self.sync_config.get("monitor_channel_id"),
+                })
+                logger.info(f"Loaded sync config from database for guild {first_guild_id}")
+        
         if self.sync_config.get("enabled"):
             bot_ids = self.sync_config.get("target_bot_ids", [])
             logger.info(f"Cross-bot sync enabled for {len(bot_ids)} bots")

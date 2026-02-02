@@ -7,11 +7,9 @@
 最后修改: 2025-09-29
 """
 
-import asyncio
 import json
 import datetime
-from collections import defaultdict, deque
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Union
 
 import discord
 from discord.ext import commands
@@ -50,17 +48,8 @@ class FeedbackCog(BaseCog):
 
     def __init__(self, bot: commands.Bot):
         super().__init__(bot)
-        # 运行时消息计数器（避免高频写库）
-        # 结构：guild_id -> user_id -> {"total": int, "timestamps": deque([epoch_seconds,...])}
-        self._msg_counters: Dict[str, Dict[str, Dict[str, object]]] = defaultdict(
-            lambda: defaultdict(lambda: {"total": 0, "timestamps": deque(maxlen=2000)})
-        )
-        # 快照任务占位（可选）
-        self._snapshot_task: Optional[asyncio.Task] = None
-
-        # 注册消息监听器（仅内存聚合）
-        # 与 bot.py 的 on_message 共存：这里仅统计，不处理命令
-        self.bot.add_listener(self._on_message, "on_message")
+        # 注：已移除 _msg_counters 消息计数器功能以节省内存
+        # 限流改为仅使用白名单 + 每日反馈次数限制（从数据库查询）
 
     async def cog_load(self):
         """Cog加载时注册持久视图"""
@@ -82,21 +71,9 @@ class FeedbackCog(BaseCog):
         else:
             self.logger.info("FeedbackPanelView already registered; skip duplicate")
 
-        # 启动可选快照任务（若开启）
-        conf = default_conf.get("runtime_counters", {})
-        if conf.get("enabled") and conf.get("persist_snapshots"):
-            interval = int(conf.get("snapshot_interval_seconds", 600))
-            self._snapshot_task = asyncio.create_task(self._snapshot_loop(interval))
-
     async def cog_unload(self):
-        """Cog卸载时取消快照任务与监听器，适配热重载"""
-        if self._snapshot_task and not self._snapshot_task.done():
-            self._snapshot_task.cancel()
-        # 移除 on_message 监听器，避免重载后重复统计
-        try:
-            self.bot.remove_listener(self._on_message, "on_message")
-        except Exception:
-            pass
+        """Cog卸载时的清理"""
+        pass  # 已移除消息计数器相关清理
 
     # ----------------------------
     # 配置读取与覆盖
@@ -177,29 +154,6 @@ class FeedbackCog(BaseCog):
         return str(interaction.user.id) in dev_ids
 
     # ----------------------------
-    # 监听器：消息聚合
-    # ----------------------------
-    async def _on_message(self, message: discord.Message):
-        """运行时消息计数，仅内存聚合，不写库"""
-        try:
-            if message.author.bot:
-                return
-            if not message.guild:
-                return
-            guild_id = str(message.guild.id)
-            user_id = str(message.author.id)
-            now = datetime.datetime.utcnow().timestamp()
-
-            bucket = self._msg_counters[guild_id][user_id]
-            bucket["total"] = int(bucket["total"]) + 1
-            # 追加时间戳到滑动窗口
-            tsq: deque = bucket["timestamps"]  # type: ignore
-            tsq.append(now)
-        except Exception as e:
-            # 统计失败不影响消息处理
-            self.logger.debug(f"消息统计失败: {e}")
-
-    # ----------------------------
     # 核心处理：提交反馈
     # ----------------------------
     async def process_feedback(
@@ -248,41 +202,21 @@ class FeedbackCog(BaseCog):
                 )
                 return await interaction.followup.send(denied_msg, ephemeral=True)
 
-        # 3) 限流校验
+        # 3) 每日反馈次数限制（从数据库查询，不使用内存计数器）
         limits = conf.get("limits", {}) or {}
-        min_total = int(limits.get("min_total_messages", 0))
-        window_seconds = int(limits.get("window_seconds", 0))
-        min_in_window = int(limits.get("min_messages_in_window", 0))
         max_per_day = int(limits.get("max_feedbacks_per_day", 0))
 
-        # 获取运行时计数
-        bucket = self._msg_counters[guild_id][user_id]
-        total = int(bucket.get("total", 0))
-        tsq: deque = bucket.get("timestamps", deque())  # type: ignore
-
-        # 滑动窗口计数
-        window_count = self._prune_and_count(tsq, window_seconds)
-
-        # 每日最大次数：查询最近24小时提交次数
-        recent_24h = await self._count_recent_feedbacks(guild_id, user_id, hours=24)
-
-        def _pass_limit() -> Tuple[bool, Optional[str]]:
-            if min_total and total < min_total:
-                return False, f"发言不足（总计 {total}/{min_total}）"
-            if window_seconds and min_in_window and window_count < min_in_window:
-                return False, f"在最近 {window_seconds} 秒内发言不足（{window_count}/{min_in_window}）"
-            if max_per_day and recent_24h >= max_per_day:
-                return False, f"今日反馈次数已达上限（{recent_24h}/{max_per_day}）"
-            return True, None
-
-        ok, reason = _pass_limit()
-        if not ok:
-            rate_msg = conf.get(
-                "rate_limited_message_ephemeral",
-                "⏰ 你的发言不足或频率限制未达标，暂时无法提交反馈。",
-            )
-            # 附加具体原因，便于用户理解
-            return await interaction.followup.send(f"{rate_msg}\n原因：{reason}", ephemeral=True)
+        if max_per_day > 0:
+            recent_24h = await self._count_recent_feedbacks(guild_id, user_id, hours=24)
+            if recent_24h >= max_per_day:
+                rate_msg = conf.get(
+                    "rate_limited_message_ephemeral",
+                    "⏰ 你的反馈次数已达上限，暂时无法提交反馈。",
+                )
+                return await interaction.followup.send(
+                    f"{rate_msg}\n原因：今日反馈次数已达上限（{recent_24h}/{max_per_day}）",
+                    ephemeral=True
+                )
 
         # 4) 组装并投递Embed
         # 匿名蓝色 / 实名黄色
@@ -376,19 +310,6 @@ class FeedbackCog(BaseCog):
         success_msg = conf.get("success_message_ephemeral", "✅ 已收到你的反馈！")
         await interaction.followup.send(success_msg, ephemeral=True)
 
-    # ----------------------------
-    # 工具：滑动窗口剪枝与计数
-    # ----------------------------
-    def _prune_and_count(self, tsq: deque, window_seconds: int) -> int:
-        if not window_seconds or window_seconds <= 0:
-            return len(tsq)
-        now = datetime.datetime.utcnow().timestamp()
-        threshold = now - window_seconds
-        # 从左侧弹出过期的时间戳
-        while tsq and tsq[0] < threshold:
-            tsq.popleft()
-        return len(tsq)
-
     async def _count_recent_feedbacks(self, guild_id: str, user_id: str, hours: int = 24) -> int:
         try:
             cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).isoformat()
@@ -402,48 +323,6 @@ class FeedbackCog(BaseCog):
         except Exception as e:
             self.logger.error(f"统计最近反馈次数失败: {e}", exc_info=True)
             return 0
-
-    # ----------------------------
-    # 可选：运行时计数快照持久化
-    # ----------------------------
-    async def _snapshot_loop(self, interval_seconds: int):
-        """按需将内存计数写入 message_counter_snapshots（仅当启用persist_snapshots）"""
-        while True:
-            try:
-                await asyncio.sleep(max(10, interval_seconds))
-                await self._persist_snapshot_once()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"反馈计数快照任务失败: {e}", exc_info=True)
-
-    async def _persist_snapshot_once(self):
-        conf = self._get_static_config().get("runtime_counters", {}) or {}
-        if not conf.get("enabled") or not conf.get("persist_snapshots"):
-            return
-        # 使用当前小时作为桶
-        now = datetime.datetime.utcnow()
-        bucket_str = now.strftime("%Y-%m-%dT%H")
-        updated_at = now.isoformat()
-
-        try:
-            # 批量 upsert（SQLite不支持标准UPSERT，使用REPLACE或先删后插）
-            # 这里简单处理：先删除同桶，再插入
-            async with db_manager.get_connection() as conn:
-                for gid, users in self._msg_counters.items():
-                    for uid, data in users.items():
-                        total = int(data.get("total", 0))
-                        window_messages = len(data.get("timestamps", []))  # 仅当前窗口大小：近似值
-                        await conn.execute(
-                            '''
-                            INSERT OR REPLACE INTO message_counter_snapshots (guild_id, user_id, total_messages, window_bucket, window_messages, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ''',
-                            (gid, uid, total, bucket_str, window_messages, updated_at),
-                        )
-                await conn.commit()
-        except Exception as e:
-            self.logger.error(f"写入消息计数快照失败: {e}", exc_info=True)
 
     # ----------------------------
     # 斜杠命令：召唤反馈面板

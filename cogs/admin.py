@@ -27,14 +27,15 @@ class AdminCog(BaseCog):
     
     @app_commands.command(name="设置馆主", description="管理道馆指令权限")
     @app_commands.describe(
-        action="选择是'添加'还是'移除'权限",
-        target="选择要授权的用户或身份组",
-        permission="授予哪个指令的权限 ('all' 代表所有道馆指令)"
+        action="选择是'添加'、'移除'还是'查询'权限",
+        target="选择要授权的用户或身份组（查询权限时可不填）",
+        permission="授予哪个指令的权限 ('all' 代表所有道馆指令，查询权限时可不填)"
     )
     @app_commands.choices(
         action=[
             app_commands.Choice(name="添加权限", value="add"),
-            app_commands.Choice(name="移除权限", value="remove")
+            app_commands.Choice(name="移除权限", value="remove"),
+            app_commands.Choice(name="查询权限", value="list")
         ],
         permission=[
             app_commands.Choice(name="所有管理指令 (包括召唤)", value="all"),
@@ -54,20 +55,35 @@ class AdminCog(BaseCog):
             app_commands.Choice(name="道馆黑名单 (/道馆黑名单)", value="道馆黑名单"),
             app_commands.Choice(name="道馆封禁 (/道馆封禁)", value="道馆封禁"),
             app_commands.Choice(name="召唤排行榜 (/召唤排行榜)", value="召唤排行榜"),
+            app_commands.Choice(name="查询道馆进度 (/查询道馆进度)", value="查询道馆进度"),
         ]
     )
     async def set_gym_master(
         self,
         interaction: discord.Interaction,
         action: str,
-        target: typing.Union[discord.Member, discord.Role],
-        permission: str
+        target: typing.Optional[typing.Union[discord.Member, discord.Role]] = None,
+        permission: typing.Optional[str] = None
     ):
         """设置道馆管理权限"""
         # 权限检查
         if not await is_admin_or_owner(interaction):
             await interaction.response.send_message(
                 "❌ 你没有权限使用此命令。",
+                ephemeral=True
+            )
+            return
+        
+        # 查询权限模式：不需要target和permission参数
+        if action == "list":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await self._list_gym_masters(interaction)
+            return
+        
+        # 添加/移除权限模式：需要target和permission参数
+        if target is None or permission is None:
+            await interaction.response.send_message(
+                "❌ 添加或移除权限时必须提供目标用户/身份组和权限类型。",
                 ephemeral=True
             )
             return
@@ -111,6 +127,99 @@ class AdminCog(BaseCog):
             logger.error(f"Error in set_gym_master: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ 操作失败: 发生了一个未知错误。",
+                ephemeral=True
+            )
+    
+    async def _list_gym_masters(self, interaction: discord.Interaction):
+        """列出本服务器的所有道馆管理权限"""
+        guild_id = str(interaction.guild.id)
+        
+        try:
+            async with self.db.get_connection() as conn:
+                conn.row_factory = self.db.dict_row
+                async with conn.execute(
+                    "SELECT target_id, target_type, permission FROM gym_masters WHERE guild_id = ? ORDER BY target_type, permission",
+                    (guild_id,)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+            
+            if not rows:
+                await interaction.followup.send(
+                    "📋 本服务器暂无设置任何道馆管理权限。",
+                    ephemeral=True
+                )
+                return
+            
+            # 按类型分组
+            user_permissions = []
+            role_permissions = []
+            
+            for row in rows:
+                target_id = row['target_id']
+                target_type = row['target_type']
+                permission = row['permission']
+                
+                if target_type == 'user':
+                    # 尝试获取用户对象（先从缓存，再从API）
+                    member = interaction.guild.get_member(int(target_id))
+                    if not member:
+                        # 缓存中没有，尝试从API获取
+                        try:
+                            member = await interaction.guild.fetch_member(int(target_id))
+                        except discord.NotFound:
+                            member = None
+                        except discord.HTTPException:
+                            member = None
+                    
+                    if member:
+                        display = member.mention
+                    else:
+                        display = f"<@{target_id}> (用户可能已离开)"
+                    user_permissions.append(f"• {display} — `{permission}`")
+                else:
+                    # 身份组
+                    role = interaction.guild.get_role(int(target_id))
+                    if role:
+                        display = role.mention
+                    else:
+                        display = f"<@&{target_id}> (身份组可能已删除)"
+                    role_permissions.append(f"• {display} — `{permission}`")
+            
+            # 构建Embed
+            embed = discord.Embed(
+                title="📋 本服务器道馆管理权限列表",
+                color=discord.Color.blue()
+            )
+            
+            if user_permissions:
+                user_text = "\n".join(user_permissions[:25])  # 限制显示数量
+                if len(user_permissions) > 25:
+                    user_text += f"\n... 还有 {len(user_permissions) - 25} 条"
+                embed.add_field(
+                    name="👤 用户权限",
+                    value=user_text,
+                    inline=False
+                )
+            
+            if role_permissions:
+                role_text = "\n".join(role_permissions[:25])
+                if len(role_permissions) > 25:
+                    role_text += f"\n... 还有 {len(role_permissions) - 25} 条"
+                embed.add_field(
+                    name="👥 身份组权限",
+                    value=role_text,
+                    inline=False
+                )
+            
+            embed.set_footer(text=f"共 {len(rows)} 条权限记录")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"Admin {interaction.user.id} listed gym masters for guild {guild_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in _list_gym_masters: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ 查询权限列表时发生错误。",
                 ephemeral=True
             )
     
