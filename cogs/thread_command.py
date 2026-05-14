@@ -6,6 +6,7 @@
 """
 
 import asyncio
+from contextlib import suppress
 import json
 import time
 from datetime import datetime, timedelta
@@ -128,6 +129,22 @@ def suggest_regex_fix(pattern: str) -> str:
     return fixed
 
 
+# ==================== 输入解析辅助函数 ====================
+
+def split_trigger_text(text: Optional[str]) -> List[str]:
+    """将用户输入的触发词文本解析为列表。
+
+    - 支持英文逗号 `,` 和中文逗号 `，` 作为分隔符
+    - 自动去除每项两侧空白
+    - 自动过滤空项
+    """
+    if not text:
+        return []
+
+    normalized = str(text).replace('，', ',')
+    return [t.strip() for t in normalized.split(',') if t and t.strip()]
+
+
 # ==================== 配置常量 ====================
 
 CACHE_CONFIG = {
@@ -160,6 +177,17 @@ RESOURCE_LIMITS = {
     'max_trigger_length': 100,      # 触发文本最大长度
     'max_reply_length': 2000,       # 回复内容最大长度
     'max_pending_deletes': 1000,    # 待删除队列最大长度
+}
+
+DELETE_SCHEDULER_CONFIG = {
+    'batch_size': 50,                  # 单次处理的到期删除任务数
+    'max_concurrency': 5,              # 删除并发上限
+    'max_sleep_seconds': 30,           # 调度器最长休眠时间
+    'max_retry_attempts': 3,           # 最大重试次数
+    'retry_delay_base_seconds': 1.5,   # 重试退避基数（指数退避）
+    'max_retry_delay_seconds': 30,     # 最大重试延迟
+    'done_retention_hours': 24,        # 已完成任务保留时长
+    'failed_retention_days': 7,        # 失败任务保留天数
 }
 
 # 默认回顶规则配置
@@ -643,13 +671,20 @@ class ThreadCommandCog(BaseCog):
         self.cache = RuleCacheManager(self.db)
         self.rate_limiter = RateLimitManager()
         self.stats_buffer = StatsBuffer(self.db)
-        
-        # 待删除消息队列: [(message_id, channel_id, delete_at)]
-        self._pending_deletes: List[Tuple[int, int, float]] = []
+
+        # 精确删除调度器状态（避免每条消息创建长期sleep任务，防止内存堆积）
+        self._delete_scheduler_event = asyncio.Event()
+        self._delete_scheduler_stop = asyncio.Event()
+        self._delete_scheduler_task: Optional[asyncio.Task] = None
     
     async def cog_load(self) -> None:
         """Cog加载时启动后台任务"""
         await super().cog_load()
+        self._delete_scheduler_stop.clear()
+        self._delete_scheduler_event.set()
+        if self._delete_scheduler_task is None or self._delete_scheduler_task.done():
+            self._delete_scheduler_task = self.bot.loop.create_task(self._delete_scheduler_loop())
+
         self.cleanup_task.start()
         self.stats_flush_task.start()
         self.cache_cleanup_task.start()
@@ -663,34 +698,198 @@ class ThreadCommandCog(BaseCog):
         self.cache_cleanup_task.cancel()
         if self.init_default_rules_task.is_running():
             self.init_default_rules_task.cancel()
+
+        self._delete_scheduler_stop.set()
+        self._delete_scheduler_event.set()
+        if self._delete_scheduler_task and not self._delete_scheduler_task.done():
+            self._delete_scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._delete_scheduler_task
+        self._delete_scheduler_task = None
+
         await self.stats_buffer.flush()
         await super().cog_unload()
     
     # ==================== 后台任务 ====================
     
-    @tasks.loop(seconds=30)
+    @tasks.loop(minutes=5)
     async def cleanup_task(self):
-        """定期清理待删除消息"""
-        now = time.time()
-        to_delete = [(mid, cid) for mid, cid, delete_at in self._pending_deletes if delete_at <= now]
-        self._pending_deletes = [(mid, cid, delete_at) for mid, cid, delete_at in self._pending_deletes if delete_at > now]
-        
-        # 限制待删除队列大小
-        if len(self._pending_deletes) > 500:
-            self._pending_deletes = self._pending_deletes[-500:]
-        
-        for message_id, channel_id in to_delete:
+        """定期清理过期删除任务记录，避免数据库无限增长"""
+        now = datetime.utcnow()
+        done_cutoff = (now - timedelta(hours=DELETE_SCHEDULER_CONFIG['done_retention_hours'])).isoformat()
+        failed_cutoff = (now - timedelta(days=DELETE_SCHEDULER_CONFIG['failed_retention_days'])).isoformat()
+
+        try:
+            await self.db.execute(
+                "DELETE FROM thread_command_delete_jobs WHERE status = 'done' AND updated_at < ?",
+                (done_cutoff,)
+            )
+            await self.db.execute(
+                "DELETE FROM thread_command_delete_jobs WHERE status = 'failed' AND updated_at < ?",
+                (failed_cutoff,)
+            )
+        except Exception as e:
+            self.logger.debug(f"清理删除任务记录失败: {e}")
+
+    async def _delete_scheduler_loop(self):
+        """精确删除调度器：根据最近到期任务动态休眠，到点立即执行"""
+        await self.bot.wait_until_ready()
+        self.logger.info("ThreadCommand 删除调度器已启动")
+
+        while not self._delete_scheduler_stop.is_set():
             try:
-                channel = self.bot.get_channel(channel_id)
-                if channel:
-                    message = await channel.fetch_message(message_id)
-                    await message.delete()
-            except discord.NotFound:
-                pass
-            except discord.Forbidden:
-                pass
+                self._delete_scheduler_event.clear()
+                await self._run_due_delete_jobs_batch()
+
+                next_due = await self._get_next_due_job_timestamp()
+
+                if next_due is None:
+                    # 无任务时阻塞等待唤醒事件（新增任务/停机）
+                    await self._delete_scheduler_event.wait()
+                    continue
+
+                wait_seconds = max(0.0, next_due - time.time())
+                wait_seconds = min(wait_seconds, DELETE_SCHEDULER_CONFIG['max_sleep_seconds'])
+                try:
+                    await asyncio.wait_for(self._delete_scheduler_event.wait(), timeout=wait_seconds)
+                except asyncio.TimeoutError:
+                    pass
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                self.logger.debug(f"删除消息失败: {e}")
+                self.logger.error(f"删除调度器异常: {e}", exc_info=True)
+                await asyncio.sleep(1)
+
+        self.logger.info("ThreadCommand 删除调度器已停止")
+
+    async def _get_next_due_job_timestamp(self) -> Optional[float]:
+        """查询最近一条待删除任务的到期时间戳"""
+        row = await self.db.fetchone(
+            """
+            SELECT due_at
+            FROM thread_command_delete_jobs
+            WHERE status = 'pending'
+            ORDER BY due_at ASC
+            LIMIT 1
+            """
+        )
+        if not row:
+            return None
+        try:
+            return float(row.get('due_at'))
+        except (TypeError, ValueError):
+            return None
+
+    async def _run_due_delete_jobs_batch(self) -> None:
+        """批量执行已到期的删除任务"""
+        now = time.time()
+        due_jobs = await self.db.fetchall(
+            """
+            SELECT message_id, channel_id, guild_id, due_at, attempt_count
+            FROM thread_command_delete_jobs
+            WHERE status = 'pending' AND due_at <= ?
+            ORDER BY due_at ASC
+            LIMIT ?
+            """,
+            (now, DELETE_SCHEDULER_CONFIG['batch_size'])
+        )
+
+        if not due_jobs:
+            return
+
+        semaphore = asyncio.Semaphore(DELETE_SCHEDULER_CONFIG['max_concurrency'])
+
+        async def _run_one(job: Dict[str, Any]):
+            async with semaphore:
+                await self._execute_delete_job(job)
+
+        await asyncio.gather(*[_run_one(job) for job in due_jobs], return_exceptions=True)
+
+    async def _execute_delete_job(self, job: Dict[str, Any]) -> None:
+        """执行单条删除任务，失败时按重试策略回退"""
+        message_id = str(job.get('message_id', '')).strip()
+        channel_id = str(job.get('channel_id', '')).strip()
+
+        if not message_id or not channel_id:
+            return
+
+        try:
+            message_id_int = int(message_id)
+            channel_id_int = int(channel_id)
+        except (TypeError, ValueError):
+            await self._mark_delete_job_failed(message_id, int(job.get('attempt_count') or 0) + 1, "invalid message/channel id")
+            return
+
+        attempt_count = int(job.get('attempt_count') or 0)
+        try:
+            await self._delete_message_by_id(channel_id_int, message_id_int)
+            await self._mark_delete_job_done(message_id)
+        except discord.NotFound:
+            # 目标消息不存在也视为“已清理”
+            await self._mark_delete_job_done(message_id)
+        except discord.Forbidden as e:
+            # 权限不足通常不可恢复，直接标记失败
+            await self._mark_delete_job_failed(message_id, attempt_count + 1, f"Forbidden: {e}")
+        except Exception as e:
+            next_attempt = attempt_count + 1
+            if next_attempt >= DELETE_SCHEDULER_CONFIG['max_retry_attempts']:
+                await self._mark_delete_job_failed(message_id, next_attempt, str(e))
+            else:
+                retry_delay = DELETE_SCHEDULER_CONFIG['retry_delay_base_seconds'] * (2 ** (next_attempt - 1))
+                retry_delay = min(retry_delay, DELETE_SCHEDULER_CONFIG['max_retry_delay_seconds'])
+                retry_at = time.time() + retry_delay
+                await self._reschedule_delete_job(message_id, next_attempt, retry_at, str(e))
+
+    async def _delete_message_by_id(self, channel_id: int, message_id: int) -> None:
+        """按ID删除消息，优先使用 partial message，减少额外对象驻留"""
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                raise
+            except discord.Forbidden:
+                raise
+
+        if channel is None:
+            raise RuntimeError("channel not found")
+
+        partial_message = channel.get_partial_message(message_id)
+        await partial_message.delete()
+
+    async def _mark_delete_job_done(self, message_id: str) -> None:
+        now_iso = datetime.utcnow().isoformat()
+        await self.db.execute(
+            """
+            UPDATE thread_command_delete_jobs
+            SET status = 'done', last_error = NULL, updated_at = ?
+            WHERE message_id = ?
+            """,
+            (now_iso, message_id)
+        )
+
+    async def _reschedule_delete_job(self, message_id: str, attempt_count: int, due_at: float, error: str) -> None:
+        now_iso = datetime.utcnow().isoformat()
+        await self.db.execute(
+            """
+            UPDATE thread_command_delete_jobs
+            SET status = 'pending', attempt_count = ?, due_at = ?, last_error = ?, updated_at = ?
+            WHERE message_id = ?
+            """,
+            (attempt_count, due_at, error[:500], now_iso, message_id)
+        )
+        self._delete_scheduler_event.set()
+
+    async def _mark_delete_job_failed(self, message_id: str, attempt_count: int, error: str) -> None:
+        now_iso = datetime.utcnow().isoformat()
+        await self.db.execute(
+            """
+            UPDATE thread_command_delete_jobs
+            SET status = 'failed', attempt_count = ?, last_error = ?, updated_at = ?
+            WHERE message_id = ?
+            """,
+            (attempt_count, error[:500], now_iso, message_id)
+        )
     
     @tasks.loop(seconds=30)
     async def stats_flush_task(self):
@@ -961,13 +1160,28 @@ class ThreadCommandCog(BaseCog):
                 self.logger.debug(f"添加反应失败: {e}")
         
         # 调度删除
-        if rule.delete_trigger_delay is not None:
-            delete_at = time.time() + rule.delete_trigger_delay
-            self._schedule_delete(message.id, message.channel.id, delete_at)
-        
-        if reply_msg and rule.delete_reply_delay is not None:
-            delete_at = time.time() + rule.delete_reply_delay
-            self._schedule_delete(reply_msg.id, reply_msg.channel.id, delete_at)
+        default_trigger_delay = config.default_delete_trigger_delay if config else None
+        default_reply_delay = config.default_delete_reply_delay if config else None
+
+        trigger_delay = self._resolve_delete_delay(rule.delete_trigger_delay, default_trigger_delay)
+        if trigger_delay is not None:
+            delete_at = time.time() + trigger_delay
+            await self._schedule_delete(
+                message_id=message.id,
+                channel_id=message.channel.id,
+                delete_at=delete_at,
+                guild_id=message.guild.id
+            )
+
+        reply_delay = self._resolve_delete_delay(rule.delete_reply_delay, default_reply_delay)
+        if reply_msg and reply_delay is not None:
+            delete_at = time.time() + reply_delay
+            await self._schedule_delete(
+                message_id=reply_msg.id,
+                channel_id=reply_msg.channel.id,
+                delete_at=delete_at,
+                guild_id=message.guild.id
+            )
         
         # 更新统计
         matched_trigger = rule.get_matched_trigger(message.content.strip())
@@ -1093,17 +1307,51 @@ class ThreadCommandCog(BaseCog):
             content = content.replace(key, value)
         
         return content
-    
-    def _schedule_delete(self, message_id: int, channel_id: int, delete_at: float):
-        """调度消息删除"""
-        # 更积极地控制队列大小
-        max_pending = 500  # 降低最大待删除数量
-        if len(self._pending_deletes) >= max_pending:
-            # 队列满，移除最早的一半
-            self._pending_deletes.sort(key=lambda x: x[2])
-            self._pending_deletes = self._pending_deletes[max_pending // 2:]
-        
-        self._pending_deletes.append((message_id, channel_id, delete_at))
+
+    @staticmethod
+    def _resolve_delete_delay(rule_delay: Optional[int], default_delay: Optional[int]) -> Optional[float]:
+        """解析最终删除延迟（规则优先，其次全服默认；<=0 视为不删除）"""
+        delay = rule_delay if rule_delay is not None else default_delay
+        if delay is None:
+            return None
+        try:
+            delay_value = float(delay)
+        except (TypeError, ValueError):
+            return None
+        if delay_value <= 0:
+            return None
+        return delay_value
+
+    async def _schedule_delete(
+        self,
+        message_id: int,
+        channel_id: int,
+        delete_at: float,
+        guild_id: Optional[int] = None,
+    ):
+        """持久化调度消息删除，并唤醒精确调度器"""
+        message_id_str = str(message_id)
+        channel_id_str = str(channel_id)
+        guild_id_str = str(guild_id) if guild_id is not None else None
+        now_iso = datetime.utcnow().isoformat()
+
+        await self.db.execute(
+            """
+            INSERT INTO thread_command_delete_jobs
+            (message_id, channel_id, guild_id, due_at, status, attempt_count, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                channel_id = excluded.channel_id,
+                guild_id = excluded.guild_id,
+                due_at = excluded.due_at,
+                status = 'pending',
+                last_error = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (message_id_str, channel_id_str, guild_id_str, float(delete_at), now_iso, now_iso)
+        )
+
+        self._delete_scheduler_event.set()
     
     # ==================== 权限检查 ====================
     
@@ -1167,12 +1415,17 @@ class ThreadCommandCog(BaseCog):
     scan_cmd = app_commands.Group(
         name="扫描监听提醒",
         description="扫描监听提醒功能管理",
-        default_permissions=discord.Permissions(send_messages=True)
+        # 不在命令组上绑定 send_messages 权限：
+        # 在论坛频道中它会映射到“发新帖/Create Posts”，
+        # 导致无法发新帖但可在现有帖子内回复的用户无法使用贴内配置命令。
     )
     
     @scan_cmd.command(name="状态", description="查看功能开关状态")
     async def show_status(self, interaction: discord.Interaction):
         """显示功能状态（临时消息）"""
+        # 先ACK，避免统计查询和规则预览构建超时导致 interaction 过期
+        await interaction.response.defer(ephemeral=True)
+
         guild_id = str(interaction.guild.id)
         
         config = await self.cache.get_server_config(guild_id)
@@ -1303,7 +1556,7 @@ class ThreadCommandCog(BaseCog):
         # 使用提示
         embed.set_footer(text="配置: 全服设置 | 帖子配置: 帖子设置 | 频道配置: 频道/分类设置")
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     
     @scan_cmd.command(name="配置", description="服务器配置面板（管理员）")
     async def server_config_panel(self, interaction: discord.Interaction):
@@ -1311,6 +1564,9 @@ class ThreadCommandCog(BaseCog):
         if not await self.check_server_config_permission(interaction):
             await interaction.response.send_message("❌ 权限不足，需要服务器管理权限或特殊权限", ephemeral=True)
             return
+
+        # 先ACK，避免配置查询和面板构建超时
+        await interaction.response.defer(ephemeral=True)
         
         guild_id = str(interaction.guild.id)
         config = await self.cache.get_server_config(guild_id)
@@ -1392,7 +1648,7 @@ class ThreadCommandCog(BaseCog):
         # 创建视图
         view = ServerConfigPanelView(self, guild_id, config_data, server_rules)
         
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     @scan_cmd.command(name="帖子配置", description="帖子配置面板（贴主）")
     async def thread_config_panel(self, interaction: discord.Interaction):
@@ -1401,8 +1657,11 @@ class ThreadCommandCog(BaseCog):
             await interaction.response.send_message("❌ 此命令只能在帖子内使用", ephemeral=True)
             return
         
+        # 先ACK，避免数据库查询/构建面板耗时导致 interaction 过期（10062）
+        await interaction.response.defer(ephemeral=True)
+
         if not await self.check_thread_config_permission(interaction, interaction.channel):
-            await interaction.response.send_message("❌ 权限不足，需要是帖主或有配置权限", ephemeral=True)
+            await interaction.followup.send("❌ 权限不足，需要是帖主或有配置权限", ephemeral=True)
             return
         
         thread_id = str(interaction.channel.id)
@@ -1466,7 +1725,7 @@ class ThreadCommandCog(BaseCog):
         # 创建视图
         view = ThreadConfigPanelView(self, guild_id, thread_id, thread_rules)
         
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     @scan_cmd.command(name="频道配置", description="频道和分类规则配置面板（管理员）")
     async def channel_config_panel(self, interaction: discord.Interaction):
@@ -1479,6 +1738,9 @@ class ThreadCommandCog(BaseCog):
         if not await self.check_server_config_permission(interaction):
             await interaction.response.send_message("❌ 权限不足，需要服务器管理权限或特殊权限", ephemeral=True)
             return
+
+        # 先ACK，避免频道/分类规则查询和面板构建超时
+        await interaction.response.defer(ephemeral=True)
         
         guild_id = str(interaction.guild.id)
         
@@ -1569,7 +1831,7 @@ class ThreadCommandCog(BaseCog):
         # 创建视图
         view = ChannelConfigPanelView(self, guild_id, channel_rules_data, category_rules_data)
         
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     # ==================== 辅助方法（供面板调用） ====================
     
@@ -2001,13 +2263,15 @@ class ServerConfigPanelView(discord.ui.View):
     
     @discord.ui.button(label="查看全部规则", style=discord.ButtonStyle.secondary, row=2)
     async def view_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
         rules_data = await self.cog.db.fetchall(
             "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'server' ORDER BY priority DESC",
             (self.guild_id,)
         )
         
         if not rules_data:
-            await interaction.response.send_message("📋 暂无全服规则", ephemeral=True)
+            await interaction.followup.send("📋 暂无全服规则", ephemeral=True)
             return
         
         embed = discord.Embed(title="📋 全服规则列表", color=0x3498db)
@@ -2036,13 +2300,15 @@ class ServerConfigPanelView(discord.ui.View):
         
         # 添加规则管理视图
         view = RuleManageView(self.cog, self.guild_id, rules_data, scope='server')
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     @discord.ui.button(label="权限管理", style=discord.ButtonStyle.danger, row=2)
     async def manage_perms(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ 需要管理员权限", ephemeral=True)
             return
+
+        await interaction.response.defer(ephemeral=True)
         
         permissions = await self.cog.cache.get_permissions(self.guild_id)
         
@@ -2072,7 +2338,7 @@ class ServerConfigPanelView(discord.ui.View):
             embed.add_field(name="权限列表", value="暂无特殊权限配置", inline=False)
         
         view = PermissionPanelView(self.cog, self.guild_id)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 class ThreadConfigPanelView(discord.ui.View):
@@ -2109,13 +2375,15 @@ class ThreadConfigPanelView(discord.ui.View):
     
     @discord.ui.button(label="管理规则", style=discord.ButtonStyle.primary, row=0)
     async def manage_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
         rules_data = await self.cog.db.fetchall(
             "SELECT * FROM thread_command_rules WHERE thread_id = ? ORDER BY priority DESC",
             (self.thread_id,)
         )
         
         if not rules_data:
-            await interaction.response.send_message("📋 暂无帖子规则", ephemeral=True)
+            await interaction.followup.send("📋 暂无帖子规则", ephemeral=True)
             return
         
         embed = discord.Embed(title="📋 帖子规则列表", color=0x3498db)
@@ -2135,7 +2403,7 @@ class ThreadConfigPanelView(discord.ui.View):
             )
         
         view = RuleManageView(self.cog, self.guild_id, rules_data, scope='thread')
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     @discord.ui.button(label="禁用所有规则", style=discord.ButtonStyle.danger, row=0)
     async def disable_all(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2301,7 +2569,7 @@ class EditRuleModal(discord.ui.Modal, title="编辑规则"):
     
     trigger_text = discord.ui.TextInput(
         label="触发词（多个用逗号分隔）",
-        placeholder="你好, hello, 回顶",
+        placeholder="你好, hello, 回顶（支持中文逗号，）",
         max_length=200
     )
     
@@ -2383,7 +2651,7 @@ class EditRuleModal(discord.ui.Modal, title="编辑规则"):
         if new_mode == 'regex':
             trigger_list = [self.trigger_text.value.strip()] if self.trigger_text.value.strip() else []
         else:
-            trigger_list = [t.strip() for t in self.trigger_text.value.split(',') if t.strip()]
+            trigger_list = split_trigger_text(self.trigger_text.value)
         
         if not trigger_list:
             await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
@@ -2609,7 +2877,7 @@ class AddRuleModal(discord.ui.Modal, title="添加规则"):
     
     trigger = discord.ui.TextInput(
         label="触发词（多个用逗号分隔）",
-        placeholder="你好, hello, 回顶",
+        placeholder="你好, hello, 回顶（支持中文逗号，）",
         max_length=200
     )
     
@@ -2661,7 +2929,7 @@ class AddRuleModal(discord.ui.Modal, title="添加规则"):
         if mode == 'regex':
             trigger_list = [self.trigger.value.strip()] if self.trigger.value.strip() else []
         else:
-            trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
+            trigger_list = split_trigger_text(self.trigger.value)
         
         if not trigger_list:
             await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)
@@ -2951,13 +3219,15 @@ class ChannelConfigPanelView(discord.ui.View):
     @discord.ui.button(label="查看频道规则", style=discord.ButtonStyle.primary, row=1)
     async def view_channel_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
         """查看所有频道规则"""
+        await interaction.response.defer(ephemeral=True)
+
         rules_data = await self.cog.db.fetchall(
             "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'channel' ORDER BY channel_id",
             (self.guild_id,)
         )
         
         if not rules_data:
-            await interaction.response.send_message("📋 暂无频道规则", ephemeral=True)
+            await interaction.followup.send("📋 暂无频道规则", ephemeral=True)
             return
         
         embed = discord.Embed(title="📺 频道规则列表", color=0x9b59b6)
@@ -2988,18 +3258,20 @@ class ChannelConfigPanelView(discord.ui.View):
             embed.set_footer(text=f"显示前10条，共{len(rules_data)}条规则")
         
         view = ChannelRuleManageView(self.cog, self.guild_id, rules_data, 'channel')
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     @discord.ui.button(label="查看分类规则", style=discord.ButtonStyle.primary, row=1)
     async def view_category_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
         """查看所有分类规则"""
+        await interaction.response.defer(ephemeral=True)
+
         rules_data = await self.cog.db.fetchall(
             "SELECT * FROM thread_command_rules WHERE guild_id = ? AND scope = 'category' ORDER BY category_id",
             (self.guild_id,)
         )
         
         if not rules_data:
-            await interaction.response.send_message("📋 暂无分类规则", ephemeral=True)
+            await interaction.followup.send("📋 暂无分类规则", ephemeral=True)
             return
         
         embed = discord.Embed(title="📁 分类规则列表", color=0x9b59b6)
@@ -3030,7 +3302,7 @@ class ChannelConfigPanelView(discord.ui.View):
             embed.set_footer(text=f"显示前10条，共{len(rules_data)}条规则")
         
         view = ChannelRuleManageView(self.cog, self.guild_id, rules_data, 'category')
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 class ChannelSelectView(discord.ui.View):
@@ -3158,7 +3430,7 @@ class AddChannelCategoryRuleModal(discord.ui.Modal):
     
     trigger = discord.ui.TextInput(
         label="触发词（多个用逗号分隔）",
-        placeholder="你好, hello, 回顶",
+        placeholder="你好, hello, 回顶（支持中文逗号，）",
         max_length=200
     )
     
@@ -3211,7 +3483,7 @@ class AddChannelCategoryRuleModal(discord.ui.Modal):
         if mode == 'regex':
             trigger_list = [self.trigger.value.strip()] if self.trigger.value.strip() else []
         else:
-            trigger_list = [t.strip() for t in self.trigger.value.split(',') if t.strip()]
+            trigger_list = split_trigger_text(self.trigger.value)
         
         if not trigger_list:
             await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)

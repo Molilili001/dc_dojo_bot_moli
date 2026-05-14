@@ -77,7 +77,7 @@ class RuleCreateModal(ui.Modal, title="创建自定义命令规则"):
     
     trigger_text = ui.TextInput(
         label="触发词",
-        placeholder="输入触发词，多个用逗号分隔（如：回顶,/回顶）",
+        placeholder="输入触发词，多个用逗号分隔（支持英文, 和中文，）",
         max_length=200,
         required=True
     )
@@ -130,7 +130,7 @@ class RuleCreateModal(ui.Modal, title="创建自定义命令规则"):
         """处理提交"""
         # 解析触发词
         triggers_text = self.trigger_text.value.strip()
-        trigger_list = [t.strip() for t in triggers_text.split(',') if t.strip()]
+        trigger_list = [t.strip() for t in triggers_text.replace('，', ',').split(',') if t.strip()]
         
         if not trigger_list:
             await interaction.response.send_message("❌ 触发词不能为空", ephemeral=True)

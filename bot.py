@@ -48,6 +48,7 @@ class DiscordBot(commands.Bot):
             "TodoListCog": "事件列表",
             "FeedbackCog": "反馈",
             "ThreadCommandCog": "帖子命令",
+            "MemberMonitorCog": "成员监控",
             # 中文名 -> 英文名（反向映射）
             "道馆管理": "GymManagementCog",
             "道馆挑战": "GymChallengeCog",
@@ -63,7 +64,8 @@ class DiscordBot(commands.Bot):
             "投诉监听": "ForumPostMonitorCog",
             "事件列表": "TodoListCog",
             "反馈": "FeedbackCog",
-            "帖子命令": "ThreadCommandCog"
+            "帖子命令": "ThreadCommandCog",
+            "成员监控": "MemberMonitorCog"
         }
         # 设置intents
         intents = discord.Intents.default()
@@ -128,6 +130,7 @@ class DiscordBot(commands.Bot):
             "cogs.todo_list",         # 事件列表
             "cogs.feedback",          # 反馈
             "cogs.thread_command",    # 帖子命令（回顶功能升级版）
+            "cogs.member_monitor",    # 成员监控
         ]
         
         # 可选Cogs（向后兼容）
@@ -214,6 +217,9 @@ class DiscordBot(commands.Bot):
                     print("🔝 帖子命令 Cog 已加载")
                     print('🤖 正在监听自定义触发词（包含回顶功能）...')
                     logger.info("帖子命令 Cog 已加载")
+                elif cog_name == "member_monitor":
+                    print("👥 成员监控 Cog 已加载")
+                    logger.info("成员监控 Cog 已加载")
                 else:
                     print(f"✅ {cog_name} Cog 已加载")
                     logger.info(f"{cog_name} Cog 已加载")
@@ -319,17 +325,28 @@ class DiscordBot(commands.Bot):
         interaction: discord.Interaction,
         error: app_commands.AppCommandError
     ) -> None:
-        """全局斜杠命令错误处理"""
+        """全局斜杠命令错误处理（兼容交互超时/重复响应场景）。"""
         if isinstance(error, app_commands.CheckFailure):
-            await interaction.response.send_message("❌ 你没有执行此指令所需的权限。", ephemeral=True)
+            msg = "❌ 你没有执行此指令所需的权限。"
         else:
-            logger.error(f"命令错误 [{interaction.command.name if interaction.command else 'unknown'}]: {error}", exc_info=True)
-            
-            # 检查是否已经响应
+            logger.error(
+                f"命令错误 [{interaction.command.name if interaction.command else 'unknown'}]: {error}",
+                exc_info=True
+            )
+            msg = "🤖 执行指令时发生未知错误。"
+
+        try:
             if interaction.response.is_done():
-                await interaction.followup.send("🤖 执行指令时发生未知错误。", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             else:
-                await interaction.response.send_message("🤖 执行指令时发生未知错误。", ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.NotFound:
+            # 交互已过期（常见于超过响应窗口）
+            logger.warning("on_app_command_error: interaction expired (NotFound)")
+        except discord.HTTPException as e:
+            logger.warning(f"on_app_command_error: failed to send error response: {e}")
+        except Exception as e:
+            logger.error(f"on_app_command_error: unexpected handler error: {e}", exc_info=True)
     
     async def on_command_error(
         self,

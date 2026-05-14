@@ -117,6 +117,8 @@ class ForumPostMonitorCog(BaseCog):
                    auto_role_enabled, auto_role_id,
                    notify_enabled, notify_message,
                    mention_role_enabled, mention_role_id, mention_message,
+                   cross_post_enabled, cross_post_channel_id, cross_post_role_ids,
+                   cross_post_template, cross_post_append_link,
                    created_at, updated_at
             FROM forum_post_monitor_configs
             WHERE guild_id = ? AND forum_channel_id = ?
@@ -129,6 +131,8 @@ class ForumPostMonitorCog(BaseCog):
                    auto_role_enabled, auto_role_id,
                    notify_enabled, notify_message,
                    mention_role_enabled, mention_role_id, mention_message,
+                   cross_post_enabled, cross_post_channel_id, cross_post_role_ids,
+                   cross_post_template, cross_post_append_link,
                    created_at, updated_at
             FROM forum_post_monitor_configs
             WHERE guild_id = ?
@@ -147,6 +151,11 @@ class ForumPostMonitorCog(BaseCog):
         mention_role_enabled: bool,
         mention_role_id: Optional[str],
         mention_message: Optional[str],
+        cross_post_enabled: bool = False,
+        cross_post_channel_id: Optional[str] = None,
+        cross_post_role_ids: Optional[str] = None,
+        cross_post_template: Optional[str] = None,
+        cross_post_append_link: bool = True,
     ) -> None:
         now = _now_iso()
         # 先尝试存在性
@@ -157,6 +166,8 @@ class ForumPostMonitorCog(BaseCog):
                 SET auto_role_enabled = ?, auto_role_id = ?,
                     notify_enabled = ?, notify_message = ?,
                     mention_role_enabled = ?, mention_role_id = ?, mention_message = ?,
+                    cross_post_enabled = ?, cross_post_channel_id = ?, cross_post_role_ids = ?,
+                    cross_post_template = ?, cross_post_append_link = ?,
                     updated_at = ?
                 WHERE guild_id = ? AND forum_channel_id = ?
             """
@@ -170,6 +181,11 @@ class ForumPostMonitorCog(BaseCog):
                     1 if mention_role_enabled else 0,
                     mention_role_id,
                     mention_message,
+                    1 if cross_post_enabled else 0,
+                    cross_post_channel_id,
+                    cross_post_role_ids,
+                    cross_post_template,
+                    1 if cross_post_append_link else 0,
                     now,
                     guild_id,
                     forum_channel_id,
@@ -182,8 +198,10 @@ class ForumPostMonitorCog(BaseCog):
                     auto_role_enabled, auto_role_id,
                     notify_enabled, notify_message,
                     mention_role_enabled, mention_role_id, mention_message,
+                    cross_post_enabled, cross_post_channel_id, cross_post_role_ids,
+                    cross_post_template, cross_post_append_link,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             await db_manager.execute(
                 query,
@@ -197,6 +215,11 @@ class ForumPostMonitorCog(BaseCog):
                     1 if mention_role_enabled else 0,
                     mention_role_id,
                     mention_message,
+                    1 if cross_post_enabled else 0,
+                    cross_post_channel_id,
+                    cross_post_role_ids,
+                    cross_post_template,
+                    1 if cross_post_append_link else 0,
                     now,
                     now,
                 ),
@@ -211,6 +234,55 @@ class ForumPostMonitorCog(BaseCog):
         rows = await db_manager.execute(query, (guild_id, forum_channel_id))
         self.logger.info(f"ForumMonitor: delete config for guild={guild_id} channel={forum_channel_id}, affected={rows}")
         return rows
+
+    # ==== 面板权限（可配置身份组）====
+
+    async def _list_panel_permission_role_ids(self, guild_id: str) -> List[str]:
+        rows = await db_manager.fetchall(
+            "SELECT role_id FROM forum_monitor_permissions WHERE guild_id = ? ORDER BY role_id",
+            (str(guild_id),),
+        )
+        return [str(r.get("role_id")) for r in rows if r.get("role_id")]
+
+    async def _add_panel_permission_role(self, guild_id: str, role_id: str, added_by: str) -> None:
+        await db_manager.execute(
+            """
+            INSERT OR REPLACE INTO forum_monitor_permissions (guild_id, role_id, added_by, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(guild_id), str(role_id), str(added_by), _now_iso()),
+        )
+
+    async def _remove_panel_permission_role(self, guild_id: str, role_id: str) -> int:
+        return await db_manager.execute(
+            "DELETE FROM forum_monitor_permissions WHERE guild_id = ? AND role_id = ?",
+            (str(guild_id), str(role_id)),
+        )
+
+    async def _clear_panel_permission_roles(self, guild_id: str) -> int:
+        return await db_manager.execute(
+            "DELETE FROM forum_monitor_permissions WHERE guild_id = ?",
+            (str(guild_id),),
+        )
+
+    async def _is_forum_monitor_operator(self, interaction: discord.Interaction) -> bool:
+        """是否可修改/删除帖子监控配置：管理员/开发者，或命中授权身份组。"""
+        from utils.permissions import is_admin_or_owner
+
+        if await is_admin_or_owner(interaction):
+            return True
+
+        guild = interaction.guild
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not guild or not member:
+            return False
+
+        role_ids = {str(r.id) for r in getattr(member, "roles", [])}
+        if not role_ids:
+            return False
+
+        allowed = set(await self._list_panel_permission_role_ids(str(guild.id)))
+        return len(role_ids.intersection(allowed)) > 0
 
     # ==== 去重与记录辅助 ====
 
@@ -272,8 +344,11 @@ class ForumPostMonitorCog(BaseCog):
             "auto_role_enabled": _to_bool(config.get("auto_role_enabled")),
             "notify_enabled": _to_bool(config.get("notify_enabled")),
             "mention_role_enabled": _to_bool(config.get("mention_role_enabled")),
+            "cross_post_enabled": _to_bool(config.get("cross_post_enabled")),
             "auto_role_id": config.get("auto_role_id"),
             "mention_role_id": config.get("mention_role_id"),
+            "cross_post_channel_id": config.get("cross_post_channel_id"),
+            "cross_post_role_ids": config.get("cross_post_role_ids"),
         }
 
     async def _update_actions_taken(self, thread_id: str, config: Dict[str, Any]) -> None:
@@ -325,6 +400,39 @@ class ForumPostMonitorCog(BaseCog):
             except Exception as e:
                 self.logger.warning(
                     f"ForumMonitor: thread.send attempt {attempt}/{max_retries} unexpected error: {e}",
+                    exc_info=True
+                )
+                last_exc = e
+
+            if attempt < max_retries:
+                await asyncio.sleep(base_delay * attempt)
+
+        assert last_exc is not None
+        raise last_exc
+
+    async def _send_to_channel_with_retry(
+        self,
+        channel: discord.abc.Messageable,
+        content: str,
+        *,
+        allowed_mentions: Optional[discord.AllowedMentions] = None,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+    ) -> discord.Message:
+        """向普通频道发送消息的重试封装。"""
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return await channel.send(content, allowed_mentions=allowed_mentions)
+            except discord.HTTPException as e:
+                self.logger.warning(
+                    f"ForumMonitor: channel.send attempt {attempt}/{max_retries} failed "
+                    f"(HTTP {getattr(e, 'status', 'unknown')}): {e}"
+                )
+                last_exc = e
+            except Exception as e:
+                self.logger.warning(
+                    f"ForumMonitor: channel.send attempt {attempt}/{max_retries} unexpected error: {e}",
                     exc_info=True
                 )
                 last_exc = e
@@ -412,52 +520,70 @@ class ForumPostMonitorCog(BaseCog):
 
     async def _process_actions(self, thread: discord.Thread, guild: discord.Guild, member: discord.Member, config: Dict[str, Any]):
         """
-        根据配置执行加身份组、通知@贴主、@指定身份组发消息
+        根据配置执行加身份组、通知@贴主、@指定身份组发消息、跨频道提醒。
         增强版：详细日志记录每步执行状态
         """
-        # 记录执行开始
         self.logger.info(f"ForumMonitor: START processing thread {thread.id} in guild {guild.id} for member {member.id}")
         self.logger.debug(f"ForumMonitor: Config data: {config}")
-        
-        # 执行状态跟踪
+
         execution_report = {
             "thread_id": str(thread.id),
             "guild_id": str(guild.id),
             "member_id": str(member.id),
             "auto_role": {"enabled": False, "executed": False, "success": False, "error": None},
             "notify": {"enabled": False, "executed": False, "success": False, "error": None},
-            "mention": {"enabled": False, "executed": False, "success": False, "error": None}
+            "mention": {"enabled": False, "executed": False, "success": False, "error": None},
+            "cross_post": {"enabled": False, "executed": False, "success": False, "error": None},
         }
-        
-        # 解析布尔
-        def _to_bool(v: Any) -> bool:
+
+        def _to_bool(v: Any, default: bool = False) -> bool:
             if isinstance(v, bool):
                 return v
             if v is None:
-                return False
+                return default
             if isinstance(v, (int, float)):
                 return v != 0
             s = str(v).strip().lower()
-            return s in ("1", "true", "t", "yes", "y")
+            if not s:
+                return default
+            return s in ("1", "true", "t", "yes", "y", "on")
+
+        def _render_cross_post_message(template: str, append_link: bool) -> str:
+            thread_url = getattr(thread, "jump_url", None) or f"https://discord.com/channels/{guild.id}/{thread.id}"
+            thread_title = (thread.name or "未命名帖子").strip()
+            forum_name = thread.parent.name if thread.parent else "未知论坛"
+
+            rendered = template
+            rendered = rendered.replace("{thread_url}", thread_url)
+            rendered = rendered.replace("{thread_title}", thread_title)
+            rendered = rendered.replace("{forum_name}", forum_name)
+            rendered = rendered.replace("{author_mention}", member.mention)
+
+            if append_link and "{thread_url}" not in template:
+                rendered = f"{rendered}\n[帖子直达]({thread_url})" if rendered else f"[帖子直达]({thread_url})"
+
+            return rendered[:MESSAGE_CONTENT_LIMIT]
 
         auto_role_enabled = _to_bool(config.get("auto_role_enabled"))
-        notify_enabled = _to_bool(config.get("notify_enabled"))
+        notify_enabled = _to_bool(config.get("notify_enabled"), default=True)
         mention_role_enabled = _to_bool(config.get("mention_role_enabled"))
-        
-        # 记录解析后的开关状态
-        self.logger.info(f"ForumMonitor: Enabled flags - auto_role:{auto_role_enabled}, notify:{notify_enabled}, mention:{mention_role_enabled}")
+        cross_post_enabled = _to_bool(config.get("cross_post_enabled"))
+
+        self.logger.info(
+            f"ForumMonitor: Enabled flags - auto_role:{auto_role_enabled}, notify:{notify_enabled}, "
+            f"mention:{mention_role_enabled}, cross_post:{cross_post_enabled}"
+        )
         execution_report["auto_role"]["enabled"] = auto_role_enabled
         execution_report["notify"]["enabled"] = notify_enabled
         execution_report["mention"]["enabled"] = mention_role_enabled
+        execution_report["cross_post"]["enabled"] = cross_post_enabled
 
         # 1. 加身份组
         if auto_role_enabled:
             execution_report["auto_role"]["executed"] = True
             self.logger.info(f"ForumMonitor: Executing auto_role for thread {thread.id}")
             rid_csv = config.get("auto_role_id")
-            self.logger.debug(f"ForumMonitor: auto_role_id raw value: {rid_csv}")
             ids = _parse_role_ids_csv(rid_csv)
-            self.logger.debug(f"ForumMonitor: Parsed role IDs: {ids}")
             roles = []
             for rid in ids:
                 role_obj = guild.get_role(rid)
@@ -468,101 +594,94 @@ class ForumPostMonitorCog(BaseCog):
             if roles:
                 try:
                     await member.add_roles(*roles, reason="论坛新帖自动授予身份组")
-                    self.logger.info(f"ForumMonitor: SUCCESS - Granted roles {[r.id for r in roles]} to user {member.id}")
                     execution_report["auto_role"]["success"] = True
-                except discord.Forbidden as e:
-                    error_msg = f"Forbidden: {str(e)}"
-                    self.logger.error(f"ForumMonitor: FAILED add_roles - {error_msg}")
-                    execution_report["auto_role"]["error"] = error_msg
-                    try:
-                        await thread.send(
-                            f"⚠️ 无法为 {member.mention} 添加身份组（权限不足或角色层级问题）。",
-                            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
-                        )
-                    except Exception as send_err:
-                        self.logger.error(f"ForumMonitor: Failed to send role error message: {send_err}")
                 except Exception as e:
                     error_msg = f"{type(e).__name__}: {str(e)}"
-                    self.logger.error(f"ForumMonitor: FAILED add_roles - {error_msg}", exc_info=True)
                     execution_report["auto_role"]["error"] = error_msg
+                    self.logger.error(f"ForumMonitor: FAILED add_roles - {error_msg}", exc_info=True)
             else:
                 self.logger.warning(f"ForumMonitor: No valid roles to grant for config {rid_csv}")
-        else:
-            self.logger.info(f"ForumMonitor: Skipping auto_role (disabled) for thread {thread.id}")
 
         # 2. 在线程中通知并@贴主
         if notify_enabled:
             execution_report["notify"]["executed"] = True
-            self.logger.info(f"ForumMonitor: Executing notify for thread {thread.id}")
             message = config.get("notify_message") or "欢迎加入讨论！"
-            self.logger.debug(f"ForumMonitor: Notify message: {message[:50]}...")
             if isinstance(message, str):
-                message = message[:MESSAGE_CONTENT_LIMIT]
                 try:
-                    self.logger.debug(f"ForumMonitor: Attempting to send notify to thread {thread.id}")
-                    msg = await self._send_with_retry(
+                    await self._send_with_retry(
                         thread,
-                        f"{member.mention} {message}",
+                        f"{member.mention} {message[:MESSAGE_CONTENT_LIMIT]}",
                         allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
                     )
-                    self.logger.info(f"ForumMonitor: SUCCESS - Sent notify message {msg.id} in thread {thread.id}")
                     execution_report["notify"]["success"] = True
-                except discord.HTTPException as e:
-                    error_msg = f"HTTPException: {e.status} - {e.text}"
-                    self.logger.error(f"ForumMonitor: FAILED send notify - {error_msg}")
-                    execution_report["notify"]["error"] = error_msg
                 except Exception as e:
                     error_msg = f"{type(e).__name__}: {str(e)}"
-                    self.logger.error(f"ForumMonitor: FAILED send notify - {error_msg}", exc_info=True)
                     execution_report["notify"]["error"] = error_msg
-            else:
-                self.logger.warning(f"ForumMonitor: Notify message is not a string: {type(message)}")
-        else:
-            self.logger.info(f"ForumMonitor: Skipping notify (disabled) for thread {thread.id}")
+                    self.logger.error(f"ForumMonitor: FAILED send notify - {error_msg}", exc_info=True)
 
         # 3. 在线程中@指定身份组并发送消息
         if mention_role_enabled:
             execution_report["mention"]["executed"] = True
-            self.logger.info(f"ForumMonitor: Executing mention_role for thread {thread.id}")
             rid_csv = config.get("mention_role_id")
             mention_msg = (config.get("mention_message") or "").strip()
-            self.logger.debug(f"ForumMonitor: mention_role_id: {rid_csv}, mention_message: {mention_msg[:50]}...")
             ids = _parse_role_ids_csv(rid_csv)
-            self.logger.debug(f"ForumMonitor: Parsed mention role IDs: {ids}")
             if ids:
                 mentions = " ".join(f"<@&{rid}>" for rid in ids)
                 text = f"{mentions} {mention_msg}" if mention_msg else mentions
-                self.logger.debug(f"ForumMonitor: Full mention text: {text[:100]}...")
                 try:
-                    self.logger.debug(f"ForumMonitor: Attempting to send mention to thread {thread.id}")
-                    msg = await self._send_with_retry(
+                    await self._send_with_retry(
                         thread,
                         text[:MESSAGE_CONTENT_LIMIT],
                         allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
                     )
-                    self.logger.info(f"ForumMonitor: SUCCESS - Sent mention message {msg.id} in thread {thread.id}")
                     execution_report["mention"]["success"] = True
-                except discord.HTTPException as e:
-                    error_msg = f"HTTPException: {e.status} - {e.text}"
-                    self.logger.error(f"ForumMonitor: FAILED send mention - {error_msg}")
-                    execution_report["mention"]["error"] = error_msg
                 except Exception as e:
                     error_msg = f"{type(e).__name__}: {str(e)}"
-                    self.logger.error(f"ForumMonitor: FAILED send mention - {error_msg}", exc_info=True)
                     execution_report["mention"]["error"] = error_msg
-            else:
-                self.logger.warning(f"ForumMonitor: No valid mention roles for config {rid_csv}")
-        else:
-            self.logger.info(f"ForumMonitor: Skipping mention_role (disabled) for thread {thread.id}")
-        
-        # 记录最终执行报告
+                    self.logger.error(f"ForumMonitor: FAILED send mention - {error_msg}", exc_info=True)
+
+        # 4. 跨频道提醒（@身份组 + 模板 + 可选自动附加链接）
+        if cross_post_enabled:
+            execution_report["cross_post"]["executed"] = True
+            try:
+                target_channel_id_raw = config.get("cross_post_channel_id")
+                target_channel_id = int(str(target_channel_id_raw).strip()) if str(target_channel_id_raw).strip().isdigit() else 0
+                target_channel = guild.get_channel(target_channel_id) if target_channel_id > 0 else None
+                if target_channel is None:
+                    raise ValueError("跨频道提醒目标频道不存在或ID无效")
+
+                me = guild.me
+                if me and hasattr(target_channel, "permissions_for"):
+                    perms = target_channel.permissions_for(me)
+                    if not perms.view_channel or not perms.send_messages:
+                        raise PermissionError("机器人缺少目标频道的查看或发送消息权限")
+
+                rid_csv = config.get("cross_post_role_ids")
+                role_ids = _parse_role_ids_csv(rid_csv)
+                role_mentions = " ".join(f"<@&{rid}>" for rid in role_ids) if role_ids else ""
+
+                raw_template = (config.get("cross_post_template") or "").strip()
+                default_template = "{author_mention} 在 {forum_name} 发布了新帖子：[{thread_title}]({thread_url})"
+                # 兼容旧写法：将 ${var} 自动修正为 {var}
+                normalized_template = (raw_template or default_template).replace("${thread_title}", "{thread_title}").replace("${thread_url}", "{thread_url}")
+                append_link = _to_bool(config.get("cross_post_append_link"), default=True)
+
+                body = _render_cross_post_message(normalized_template, append_link)
+                final_text = f"{role_mentions}\n{body}" if role_mentions and body else (role_mentions or body)
+                final_text = final_text[:MESSAGE_CONTENT_LIMIT]
+
+                await self._send_to_channel_with_retry(
+                    target_channel,
+                    final_text,
+                    allowed_mentions=discord.AllowedMentions(users=False, roles=True, everyone=False),
+                )
+                execution_report["cross_post"]["success"] = True
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {str(e)}"
+                execution_report["cross_post"]["error"] = error_msg
+                self.logger.error(f"ForumMonitor: FAILED cross_post - {error_msg}", exc_info=True)
+
         self.logger.info(f"ForumMonitor: COMPLETE processing thread {thread.id} - Report: {json.dumps(execution_report, ensure_ascii=False)}")
-        
-        # 检测部分失败情况
-        if execution_report["auto_role"]["enabled"] and execution_report["auto_role"]["executed"] and execution_report["auto_role"]["success"]:
-            if (execution_report["notify"]["enabled"] and not execution_report["notify"]["success"]) or \
-               (execution_report["mention"]["enabled"] and not execution_report["mention"]["success"]):
-                self.logger.warning(f"ForumMonitor: PARTIAL FAILURE detected for thread {thread.id} - Role added but messages failed")
 
     # ==== 定时扫描遗漏的帖子 ====
 
@@ -692,14 +811,22 @@ class ForumPostMonitorCog(BaseCog):
             self.logger.error(f"ForumMonitor: panel cleanup task error: {e}", exc_info=True)
 
     @app_commands.command(name="帖子监控面板", description="打开本服务器的帖子监控配置面板（论坛频道新帖自动处理）")
-    @admin_or_owner()
     async def open_forum_monitor_panel(self, interaction: discord.Interaction):
         """
-        管理员/拥有者可用，打开配置面板视图。
+        管理员/开发者/被授权身份组可用，打开配置面板视图。
         """
         # 黄金法则：先 defer
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
+
+        # 权限检查：管理员/开发者/被授权身份组
+        if not await self._is_forum_monitor_operator(interaction):
+            try:
+                await interaction.edit_original_response(content="❌ 你没有权限召唤帖子监控面板。")
+            except Exception:
+                pass
+            return
+
         # 立即结束“正在响应”提示，给出进度反馈
         try:
             await interaction.edit_original_response(content="⌛ 正在发布帖子监控面板……")
@@ -723,7 +850,8 @@ class ForumPostMonitorCog(BaseCog):
                 "在此选择论坛频道并为其配置自动处理策略：\n"
                 "- 为新帖贴主自动上身份组\n"
                 "- 在线程内通知并@贴主\n"
-                "- 在线程内@指定身份组并发送消息\n\n"
+                "- 在线程内@指定身份组并发送消息\n"
+                "- 在其他聊天频道发送带帖子链接的提醒\n\n"
                 "提示：所有配置为每个论坛频道独立生效。"
             ),
             color=discord.Color.blue(),
@@ -735,7 +863,7 @@ class ForumPostMonitorCog(BaseCog):
             # 24小时后自动清除面板消息
             asyncio.create_task(self._schedule_panel_cleanup(panel_message, hours=24))
             await interaction.edit_original_response(
-                content="✅ 帖子监控面板已发布，所有成员可打开与查看；仅管理员/开发者可修改配置。此面板将在24小时后自动清除。"
+                content="✅ 帖子监控面板已发布，所有成员可打开与查看；管理员/开发者/被授权身份组可修改配置。此面板将在24小时后自动清除。"
             )
         except discord.Forbidden:
             try:

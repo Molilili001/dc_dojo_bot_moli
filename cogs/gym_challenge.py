@@ -1156,7 +1156,7 @@ class GymChallengeCog(BaseCog):
             # 清理会话和锁
             self._cleanup_user_session(user_id)
             
-            logger.info(f"Ultimate challenge success for user {user_id}. Time: {completion_time:.2f}s")
+            logger.warning(f"Ultimate challenge success for user {user_id} in gym '{session.gym_info['name']}' (id={session.gym_id}). Time: {completion_time:.2f}s")
             
             # 触发排行榜更新
             await self._trigger_leaderboard_update(int(guild_id))
@@ -1178,13 +1178,14 @@ class GymChallengeCog(BaseCog):
             
         else:
             # 普通道馆成功
+            completion_time = session.get_completion_time()
             await self._reset_failures(user_id, guild_id, session.gym_id)
             await self._set_gym_completed(user_id, guild_id, session.gym_id)
             
             # 清理会话和锁
             self._cleanup_user_session(user_id)
             
-            logger.info(f"Challenge success for user {user_id} in gym {session.gym_id}")
+            logger.warning(f"Challenge success for user {user_id} in gym '{session.gym_info['name']}' (id={session.gym_id}). Time: {completion_time:.2f}s, mistakes: {session.mistakes_made}/{session.allowed_mistakes}")
             
             success_desc = (f"你成功通过了 **{session.gym_info['name']}** 的考核！\n\n"
                           f"总题数: **{len(session.questions_for_session)}**\n"
@@ -1234,7 +1235,7 @@ class GymChallengeCog(BaseCog):
         # 清理会话和锁
         self._cleanup_user_session(user_id)
         
-        logger.info(f"Challenge failed for user {user_id} in gym {session.gym_id}")
+        logger.warning(f"Challenge failed for user {user_id} in gym '{session.gym_info['name']}' (id={session.gym_id}). mistakes: {session.mistakes_made}, ban_duration: {ban_duration.total_seconds()}s")
         
         # 构建失败消息
         fail_desc = (f"本次挑战失败。\n\n"
