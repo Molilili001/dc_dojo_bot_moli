@@ -90,11 +90,11 @@ def _truncate_message(text: Optional[str]) -> Optional[str]:
 def _parse_flags(raw: Optional[str]) -> Dict[str, bool]:
     """
     解析flags文本（可选），格式示例：
-    auto=yes, notify=yes, mention=no
+    auto=yes, notify=yes, mention=no, cross=yes, append_link=yes
     支持: yes/no/true/false/1/0/y/n/t/f
-    未提供时默认: notify=True，其它False
+    未提供时默认: notify=True, append_link=True，其它False
     """
-    default = {"auto": False, "notify": True, "mention": False}
+    default = {"auto": False, "notify": True, "mention": False, "cross": False, "append_link": True}
     if not raw or not isinstance(raw, str):
         return default
 
@@ -111,7 +111,7 @@ def _parse_flags(raw: Optional[str]) -> Dict[str, bool]:
             k, v = p.split("=", 1)
             k = k.strip().lower()
             v = v.strip()
-            if k in ("auto", "notify", "mention"):
+            if k in ("auto", "notify", "mention", "cross", "append_link"):
                 flags[k] = to_bool(v)
         return {**default, **flags}
     except Exception:
@@ -146,13 +146,22 @@ class ForumMonitorConfigModal(ui.Modal, title="配置论坛频道监控"):
     - notify_message: 在线程内对帖主的通知文本（可为空，默认“欢迎加入讨论！”）
     - mention_role_id: 要@的身份组（ID或@提及）
     - mention_message: 在线程内@身份组时附加的文本
-    - flags: 可选开关 "auto=yes, notify=yes, mention=no"
+    - cross_post_config: 跨频道提醒综合配置（多行）
+      channel=频道ID或<#频道>
+      roles=角色ID列表或<@&角色>列表（逗号分隔）
+      template=模板（支持 {thread_url} {thread_title} {forum_name} {author_mention}）
+      flags=cross=yes,append_link=yes（也支持 auto/notify/mention）
     """
     auto_role_id = ui.TextInput(label="自动身份组ID或@提及（可选，多个用逗号分隔）", required=False, placeholder="示例: 123,456 或 <@&123>,<@&456>")
     notify_message = ui.TextInput(label="通知消息（可选）", style=discord.TextStyle.paragraph, required=False, placeholder="默认：欢迎加入讨论！")
     mention_role_id = ui.TextInput(label="@身份组ID或@提及（可选，多个用逗号分隔）", required=False, placeholder="示例: 123,456 或 <@&123>,<@&456>")
     mention_message = ui.TextInput(label="@身份组附加消息（可选）", style=discord.TextStyle.paragraph, required=False)
-    flags = ui.TextInput(label="开关flags（可选）", required=False, placeholder="auto=yes, notify=yes, mention=no")
+    cross_post_config = ui.TextInput(
+        label="跨频道提醒配置（可选，多行key=value）",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        placeholder="channel=<#频道ID>；roles=<@&角色ID>；flags=cross=yes,append_link=yes"
+    )
 
     def __init__(self, guild: discord.Guild, channel_id: str):
         super().__init__(timeout=180)
@@ -173,12 +182,47 @@ class ForumMonitorConfigModal(ui.Modal, title="配置论坛频道监控"):
         notify_msg = _truncate_message(str(self.notify_message)) if str(self.notify_message).strip() else None
         mention_role_ids = _parse_role_ids_csv(self.guild, str(self.mention_role_id)) if str(self.mention_role_id).strip() else []
         mention_msg = _truncate_message(str(self.mention_message)) if str(self.mention_message).strip() else None
-        flags_dict = _parse_flags(str(self.flags)) if str(self.flags).strip() else _parse_flags(None)
+        raw_cross_cfg = str(self.cross_post_config).strip()
+        cross_map: Dict[str, str] = {}
+        if raw_cross_cfg:
+            for line in raw_cross_cfg.splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if k and v:
+                    cross_map[k] = v
+
+        flags_raw = cross_map.get("flags")
+        flags_dict = _parse_flags(flags_raw) if flags_raw else _parse_flags(None)
+
+        cross_channel_raw = (cross_map.get("channel") or "").strip()
+        cross_channel_id = None
+        if cross_channel_raw:
+            if cross_channel_raw.startswith("<#") and cross_channel_raw.endswith(">"):
+                cross_channel_raw = cross_channel_raw[2:-1]
+            if cross_channel_raw.isdigit():
+                ch = self.guild.get_channel(int(cross_channel_raw))
+                if ch and ch.type in (
+                    discord.ChannelType.text,
+                    discord.ChannelType.news,
+                    discord.ChannelType.public_thread,
+                    discord.ChannelType.private_thread,
+                ):
+                    cross_channel_id = cross_channel_raw
+
+        cross_roles_raw = cross_map.get("roles")
+        cross_role_ids = _parse_role_ids_csv(self.guild, cross_roles_raw) if cross_roles_raw else []
+        cross_template_raw = cross_map.get("template")
+        cross_template = _truncate_message(cross_template_raw) if cross_template_raw else None
 
         # 确定开关
         auto_enabled = flags_dict.get("auto", False) and len(auto_role_ids) > 0
         notify_enabled = flags_dict.get("notify", True)  # 允许notify开启但消息为空时使用默认文案
         mention_enabled = flags_dict.get("mention", False) and len(mention_role_ids) > 0
+        cross_enabled = flags_dict.get("cross", False) and bool(cross_channel_id)
+        append_link_enabled = flags_dict.get("append_link", True)
 
         # 默认通知文案
         if notify_enabled and not notify_msg:
@@ -198,7 +242,12 @@ class ForumMonitorConfigModal(ui.Modal, title="配置论坛频道监控"):
                 notify_message=notify_msg,
                 mention_role_enabled=mention_enabled,
                 mention_role_id=",".join(mention_role_ids) if mention_role_ids else None,
-                mention_message=mention_msg
+                mention_message=mention_msg,
+                cross_post_enabled=cross_enabled,
+                cross_post_channel_id=cross_channel_id,
+                cross_post_role_ids=",".join(cross_role_ids) if cross_role_ids else None,
+                cross_post_template=cross_template,
+                cross_post_append_link=append_link_enabled,
             )
 
             await interaction.followup.send("✅ 配置已保存。", ephemeral=True)
@@ -210,6 +259,80 @@ class ForumMonitorConfigModal(ui.Modal, title="配置论坛频道监控"):
         except Exception as e:
             logger.error(f"ForumMonitor: save config error: {e}", exc_info=True)
             await interaction.followup.send("❌ 保存配置时发生错误。", ephemeral=True)
+
+
+class ForumMonitorPermissionModal(ui.Modal, title="帖子监控权限管理"):
+    action = ui.TextInput(
+        label="操作类型",
+        required=True,
+        placeholder="add / remove / list / clear"
+    )
+    role_ids = ui.TextInput(
+        label="身份组（可选，多个用逗号分隔）",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        placeholder="示例: 123,456 或 <@&123>,<@&456>"
+    )
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await safe_defer(interaction)
+
+        if not await is_admin_or_owner(interaction):
+            await interaction.followup.send("❌ 仅管理员/开发者可管理帖子监控权限。", ephemeral=True)
+            return
+
+        cog = interaction.client.get_cog("ForumPostMonitorCog")
+        if not cog:
+            await interaction.followup.send("❌ 系统模块未加载。", ephemeral=True)
+            return
+
+        action = str(self.action).strip().lower()
+        guild_id = str(self.guild.id)
+
+        try:
+            if action == "list":
+                role_ids = await cog._list_panel_permission_role_ids(guild_id)
+                if not role_ids:
+                    await interaction.followup.send("ℹ️ 当前未配置额外可操作帖子监控的身份组。", ephemeral=True)
+                    return
+                mentions = []
+                for rid in role_ids:
+                    role = self.guild.get_role(int(rid)) if str(rid).isdigit() else None
+                    mentions.append(role.mention if role else f"<@&{rid}>")
+                await interaction.followup.send("✅ 当前可操作身份组：\n" + " ".join(mentions), ephemeral=True)
+                return
+
+            if action == "clear":
+                affected = await cog._clear_panel_permission_roles(guild_id)
+                await interaction.followup.send(f"✅ 已清空帖子监控额外权限身份组（{affected} 条）。", ephemeral=True)
+                return
+
+            role_ids = _parse_role_ids_csv(self.guild, str(self.role_ids)) if str(self.role_ids).strip() else []
+            if not role_ids:
+                await interaction.followup.send("❌ 请提供至少一个有效身份组。", ephemeral=True)
+                return
+
+            if action == "add":
+                for rid in role_ids:
+                    await cog._add_panel_permission_role(guild_id, rid, str(interaction.user.id))
+                await interaction.followup.send(f"✅ 已添加 {len(role_ids)} 个身份组到帖子监控可操作名单。", ephemeral=True)
+                return
+
+            if action == "remove":
+                removed = 0
+                for rid in role_ids:
+                    removed += await cog._remove_panel_permission_role(guild_id, rid)
+                await interaction.followup.send(f"✅ 已移除 {removed} 条帖子监控身份组权限。", ephemeral=True)
+                return
+
+            await interaction.followup.send("❌ 操作类型无效，请使用 add/remove/list/clear。", ephemeral=True)
+        except Exception as e:
+            logger.error(f"ForumMonitor: manage permission roles error: {e}", exc_info=True)
+            await interaction.followup.send("❌ 处理权限管理时发生错误。", ephemeral=True)
 
 
 class ForumMonitorPanelView(ui.View):
@@ -269,7 +392,37 @@ class ForumMonitorPanelView(ui.View):
             embed.add_field(name="自动加身份组", value=f"{b2e(config.get('auto_role_enabled'))} | 目标: {auto_targets}", inline=False)
             embed.add_field(name="通知贴主", value=f"{b2e(config.get('notify_enabled'))} | 文案: {config.get('notify_message') or '欢迎加入讨论！'}", inline=False)
             embed.add_field(name="@身份组消息", value=f"{b2e(config.get('mention_role_enabled'))} | 目标: {mention_targets} | 文案: {config.get('mention_message') or '无'}", inline=False)
+
+            cross_target = "无"
+            cross_id = str(config.get("cross_post_channel_id") or "").strip()
+            if cross_id.isdigit():
+                cross_ch = interaction.guild.get_channel(int(cross_id))
+                cross_target = cross_ch.mention if cross_ch else f"ID: {cross_id}"
+            cross_roles = _format_role_ids_for_display(interaction.guild, config.get('cross_post_role_ids'))
+            cross_tpl = (config.get('cross_post_template') or '默认模板').strip()
+            append_link_text = b2e(config.get('cross_post_append_link'))
+            embed.add_field(
+                name="跨频道提醒",
+                value=(
+                    f"{b2e(config.get('cross_post_enabled'))} | 目标频道: {cross_target}\n"
+                    f"目标身份组: {cross_roles} | 自动附链: {append_link_text}\n"
+                    f"模板: {cross_tpl}"
+                ),
+                inline=False,
+            )
+        role_ids = await cog._list_panel_permission_role_ids(guild_id)
+        if role_ids:
+            mentions = []
+            for rid in role_ids:
+                role = interaction.guild.get_role(int(rid)) if str(rid).isdigit() else None
+                mentions.append(role.mention if role else f"<@&{rid}>")
+            roles_text = " ".join(mentions)
         else:
+            roles_text = "无（仅管理员/开发者可操作）"
+
+        embed.add_field(name="面板可操作身份组", value=roles_text, inline=False)
+
+        if not config:
             embed.description = "此频道尚未配置监控策略。"
 
         try:
@@ -285,7 +438,12 @@ class ForumMonitorPanelView(ui.View):
         所有人可查看面板，但仅管理员/开发者可修改配置。
         """
         # 权限检查（不使用defer，避免与send_modal冲突）
-        if not await is_admin_or_owner(interaction):
+        cog = interaction.client.get_cog("ForumPostMonitorCog")
+        if not cog:
+            await interaction.response.send_message("❌ 系统模块未加载。", ephemeral=True)
+            return
+
+        if not await cog._is_forum_monitor_operator(interaction):
             await interaction.response.send_message("❌ 你没有权限修改配置。", ephemeral=True)
             return
 
@@ -305,18 +463,18 @@ class ForumMonitorPanelView(ui.View):
     @ui.button(label="删除该频道配置", style=discord.ButtonStyle.danger)
     async def delete_button(self, interaction: discord.Interaction, button: ui.Button):
         await safe_defer(interaction)
-        # 权限限制：仅管理员/开发者可删除配置
-        if not await is_admin_or_owner(interaction):
+        cog = interaction.client.get_cog("ForumPostMonitorCog")
+        if not cog:
+            await interaction.followup.send("❌ 系统模块未加载。", ephemeral=True)
+            return
+
+        # 权限限制：管理员/开发者 或 已授权身份组
+        if not await cog._is_forum_monitor_operator(interaction):
             await interaction.followup.send("❌ 你没有权限删除配置。", ephemeral=True)
             return
 
         if not self.selected_channel_id:
             await interaction.followup.send("ℹ️ 请先选择一个论坛频道。", ephemeral=True)
-            return
-
-        cog = interaction.client.get_cog("ForumPostMonitorCog")
-        if not cog:
-            await interaction.followup.send("❌ 系统模块未加载。", ephemeral=True)
             return
 
         guild_id = str(interaction.guild.id)
@@ -335,9 +493,94 @@ class ForumMonitorPanelView(ui.View):
     async def refresh_button(self, interaction: discord.Interaction, button: ui.Button):
         await self.show_current_config(interaction)
 
+    @ui.button(label="使用说明/预设", style=discord.ButtonStyle.secondary)
+    async def help_button(self, interaction: discord.Interaction, button: ui.Button):
+        """显示面板使用说明与可复制预设。"""
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        guide_embed = discord.Embed(
+            title="帖子监控面板使用说明",
+            description=(
+                "你可以先在上方选择论坛频道，再点“新增/更新配置”。\n"
+                "跨频道提醒使用单个多行字段 `key=value` 配置。\n"
+                "模板中可写变量，最终会自动替换。"
+            ),
+            color=discord.Color.blurple(),
+        )
+        guide_embed.add_field(
+            name="开关说明（写在 flags=...）",
+            value=(
+                "- auto: 自动上身份组\n"
+                "- notify: 在线程内通知贴主\n"
+                "- mention: 在线程内@身份组\n"
+                "- cross: 跨频道提醒\n"
+                "- append_link: 自动附加帖子链接"
+            ),
+            inline=False,
+        )
+        guide_embed.add_field(
+            name="预设A（只保留原有三项）",
+            value=(
+                "```\n"
+                "flags=auto=yes,notify=yes,mention=yes\n"
+                "```"
+            ),
+            inline=False,
+        )
+        guide_embed.add_field(
+            name="预设B（开启跨频道提醒）",
+            value=(
+                "```\n"
+                "channel=<#目标频道ID>\n"
+                "roles=<@&角色1>,<@&角色2>\n"
+                "template={author_mention} 在 {forum_name} 发布了新帖子：[{thread_title}]({thread_url})\n"
+                "flags=auto=yes,notify=yes,mention=yes,cross=yes,append_link=yes\n"
+                "```"
+            ),
+            inline=False,
+        )
+        guide_embed.add_field(
+            name="可用变量（template里可用）",
+            value=(
+                "- `{thread_url}`: 帖子跳转链接\n"
+                "- `{thread_title}`: 帖子标题\n"
+                "- `{forum_name}`: 所在论坛频道名\n"
+                "- `{author_mention}`: 发帖人@提及"
+            ),
+            inline=False,
+        )
+        guide_embed.add_field(
+            name="格式与注意事项",
+            value=(
+                "- 蓝色可跳转标题格式：`[{thread_title}]({thread_url})`\n"
+                "- `append_link=yes` 且模板里没有 `{thread_url}` 时，系统会在末尾自动补一条链接\n"
+                "- 未识别变量会保留原文，不会报错\n"
+                "- `roles=` 可留空，留空则只发文本不@身份组"
+            ),
+            inline=False,
+        )
+
+        await interaction.followup.send(embed=guide_embed, ephemeral=True)
+
+    @ui.button(label="权限管理", style=discord.ButtonStyle.secondary)
+    async def dev_permission_button(self, interaction: discord.Interaction, button: ui.Button):
+        """管理可操作帖子监控配置的身份组。"""
+        if not await is_admin_or_owner(interaction):
+            await interaction.response.send_message("❌ 仅管理员/开发者可管理权限。", ephemeral=True)
+            return
+
+        try:
+            await interaction.response.send_modal(ForumMonitorPermissionModal(interaction.guild))
+        except Exception as e:
+            logger.error(f"ForumMonitor: open permission modal error: {e}", exc_info=True)
+            await safe_defer(interaction)
+            await interaction.followup.send("❌ 无法打开权限管理表单。", ephemeral=True)
+
 
 __all__ = [
     "ForumMonitorPanelView",
     "ForumMonitorConfigModal",
+    "ForumMonitorPermissionModal",
     "ForumChannelSelect",
 ]

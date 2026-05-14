@@ -48,6 +48,7 @@ class AdminCog(BaseCog):
             app_commands.Choice(name="列表 (/道馆 列表)", value="列表"),
             app_commands.Choice(name="列表面板 (/道馆 列表面板)", value="列表面板"),
             app_commands.Choice(name="更新面板 (/道馆 更新面板)", value="更新面板"),
+            app_commands.Choice(name="设置进度 (/设置进度)", value="设置进度"),
             app_commands.Choice(name="重置进度 (/重置进度)", value="重置进度"),
             app_commands.Choice(name="解除处罚 (/解除处罚)", value="解除处罚"),
             app_commands.Choice(name="停业 (/道馆 停业)", value="停业"),

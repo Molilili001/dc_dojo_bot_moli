@@ -269,6 +269,11 @@ class ForumMonitorConfig:
     mention_role_enabled: bool = False
     mention_role_id: Optional[str] = None
     mention_message: Optional[str] = None
+    cross_post_enabled: bool = False
+    cross_post_channel_id: Optional[str] = None
+    cross_post_role_ids: Optional[str] = None
+    cross_post_template: Optional[str] = None
+    cross_post_append_link: bool = True
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -284,6 +289,11 @@ class ForumMonitorConfig:
             'mention_role_enabled': 1 if self.mention_role_enabled else 0,
             'mention_role_id': self.mention_role_id,
             'mention_message': self.mention_message,
+            'cross_post_enabled': 1 if self.cross_post_enabled else 0,
+            'cross_post_channel_id': self.cross_post_channel_id,
+            'cross_post_role_ids': self.cross_post_role_ids,
+            'cross_post_template': self.cross_post_template,
+            'cross_post_append_link': 1 if self.cross_post_append_link else 0,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -319,6 +329,11 @@ class ForumMonitorConfig:
             mention_role_enabled=parse_bool(row.get('mention_role_enabled')),
             mention_role_id=str(row.get('mention_role_id')) if row.get('mention_role_id') else None,
             mention_message=row.get('mention_message') if row.get('mention_message') else None,
+            cross_post_enabled=parse_bool(row.get('cross_post_enabled')),
+            cross_post_channel_id=str(row.get('cross_post_channel_id')) if row.get('cross_post_channel_id') else None,
+            cross_post_role_ids=str(row.get('cross_post_role_ids')) if row.get('cross_post_role_ids') else None,
+            cross_post_template=row.get('cross_post_template') if row.get('cross_post_template') else None,
+            cross_post_append_link=parse_bool(row.get('cross_post_append_link')) if row.get('cross_post_append_link') is not None else True,
             created_at=parse_dt(row.get('created_at')),
             updated_at=parse_dt(row.get('updated_at')),
         )
@@ -336,6 +351,11 @@ class ForumMonitorConfig:
             'mention_role_enabled': self.mention_role_enabled,
             'mention_role_id': self.mention_role_id,
             'mention_message': self.mention_message,
+            'cross_post_enabled': self.cross_post_enabled,
+            'cross_post_channel_id': self.cross_post_channel_id,
+            'cross_post_role_ids': self.cross_post_role_ids,
+            'cross_post_template': self.cross_post_template,
+            'cross_post_append_link': self.cross_post_append_link,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }, ensure_ascii=False, indent=4)
