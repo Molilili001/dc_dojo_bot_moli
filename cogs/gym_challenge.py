@@ -67,17 +67,17 @@ class ChallengeSession:
             if not self.is_ultimate and num_to_ask <= orig_total:
                 self.questions_for_session = random.sample(self.questions_for_session, num_to_ask)
                 try:
-                    logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} sampled={len(self.questions_for_session)}")
+                    logger.info(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} sampled={len(self.questions_for_session)}")
                 except Exception:
                     pass
             else:
                 try:
-                    logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} no-sample")
+                    logger.info(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} no-sample")
                 except Exception:
                     pass
         else:
             try:
-                logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} (ignored or invalid)")
+                logger.info(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} ignored_or_invalid")
             except Exception:
                 pass
     
@@ -1107,7 +1107,10 @@ class GymChallengeCog(BaseCog):
             else:
                 shuffled_options = options
             try:
-                logger.warning(f"[mc-render] user={session.user_id} qidx={session.current_question_index} randomize={session.randomize_options} opts={options} shuffled={shuffled_options}")
+                logger.debug(
+                    f"[mc-render] user={session.user_id} qidx={session.current_question_index} "
+                    f"randomize={session.randomize_options} option_count={len(options)}"
+                )
             except Exception:
                 pass
 
