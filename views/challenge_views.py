@@ -37,6 +37,17 @@ class GymSelect(ui.Select):
     """道馆选择下拉菜单"""
     def __init__(self, guild_gyms: List[Dict], user_progress: Dict, panel_message_id: int):
         self.panel_message_id = panel_message_id
+
+        completed_count = sum(
+            1 for gym in guild_gyms
+            if user_progress.get(gym.get('id'), False)
+        )
+        incomplete_count = len(guild_gyms) - completed_count
+        sorted_gyms = sorted(
+            guild_gyms,
+            key=lambda gym: user_progress.get(gym.get('id'), False)
+        )
+
         options = []
 
         if not guild_gyms:
@@ -47,7 +58,7 @@ class GymSelect(ui.Select):
                 emoji="🤷"
             ))
         else:
-            for gym in guild_gyms:
+            for gym in sorted_gyms:
                 gym_id = gym['id']
                 completed = user_progress.get(gym_id, False)
 
@@ -80,7 +91,7 @@ class GymSelect(ui.Select):
                     ))
 
         super().__init__(
-            placeholder="请选择一个道馆进行挑战...",
+            placeholder=f"请选择一个道馆进行挑战（{incomplete_count}/{completed_count}）",
             min_values=1,
             max_values=1,
             options=options

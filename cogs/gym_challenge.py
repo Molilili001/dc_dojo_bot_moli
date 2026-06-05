@@ -336,13 +336,20 @@ class GymChallengeCog(BaseCog):
                 )
             return
         
+        completed_count = sum(
+            1 for gym in available_gyms
+            if user_progress.get(gym.get('id'), False)
+        )
+        incomplete_count = len(available_gyms) - completed_count
+        available_gyms.sort(key=lambda gym: user_progress.get(gym.get('id'), False))
+        
         # 创建道馆选择视图
         from views.challenge_views import GymSelectView
         view = GymSelectView(available_gyms, user_progress, int(panel_message_id) if panel_message_id else 0)
         
         embed = discord.Embed(
             title="选择道馆",
-            description="请选择一个道馆进行挑战：",
+            description=f"请选择一个道馆进行挑战（未完成/已完成：{incomplete_count}/{completed_count}）：",
             color=discord.Color.blue()
         )
         
