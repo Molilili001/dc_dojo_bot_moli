@@ -176,6 +176,11 @@ class StartChallengeButton(ui.Button):
             )
             return
 
+        # 从活跃挑战中获取会话，并避免教程超时在开始流程中清理 session
+        session = challenge_cog.active_challenges.get(user_id)
+        if session:
+            session.started = True
+
         # 在开始前再次检查封禁状态
         guild_id = str(interaction.guild.id)
         ban_entry = await challenge_cog._get_challenge_ban_entry(guild_id, interaction.user)
@@ -189,8 +194,6 @@ class StartChallengeButton(ui.Button):
             await interaction.followup.send(ban_message, ephemeral=True)
             return
 
-        # 从活跃挑战中获取会话
-        session = challenge_cog.active_challenges.get(user_id)
         if session:
             # 停止当前视图的超时计时器
             self.view.stop()
@@ -274,9 +277,20 @@ class QuestionView(ui.View):
         self.answered = False  # 添加标记来跟踪是否已经回答
         # 为本视图实例生成一次性令牌，确保组件 custom_id 唯一，避免客户端缓存导致的渲染抑制
         self.session_token = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        self.question_index = self.session.current_question_index
+        self.session.current_question_view_token = self.session_token
+        self.session.current_question_view_index = self.question_index
         logger.debug(
             f"QuestionView initialized for user {self.session.user_id} "
-            f"gym={self.session.gym_id} qidx={self.session.current_question_index} token={self.session_token}"
+            f"gym={self.session.gym_id} qidx={self.question_index} token={self.session_token}"
+        )
+
+    def is_current_for_session(self, session: Any) -> bool:
+        """检查当前交互视图是否仍是这场挑战的当前题目视图。"""
+        return (
+            session is self.session and
+            getattr(session, "current_question_view_token", None) == self.session_token and
+            getattr(session, "current_question_view_index", None) == self.question_index
         )
 
     async def on_timeout(self):
@@ -289,11 +303,18 @@ class QuestionView(ui.View):
 
         # 获取挑战Cog来处理超时
         challenge_cog = self.interaction.client.get_cog('GymChallengeCog')
-        if challenge_cog:
-            # 只有当会话还存在时才处理超时
-            if user_id in challenge_cog.active_challenges and \
-               challenge_cog.active_challenges[user_id] == self.session:
-                await challenge_cog.handle_challenge_timeout(user_id, self.session)
+        if not challenge_cog:
+            return
+
+        active_session = challenge_cog.active_challenges.get(user_id)
+        if not self.is_current_for_session(active_session):
+            logger.info(
+                f"Ignored stale QuestionView timeout for user {user_id} "
+                f"gym={self.session.gym_id} qidx={self.question_index} token={self.session_token}"
+            )
+            return
+
+        await challenge_cog.handle_challenge_timeout(user_id, self.session)
 
         # 禁用所有按钮
         for item in self.children:
@@ -421,10 +442,18 @@ class QuestionAnswerButton(ui.Button):
         async with challenge_cog.user_challenge_locks[user_id]:
             session = challenge_cog.active_challenges.get(user_id)
             if not session:
+                logger.warning(f"Answer received without active session for user {user_id}")
                 await interaction.edit_original_response(
                     content="挑战已超时或已结束，请重新开始。",
                     view=None,
                     embed=None
+                )
+                return
+
+            if hasattr(self.view, "is_current_for_session") and not self.view.is_current_for_session(session):
+                await interaction.followup.send(
+                    "这是旧题目按钮，请回到当前题目继续。",
+                    ephemeral=True
                 )
                 return
 
@@ -484,11 +513,24 @@ class FillInBlankButton(ui.Button):
             return
 
         session = challenge_cog.active_challenges.get(str(interaction.user.id))
-        if session:
-            # 传递当前视图到模态框
-            await interaction.response.send_modal(
-                FillInBlankModal(session.get_current_question(), self.view)
+        if not session:
+            await interaction.response.send_message(
+                "挑战已超时或已结束，请重新开始。",
+                ephemeral=True
             )
+            return
+
+        if hasattr(self.view, "is_current_for_session") and not self.view.is_current_for_session(session):
+            await interaction.response.send_message(
+                "这是旧题目按钮，请回到当前题目继续。",
+                ephemeral=True
+            )
+            return
+
+        # 传递当前视图到模态框
+        await interaction.response.send_modal(
+            FillInBlankModal(session.get_current_question(), self.view)
+        )
 
 
 class FillInBlankModal(ui.Modal, title="填写答案"):
@@ -527,10 +569,18 @@ class FillInBlankModal(ui.Modal, title="填写答案"):
         async with challenge_cog.user_challenge_locks[user_id]:
             session = challenge_cog.active_challenges.get(user_id)
             if not session:
+                logger.warning(f"Fill-in answer received without active session for user {user_id}")
                 await interaction.edit_original_response(
                     content="挑战已超时或已结束，请重新开始。",
                     view=None,
                     embed=None
+                )
+                return
+
+            if hasattr(self.original_view, "is_current_for_session") and not self.original_view.is_current_for_session(session):
+                await interaction.followup.send(
+                    "这道填空题已经不是当前题目，请回到当前题目继续。",
+                    ephemeral=True
                 )
                 return
 
