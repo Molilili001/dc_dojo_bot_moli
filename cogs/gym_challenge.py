@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any
 
 from cogs.base_cog import BaseCog
 from core.database import DatabaseManager
+from core.constants import CHALLENGE_TIMEOUT
 from core.models import Gym, UserProgress, ChallengeFailure, Question
 from core.exceptions import ValidationError
 from utils.formatters import format_time, format_timedelta, format_wrong_answers
@@ -47,7 +48,10 @@ class ChallengeSession:
         self.panel_message_id = panel_message_id
         self.is_ultimate = gym_info.get('is_ultimate', False)
         self.start_time = time.time()
+        self.started = False
         self.current_question_index = 0
+        self.current_question_view_token = None
+        self.current_question_view_index = None
         self.mistakes_made = 0
         self.wrong_answers = []  # [(question, user_answer), ...]
         self.allowed_mistakes = gym_info.get('allowed_mistakes', 0)
@@ -63,17 +67,17 @@ class ChallengeSession:
             if not self.is_ultimate and num_to_ask <= orig_total:
                 self.questions_for_session = random.sample(self.questions_for_session, num_to_ask)
                 try:
-                    logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} sampled={len(self.questions_for_session)}")
+                    logger.info(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} sampled={len(self.questions_for_session)}")
                 except Exception:
                     pass
             else:
                 try:
-                    logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} no-sample")
+                    logger.info(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} no-sample")
                 except Exception:
                     pass
         else:
             try:
-                logger.warning(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} (ignored or invalid)")
+                logger.info(f"[session-init] user={self.user_id} gym={self.gym_id} is_ultimate={self.is_ultimate} total={orig_total} to_ask={num_to_ask} ignored_or_invalid")
             except Exception:
                 pass
     
@@ -444,6 +448,7 @@ class GymChallengeCog(BaseCog):
     
     async def display_question(self, interaction: discord.Interaction, session):
         """显示第一个问题"""
+        session.started = True
         await self._display_next_question(interaction, session)
     
     async def handle_challenge_cancel(self, interaction: discord.Interaction, user_id: str):
@@ -452,9 +457,17 @@ class GymChallengeCog(BaseCog):
     
     async def handle_challenge_timeout(self, user_id: str, session):
         """处理挑战超时"""
+        current_session = self.active_challenges.get(user_id)
+        if current_session is not session:
+            logger.info(f"Ignored stale timeout for user {user_id}")
+            return
+
         # 清理会话和锁
         self._cleanup_user_session(user_id)
-        logger.info(f"Challenge session timed out for user {user_id}")
+        logger.warning(
+            f"Challenge session timed out for user {user_id} "
+            f"gym={session.gym_id} qidx={session.current_question_index}"
+        )
     
     async def process_answer(self, interaction: discord.Interaction, session,
                             answer: str, is_correct: bool, from_modal: bool = False):
@@ -931,8 +944,18 @@ class GymChallengeCog(BaseCog):
         # 设置超时回调来清理会话
         async def cleanup_on_timeout():
             """超时时清理会话和锁"""
-            self._cleanup_user_session(session.user_id)
-            logger.info(f"Tutorial view timed out, cleaned up session for user {session.user_id}")
+            current_session = self.active_challenges.get(session.user_id)
+            if current_session is session and not getattr(session, "started", False):
+                self._cleanup_user_session(session.user_id)
+                logger.warning(
+                    f"Tutorial view timed out, cleaned up unstarted session "
+                    f"user={session.user_id} gym={session.gym_id}"
+                )
+            else:
+                logger.info(
+                    f"Ignored tutorial timeout for user {session.user_id} "
+                    f"gym={session.gym_id}; session already started or stale"
+                )
         
         # 保存原始的on_timeout方法
         original_on_timeout = view.on_timeout
@@ -1019,8 +1042,8 @@ class GymChallengeCog(BaseCog):
         
         # 导入视图
         from views.challenge_views import QuestionView
-        # 设置3分钟（180秒）超时
-        view = QuestionView(session, interaction, timeout=180)
+        # 设置3分钟超时
+        view = QuestionView(session, interaction, timeout=CHALLENGE_TIMEOUT)
         
         # 根据题目类型设置视图
         if question['type'] == 'multiple_choice':
@@ -1084,7 +1107,10 @@ class GymChallengeCog(BaseCog):
             else:
                 shuffled_options = options
             try:
-                logger.warning(f"[mc-render] user={session.user_id} qidx={session.current_question_index} randomize={session.randomize_options} opts={options} shuffled={shuffled_options}")
+                logger.debug(
+                    f"[mc-render] user={session.user_id} qidx={session.current_question_index} "
+                    f"randomize={session.randomize_options} option_count={len(options)}"
+                )
             except Exception:
                 pass
 

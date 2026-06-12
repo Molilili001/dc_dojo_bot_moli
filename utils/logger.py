@@ -7,6 +7,7 @@ from typing import Optional
 import pytz
 from core.constants import (
     LOG_DIR as DEFAULT_LOG_DIR,
+    LOG_LEVEL as DEFAULT_LOG_LEVEL,
     LOG_BACKUP_COUNT as DEFAULT_BACKUP_COUNT,
     LOG_FORMAT as DEFAULT_LOG_FORMAT,
     LOG_DATE_FORMAT as DEFAULT_LOG_DATE_FORMAT,
@@ -45,10 +46,22 @@ class TimezoneFormatter(logging.Formatter):
         return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _resolve_log_level(log_level: Optional[object] = None) -> int:
+    """将配置中的日志级别解析为 logging 模块使用的整数级别。"""
+    value = DEFAULT_LOG_LEVEL if log_level is None else log_level
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        resolved = logging.getLevelName(value.upper())
+        if isinstance(resolved, int):
+            return resolved
+    return logging.INFO
+
+
 def setup_logger(
     name: str = "discord_bot",
     log_dir: Optional[str] = None,
-    log_level: Optional[int] = None,
+    log_level: Optional[object] = None,
     use_beijing_tz: bool = True
 ) -> logging.Logger:
     """
@@ -63,19 +76,18 @@ def setup_logger(
     if not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
 
-    # 若 root 已配置处理器，则只调整级别并返回命名 logger
     root_logger = logging.getLogger()
+    resolved_level = _resolve_log_level(log_level)
+
+    # 若 root 已配置处理器，则只调整级别并返回命名 logger
     if root_logger.handlers:
-        # 若已初始化但未传入级别，使用 WARNING 降低日志量
-        root_logger.setLevel(log_level or logging.WARNING)
+        root_logger.setLevel(resolved_level)
+        for handler in root_logger.handlers:
+            handler.setLevel(resolved_level)
         return logging.getLogger(name)
 
     # 设置时区与格式
     tz = pytz.timezone('Asia/Shanghai') if use_beijing_tz else pytz.utc
-
-    # 若未指定级别，默认使用 WARNING 降低日志量
-    if log_level is None:
-        log_level = logging.WARNING
 
     formatter = TimezoneFormatter(
         DEFAULT_LOG_FORMAT,
@@ -93,15 +105,15 @@ def setup_logger(
         encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
-    file_handler.setLevel(log_level)
+    file_handler.setLevel(resolved_level)
 
     # 控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    console_handler.setLevel(log_level)
+    console_handler.setLevel(resolved_level)
 
     # 绑定到 root，确保所有子 logger 生效
-    root_logger.setLevel(log_level)
+    root_logger.setLevel(resolved_level)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
