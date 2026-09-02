@@ -176,23 +176,8 @@ class StartChallengeButton(ui.Button):
             )
             return
 
-        # 从活跃挑战中获取会话，并避免教程超时在开始流程中清理 session
+        # 从活跃挑战中获取会话；协调层会在锁内复核会话与封禁状态。
         session = challenge_cog.active_challenges.get(user_id)
-        if session:
-            session.started = True
-
-        # 在开始前再次检查封禁状态
-        guild_id = str(interaction.guild.id)
-        ban_entry = await challenge_cog._get_challenge_ban_entry(guild_id, interaction.user)
-        if ban_entry:
-            # 清理已存在的挑战会话
-            if user_id in challenge_cog.active_challenges:
-                del challenge_cog.active_challenges[user_id]
-
-            ban_message = challenge_cog._format_challenge_ban_message(ban_entry, interaction.user)
-            # 已 defer，统一使用 followup 发送
-            await interaction.followup.send(ban_message, ephemeral=True)
-            return
 
         if session:
             # 停止当前视图的超时计时器

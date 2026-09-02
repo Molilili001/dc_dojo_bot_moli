@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: June 12, 2026
+Last updated: September 2, 2026
 
 This Privacy Policy explains how Discord Dojo Bot (the "Bot") collects, uses, stores, and deletes data when it is added to a Discord server.
 
@@ -35,6 +35,12 @@ The Bot uses data only to provide server features requested or configured by ser
 - Maintaining audit records and operational logs needed for reliability and abuse prevention.
 
 The Bot does not sell data, share data with advertisers, build advertising profiles, or use message content for unrelated analytics.
+
+## Dojo Quiz Eligibility
+
+When a member of the configured target Discord server chooses to start a dojo challenge, the Bot sends that member's Discord user ID to the production Dojo website. The website operator compares the ID with existing anti-cheating observations and returns only whether the member is currently eligible or is missing a current observation. The Bot does not send challenge answers, roles, message content, or other Discord profile data in this request, and the website does not return browser, network, hash, or observation-time data.
+
+The Bot owner is responsible for the Bot configuration and this transfer. The Dojo website operator is responsible for the website's observation data, eligibility decision, retention, and verified-deletion process. The website stores no per-request eligibility decision record. If the eligibility service is unavailable or reports no current observation, the challenge does not start and no challenge failure is recorded; the response is private to the member.
 
 ## Message Content
 
@@ -82,11 +88,13 @@ The Bot owner may access stored data and logs only for maintenance, debugging, s
 
 Server administrators can control which features are enabled and where the Bot listens or posts messages. Users and administrators can use the Bot's commands and configuration panels to manage supported data such as challenge progress, todo/event entries, feedback settings, monitoring configuration, and automation rules.
 
-To request deletion of data associated with a user, server, or feature, contact the Bot owner through the GitHub repository issues page:
+To request deletion of data stored by the Bot and associated with a user, server, or feature, contact the Bot owner through the GitHub repository issues page:
 
 https://github.com/Molilili001/dc_dojo_bot_moli/issues
 
-Please include the Discord server ID, user ID if applicable, and a short description of the data you want deleted. Do not include private tokens or sensitive credentials in a public issue.
+In the public issue, ask only for a private deletion-contact channel. Do not publish Discord IDs, private tokens, credentials, or other sensitive details. The Bot owner will provide private instructions for identifying the records and verifying control of the affected account or server.
+
+For anti-cheating observations held by the Dojo website, use the verified community-contact process published in the [Dojo website privacy notice](https://dojo.windkingmomfly.site/#privacy). Do not post credentials, browser or network details, or other sensitive data in a public issue.
 
 ## Security
 

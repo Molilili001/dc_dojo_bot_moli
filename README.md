@@ -198,6 +198,7 @@ Discord Dojo Bot 是面向 Discord 社区的综合型机器人，提供道馆挑
 3. 安装 `requirements.txt` 中的依赖。
 4. 复制 `config.example.json` 为 `config.json`。
 5. 在 `config.json` 中填写 Bot Token、开发者 ID、反馈频道、联动监控频道等必要配置。
+   `QUIZ_ELIGIBILITY_API_KEY` 必须替换为至少包含 32 个随机字节的无填充 base64url key；缺失、格式错误或强度不足时，道馆挑战 Cog 会保持未加载，其他功能仍可启动。
 6. 如服务器访问 Discord 需要代理，可在配置中启用代理设置。
 
 ### 3. 启动机器人

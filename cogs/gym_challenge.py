@@ -13,6 +13,15 @@ from core.database import DatabaseManager
 from core.constants import CHALLENGE_TIMEOUT
 from core.models import Gym, UserProgress, ChallengeFailure, Question
 from core.exceptions import ValidationError
+from core.quiz_eligibility import (
+    TARGET_GUILD_ID,
+    TUTORIAL_DIRECTORY_URL,
+    EligibilityChecker,
+    EligibilityOutcome,
+    EligibilityUnavailable,
+    QuizEligibilityClient,
+    eligibility_api_key_from_config,
+)
 from utils.formatters import format_time, format_timedelta, format_wrong_answers
 from utils.logger import get_logger
 from utils.time_utils import (
@@ -24,6 +33,19 @@ from utils.time_utils import (
 )
 
 logger = get_logger(__name__)
+
+MISSING_OBSERVATION_MESSAGE = (
+    "⚠️ **暂时无法开始挑战**\n\n"
+    "尚未找到当前有效的防代打观测。请先打开"
+    f"[基础教程目录]({TUTORIAL_DIRECTORY_URL})并完成网站验证，"
+    "等待网站显示观测成功反馈后，再重新选择道馆。\n\n"
+    "本次挑战尚未开始，未记录挑战失败。"
+)
+ELIGIBILITY_UNAVAILABLE_MESSAGE = (
+    "⚠️ **答题资格服务暂时不可用**\n\n"
+    "现在无法确认答题资格，请稍后重新选择道馆。\n\n"
+    "本次挑战尚未开始，未记录挑战失败。"
+)
 
 
 class ChallengeSession:
@@ -157,8 +179,13 @@ class ChallengeSession:
 class GymChallengeCog(BaseCog):
     """道馆挑战Cog"""
     
-    def __init__(self, bot: commands.Bot):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        eligibility_checker: EligibilityChecker,
+    ):
         super().__init__(bot)
+        self.eligibility_checker = eligibility_checker
         self.active_challenges: Dict[str, ChallengeSession] = {}
         self.user_challenge_locks: Dict[str, asyncio.Lock] = {}
     
@@ -178,6 +205,19 @@ class GymChallengeCog(BaseCog):
             del self.active_challenges[user_id]
         if user_id in self.user_challenge_locks:
             del self.user_challenge_locks[user_id]
+
+    async def _end_unstarted_challenge(
+        self,
+        interaction: discord.Interaction,
+        user_id: str,
+        message: str,
+    ):
+        self._cleanup_user_session(user_id)
+        await interaction.edit_original_response(
+            content=message,
+            embed=None,
+            view=None,
+        )
     
     # ========== 挑战管理方法 ==========
     
@@ -448,8 +488,56 @@ class GymChallengeCog(BaseCog):
     
     async def display_question(self, interaction: discord.Interaction, session):
         """显示第一个问题"""
-        session.started = True
-        await self._display_next_question(interaction, session)
+        user_id = session.user_id
+        if user_id not in self.user_challenge_locks:
+            self.user_challenge_locks[user_id] = asyncio.Lock()
+
+        async with self.user_challenge_locks[user_id]:
+            current_session = self.active_challenges.get(user_id)
+            if current_session is not session or session.started:
+                return
+
+            ban_entry = await self._get_challenge_ban_entry(
+                session.guild_id, interaction.user
+            )
+            if ban_entry:
+                self._cleanup_user_session(user_id)
+                await interaction.followup.send(
+                    self._format_challenge_ban_message(
+                        ban_entry, interaction.user
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            # Keep this guard even while the Bot serves one Guild so a future
+            # multi-Guild rollout keeps the eligibility migration isolated.
+            if str(session.guild_id) == TARGET_GUILD_ID:
+                try:
+                    outcome = await self.eligibility_checker.check(user_id)
+                except EligibilityUnavailable:
+                    if self.active_challenges.get(user_id) is not session:
+                        return
+                    await self._end_unstarted_challenge(
+                        interaction,
+                        user_id,
+                        ELIGIBILITY_UNAVAILABLE_MESSAGE,
+                    )
+                    return
+                if self.active_challenges.get(user_id) is not session:
+                    return
+                if outcome is EligibilityOutcome.FINGERPRINT_MISSING:
+                    await self._end_unstarted_challenge(
+                        interaction,
+                        user_id,
+                        MISSING_OBSERVATION_MESSAGE,
+                    )
+                    return
+                if outcome is not EligibilityOutcome.ELIGIBLE:
+                    return
+
+            session.started = True
+            await self._display_next_question(interaction, session)
     
     async def handle_challenge_cancel(self, interaction: discord.Interaction, user_id: str):
         """处理挑战取消"""
@@ -1486,4 +1574,7 @@ class GymChallengeCog(BaseCog):
 
 async def setup(bot: commands.Bot):
     """设置函数，用于添加Cog到bot"""
-    await bot.add_cog(GymChallengeCog(bot))
+    api_key = eligibility_api_key_from_config(bot.config)
+    await bot.add_cog(
+        GymChallengeCog(bot, QuizEligibilityClient(api_key))
+    )
