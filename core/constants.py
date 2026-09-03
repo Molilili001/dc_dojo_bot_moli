@@ -75,12 +75,9 @@ DEFAULT_ALLOWED_MISTAKES = 0
 # 挑战超时时间（秒）
 CHALLENGE_TIMEOUT = 180
 
-# 失败惩罚时长（小时）
-FAILURE_PENALTIES = {
-    3: 1,    # 第3次失败：1小时
-    4: 6,    # 第4次失败：6小时
-    5: 12,   # 第5次及以上：12小时
-}
+# 连续失败冷却
+FAILURE_COOLDOWN_THRESHOLD = 4
+FAILURE_COOLDOWN_HOURS = 2
 
 # 究极道馆题目比例
 ULTIMATE_GYM_QUESTION_RATIO = 0.5  # 抽取50%的题目

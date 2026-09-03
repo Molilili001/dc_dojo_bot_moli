@@ -10,7 +10,11 @@ from typing import Dict, List, Optional, Any
 
 from cogs.base_cog import BaseCog
 from core.database import DatabaseManager
-from core.constants import CHALLENGE_TIMEOUT
+from core.constants import (
+    CHALLENGE_TIMEOUT,
+    FAILURE_COOLDOWN_HOURS,
+    FAILURE_COOLDOWN_THRESHOLD,
+)
 from core.models import Gym, UserProgress, ChallengeFailure, Question
 from core.exceptions import ValidationError
 from core.quiz_eligibility import (
@@ -901,12 +905,8 @@ class GymChallengeCog(BaseCog):
             
             # 计算封禁时间
             ban_duration = timedelta(seconds=0)
-            if failure_count == 3:
-                ban_duration = timedelta(hours=1)
-            elif failure_count == 4:
-                ban_duration = timedelta(hours=6)
-            elif failure_count >= 5:
-                ban_duration = timedelta(hours=12)
+            if failure_count >= FAILURE_COOLDOWN_THRESHOLD:
+                ban_duration = timedelta(hours=FAILURE_COOLDOWN_HOURS)
             
             banned_until = None
             if ban_duration.total_seconds() > 0:
