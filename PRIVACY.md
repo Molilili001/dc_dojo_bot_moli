@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: September 2, 2026
+Last updated: November 8, 2026
 
 This Privacy Policy explains how Discord Dojo Bot (the "Bot") collects, uses, stores, and deletes data when it is added to a Discord server.
 
@@ -38,9 +38,9 @@ The Bot does not sell data, share data with advertisers, build advertising profi
 
 ## Dojo Quiz Eligibility
 
-When a member of the configured target Discord server chooses to start a dojo challenge, the Bot sends that member's Discord user ID to the production Dojo website. The website operator compares the ID with existing anti-cheating observations and returns only whether the member is currently eligible or is missing a current observation. The Bot does not send challenge answers, roles, message content, or other Discord profile data in this request, and the website does not return browser, network, hash, or observation-time data.
+When a member of the configured target Discord server chooses to start a dojo challenge, the Bot sends that member's Discord user ID to the production Dojo website. The website checks whether the member has completed Discord login verification on the tutorial website within the last 8 days and returns only the current eligibility decision. The Bot does not send challenge answers, roles, message content, or other Discord profile data in this request, and the website does not return login record details or verification timestamps.
 
-The Bot owner is responsible for the Bot configuration and this transfer. The Dojo website operator is responsible for the website's observation data, eligibility decision, retention, and verified-deletion process. The website stores no per-request eligibility decision record. If the eligibility service is unavailable or reports no current observation, the challenge does not start and no challenge failure is recorded; the response is private to the member.
+The Bot owner is responsible for the Bot configuration and this transfer. The Dojo website operator is responsible for the website's login verification records, eligibility decision, retention, and verified-deletion process. The website stores no per-request eligibility decision record. If the eligibility service is unavailable or reports no valid login verification record within the last 8 days, the challenge does not start and no challenge failure is recorded; the response is private to the member.
 
 ## Message Content
 
@@ -94,7 +94,7 @@ https://github.com/Molilili001/dc_dojo_bot_moli/issues
 
 In the public issue, ask only for a private deletion-contact channel. Do not publish Discord IDs, private tokens, credentials, or other sensitive details. The Bot owner will provide private instructions for identifying the records and verifying control of the affected account or server.
 
-For anti-cheating observations held by the Dojo website, use the verified community-contact process published in the [Dojo website privacy notice](https://dojo.windkingmomfly.site/#privacy). Do not post credentials, browser or network details, or other sensitive data in a public issue.
+For Discord login verification records held by the Dojo website, use the verified community-contact process published in the [Dojo website privacy notice](https://dojo.windkingmomfly.site/#privacy). Do not post credentials or other sensitive data in a public issue.
 
 ## Security
 
