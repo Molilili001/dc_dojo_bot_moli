@@ -240,10 +240,11 @@ class QuizEligibilityChallengeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cog.displayed_sessions, [])
         self.assertEqual(len(interaction.edits), 1)
         message = interaction.edits[0]["content"]
-        self.assertIn(TUTORIAL_DIRECTORY_URL, message)
-        self.assertIn("等待网站显示观测成功", message)
-        self.assertIn("重新选择道馆", message)
-        self.assertIn("未记录挑战失败", message)
+        self.assertEqual(
+            message,
+            f"你需要在最近8天内登录过一次 [教程网站]({TUTORIAL_DIRECTORY_URL}) 才能开始挑战！\n"
+            "请完成 Discord 登录验证后重试，本次不计失败次数。",
+        )
         self.assertEqual(interaction.edits[0]["embed"], None)
         self.assertEqual(interaction.edits[0]["view"], None)
         self.assertEqual(interaction.followups, [])

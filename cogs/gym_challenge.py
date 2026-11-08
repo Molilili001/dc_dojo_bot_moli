@@ -39,11 +39,8 @@ from utils.time_utils import (
 logger = get_logger(__name__)
 
 MISSING_OBSERVATION_MESSAGE = (
-    "⚠️ **暂时无法开始挑战**\n\n"
-    "尚未找到当前有效的防代打观测。请先打开"
-    f"[基础教程目录]({TUTORIAL_DIRECTORY_URL})并完成网站验证，"
-    "等待网站显示观测成功反馈后，再重新选择道馆。\n\n"
-    "本次挑战尚未开始，未记录挑战失败。"
+    f"你需要在最近8天内登录过一次 [教程网站]({TUTORIAL_DIRECTORY_URL}) 才能开始挑战！\n"
+    "请完成 Discord 登录验证后重试，本次不计失败次数。"
 )
 ELIGIBILITY_UNAVAILABLE_MESSAGE = (
     "⚠️ **答题资格服务暂时不可用**\n\n"
