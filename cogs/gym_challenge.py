@@ -1311,14 +1311,16 @@ class GymChallengeCog(BaseCog):
             )
             
             # 检查并管理完成奖励
-            await self._check_completion_rewards(interaction.user, session)
+            reward_field = await self._check_completion_rewards(interaction.user, session)
+            if reward_field:
+                embed.add_field(**reward_field)
         
         # 添加错题回顾
-        if session.wrong_answers:
+        remaining_fields = 25 - len(embed.fields)
+        if session.wrong_answers and remaining_fields > 0:
             wrong_fields = format_wrong_answers(session.wrong_answers, show_correct=True)
-            for field in wrong_fields[:25]:  # Discord限制25个字段
+            for field in wrong_fields[:remaining_fields]:  # Discord限制25个字段
                 embed.add_field(**field)
-        
         # 发送成功消息
         if from_modal:
             await interaction.edit_original_response(embed=embed, view=None)
@@ -1392,8 +1394,25 @@ class GymChallengeCog(BaseCog):
         else:
             await interaction.response.edit_message(embed=embed, view=None)
     
-    async def _check_completion_rewards(self, member: discord.Member, session: ChallengeSession):
-        """检查并发放完成奖励"""
+    @staticmethod
+    def _resolve_guild_role(guild: discord.Guild, role_id: str) -> Optional[discord.Role]:
+        """按身份组 ID 动态解析当前服务器中的身份组对象"""
+        try:
+            return guild.get_role(int(role_id))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_role_display(role: Optional[discord.Role], role_id: str, *, for_dm: bool) -> str:
+        """格式化身份组展示文案：私信用动态解析后的名称，服务器内用 mention"""
+        if role is not None:
+            if for_dm:
+                return f"@{discord.utils.escape_markdown(role.name)}"
+            return role.mention
+        return f"身份组 ID `{role_id}`"
+
+    async def _check_completion_rewards(self, member: discord.Member, session: ChallengeSession) -> Optional[Dict[str, Any]]:
+        """检查并发放完成奖励，返回可选的成功消息 Embed 字段"""
         guild_id = str(member.guild.id)
         user_id = str(member.id)
         panel_message_id = str(session.panel_message_id)
@@ -1411,11 +1430,13 @@ class GymChallengeCog(BaseCog):
                 panel_config = await cursor.fetchone()
         
         if not panel_config:
-            return
+            return None
         
-        # 解析配置
-        role_to_add_ids = json.loads(panel_config[0]) if panel_config[0] else []
-        role_to_remove_ids = json.loads(panel_config[1]) if panel_config[1] else []
+        # 解析配置并保持顺序去重
+        raw_add_ids = json.loads(panel_config[0]) if panel_config[0] else []
+        raw_remove_ids = json.loads(panel_config[1]) if panel_config[1] else []
+        role_to_add_ids = list(dict.fromkeys(str(rid) for rid in raw_add_ids))
+        role_to_remove_ids = list(dict.fromkeys(str(rid) for rid in raw_remove_ids))
         associated_gyms = json.loads(panel_config[2]) if panel_config[2] else None
         blacklist_enabled = panel_config[3]
         completion_threshold = panel_config[4]
@@ -1432,7 +1453,11 @@ class GymChallengeCog(BaseCog):
                     )
                 except discord.Forbidden:
                     pass
-                return
+                return {
+                    "name": "🚫 身份组获取失败",
+                    "value": "由于你被记录在处罚名单中，即使完成了道馆挑战，也无法获得或变更相关身份组。",
+                    "inline": False,
+                }
         
         # 获取所有道馆
         all_gyms = await self._get_all_guild_gyms(guild_id)
@@ -1459,45 +1484,135 @@ class GymChallengeCog(BaseCog):
                 all_checks_passed = True
         
         if not all_checks_passed:
-            return
+            return None
         
-        # 发放奖励
-        messages = []
+        member_role_ids = {str(r.id) for r in member.roles}
+        added_roles = []
+        skipped_claimed_roles = []
+        failed_add_roles = []
+        all_add_roles_satisfied = True
         
-        # 添加身份组
+        # 添加身份组：只有所有应发身份组最终都在用户身上，才允许移除旧身份组
         for role_id in role_to_add_ids:
-            # 检查是否已领取
-            if await self._has_claimed_reward(guild_id, user_id, role_id):
+            role = self._resolve_guild_role(member.guild, role_id)
+            if role is None:
+                logger.error(f"Reward role {role_id} not found in guild {guild_id}")
+                failed_add_roles.append((None, role_id))
+                all_add_roles_satisfied = False
                 continue
             
-            role = member.guild.get_role(int(role_id))
-            if role and role not in member.roles:
-                try:
-                    await member.add_roles(role, reason=f"Panel {panel_message_id} completion")
-                    await self._record_reward_claim(guild_id, user_id, role_id)
-                    messages.append(f"✅ **获得了身份组**: {role.mention}")
-                    logger.info(f"Granted role {role_id} to user {user_id}")
-                except Exception as e:
-                    logger.error(f"Failed to add role {role_id}: {e}")
+            if role_id in member_role_ids:
+                continue
+            
+            if await self._has_claimed_reward(guild_id, user_id, role_id):
+                logger.info(
+                    f"Skipped already-claimed reward role {role_id} for user {user_id} in guild {guild_id}"
+                )
+                skipped_claimed_roles.append((role, role_id))
+                all_add_roles_satisfied = False
+                continue
+            
+            try:
+                await member.add_roles(role, reason=f"Panel {panel_message_id} completion")
+                await self._record_reward_claim(guild_id, user_id, role_id)
+                member_role_ids.add(role_id)
+                added_roles.append((role, role_id))
+                logger.info(f"Granted role {role_id} to user {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to add role {role_id}: {e}")
+                failed_add_roles.append((role, role_id))
+                all_add_roles_satisfied = False
         
         # 移除身份组
+        removed_roles = []
+        failed_remove_roles = []
+        preserved_remove_roles = []
+        removable_held = []
         for role_id in role_to_remove_ids:
-            role = member.guild.get_role(int(role_id))
-            if role and role in member.roles:
+            role = self._resolve_guild_role(member.guild, role_id)
+            if role is not None and role_id in member_role_ids:
+                removable_held.append((role, role_id))
+        
+        if all_add_roles_satisfied:
+            for role, role_id in removable_held:
                 try:
                     await member.remove_roles(role, reason=f"Panel {panel_message_id} completion")
-                    messages.append(f"✅ **移除了身份组**: {role.mention}")
+                    member_role_ids.discard(role_id)
+                    removed_roles.append((role, role_id))
                 except Exception as e:
                     logger.error(f"Failed to remove role {role_id}: {e}")
+                    failed_remove_roles.append((role, role_id))
+        elif removable_held:
+            preserved_remove_roles.extend(removable_held)
+            logger.info(
+                f"Preserved removable roles {[rid for _, rid in preserved_remove_roles]} "
+                f"for user {user_id} because not all reward roles were satisfied"
+            )
         
-        # 发送通知
-        if messages:
+        def build_lines(*, for_dm: bool) -> List[str]:
+            lines: List[str] = []
+            for role, role_id in added_roles:
+                display = self._format_role_display(role, role_id, for_dm=for_dm)
+                lines.append(f"✅ **获得了身份组**: {display}")
+            for role, role_id in removed_roles:
+                display = self._format_role_display(role, role_id, for_dm=for_dm)
+                lines.append(f"✅ **移除了身份组**: {display}")
+            for role, role_id in skipped_claimed_roles:
+                display = self._format_role_display(role, role_id, for_dm=for_dm)
+                lines.append(
+                    f"ℹ️ **未重复发放身份组**: {display}（系统记录你此前已领取过该奖励）"
+                )
+            for role, role_id in failed_add_roles:
+                display = self._format_role_display(role, role_id, for_dm=for_dm)
+                lines.append(
+                    f"❌ **未能发放身份组**: {display}（发放失败或身份组不存在）"
+                )
+            for role, role_id in failed_remove_roles:
+                display = self._format_role_display(role, role_id, for_dm=for_dm)
+                lines.append(f"❌ **未能移除身份组**: {display}")
+            for role, role_id in preserved_remove_roles:
+                display = self._format_role_display(role, role_id, for_dm=for_dm)
+                lines.append(
+                    f"🛡️ **已保留原有身份组**: {display}（因奖励身份组未全部发放，未执行移除）"
+                )
+            if skipped_claimed_roles:
+                lines.append("如因退群重进或身份组丢失需要补发，请联系服务器管理员处理。")
+            elif failed_add_roles or failed_remove_roles:
+                lines.append("请联系服务器管理员检查配置或权限。")
+            return lines
+        
+        dm_lines = build_lines(for_dm=True)
+        embed_lines = build_lines(for_dm=False)
+        has_warning = bool(skipped_claimed_roles or failed_add_roles or failed_remove_roles)
+        has_change = bool(added_roles or removed_roles)
+        
+        # 发送私信通知（私信中动态解析身份组名称，避免显示为未知身份组）
+        if dm_lines:
             try:
-                header = f"🎉 恭喜你！你已在 **{member.guild.name}** 服务器完成了指定道馆挑战！"
-                full_message = header + "\n\n" + "\n".join(messages)
+                if has_warning and not has_change:
+                    header = (
+                        f"ℹ️ 你已在 **{member.guild.name}** 服务器完成了指定道馆挑战，"
+                        "以下是身份组奖励处理结果："
+                    )
+                else:
+                    header = f"🎉 恭喜你！你已在 **{member.guild.name}** 服务器完成了指定道馆挑战！"
+                full_message = header + "\n\n" + "\n".join(dm_lines)
                 await member.send(full_message)
             except discord.Forbidden:
                 logger.warning(f"Cannot send DM to user {user_id}")
+        
+        if not embed_lines:
+            return None
+        
+        field_name = "⚠️ 身份组奖励提示" if has_warning and not has_change else "🎁 身份组奖励"
+        field_value = "\n".join(embed_lines)
+        if len(field_value) > 1024:
+            field_value = field_value[:1021] + "..."
+        return {
+            "name": field_name,
+            "value": field_value,
+            "inline": False,
+        }
     
     async def _trigger_leaderboard_update(self, guild_id: int):
         """触发排行榜更新"""
